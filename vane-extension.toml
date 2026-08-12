@@ -1,0 +1,9 @@
+schema_version = 1
+name = "iceberg"
+extension_config = "extension_config.cmake"
+build_extensions = ["httpfs", "parquet", "tpch"]
+native_test_selection = "test/sql/local/iceberg_scans/iceberg_metadata.test"
+
+[vane]
+repository = "AstroVela/vane"
+revision = "482d483cbd4e1784b26d4ee0eb071fac3bc597de"
