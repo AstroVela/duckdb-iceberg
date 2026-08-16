@@ -37,21 +37,60 @@ This will build both the separate loadable extension and a duckdb binary with th
 ./build/release/extension/iceberg/iceberg.duckdb_extension
 ```
 
-### Vane integration
+### Optional Vane build
 
-The upstream `duckdb` and `extension-ci-tools` submodules remain the source of
-the standard DuckDB build above. Vane builds use the separate
-`vane-extension-ci-tools` submodule and an exact `AstroVela/vane` revision from
-`vane-extension.toml`:
+The default targets continue to build against the upstream `duckdb/`
+submodule. Distributed execution is an explicit second build mode and does not
+change the upstream DuckDB extension binary.
+
+`vane-extension-ci-tools/` checks out the exact Vane revision pinned in
+`vane-extension.toml`, then builds this extension against Vane's
+`external/duckdb`. The Vane-only configuration enables
+`ICEBERG_VANE_DISTRIBUTED`; Vane headers, scan callbacks, and write-provider
+code are excluded from the default build.
 
 ```shell
-VCPKG_TOOLCHAIN_PATH='<path_to_your_vcpkg_repo>/scripts/buildsystems/vcpkg.cmake' \
-  make vane_ci
+git submodule update --init --recursive
+export VCPKG_TOOLCHAIN_PATH=/path/to/vcpkg/scripts/buildsystems/vcpkg.cmake
+make vane_validate
+make vane_ci
 ```
 
-This compiles Iceberg against `AstroVela/vane/external/duckdb` and runs the
-selected native Iceberg test. It does not replace either upstream submodule and
-does not select a fallback DuckDB source.
+The Vane build supports distributed Iceberg scans and auto-commit `INSERT`.
+`CREATE TABLE AS` additionally requires an explicit `location` or
+`write.data.path` table property and does not support `IF NOT EXISTS` or
+`OR REPLACE`. The catalog must also enable staged table creation
+(`stage_create_tables=true`) so the new table remains transactional until its
+initial snapshot commit. Distributed writes reject a current partition spec
+containing a `VOID` transform. Format-version 2 tables support distributed `UPDATE` and `DELETE`
+through positional-delete files; a distributed row-delta operation fails if
+any selected source file uses a partition spec other than the current default.
+Scan tasks materialize the coordinator's selected files and delete state,
+including transaction-local changes visible when the plan is created.
+
+Workers produce immutable data/delete artifacts. Coordinator finalization
+validates the selected artifacts and adds them to the ordinary Iceberg catalog
+transaction in Vane's single, non-retried finalization call. Iceberg remains
+the only transaction authority: this extension adds no durable operation ID,
+reconciliation, or separate exactly-once layer. Once catalog finalization
+starts, rollback conservatively retains selected artifacts because a lost
+catalog response can leave the commit outcome unknown; catalog garbage
+collection remains responsible for true orphans. Iceberg extension payloads
+do not capture or replay persistent SecretManager entries. Storage
+authorization for the explicit data path must be available to both the
+coordinator and every worker connection; any transport of explicit session
+settings is governed by Vane's connection-snapshot policy. Worker scan binds carry only the schema and partition metadata
+required by the selected scan, plus the Iceberg name mapping; Parquet
+encryption keys, explicit cardinality overrides, and legacy VARIANT decoding
+are rejected instead of being serialized with incomplete semantics.
+
+In Vane's Ray mode these mutations use the distributed provider or fail; there
+is no local fallback. `VANE_RUNNER=local-fast` selects the independent native
+DuckDB execution path.
+
+The current reusable Vane CI lane builds the extension and runs a native
+sqllogictest against Vane's DuckDB fork. Ray integration tests require a full
+Vane wheel and catalog services and remain an explicit integration lane.
 
 ### Running tests
 

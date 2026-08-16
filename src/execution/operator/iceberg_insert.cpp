@@ -37,6 +37,11 @@
 #include "common/iceberg_utils.hpp"
 #include "catalog/rest/transaction/iceberg_transaction_update.hpp"
 #include "iceberg_logging.hpp"
+#ifdef ICEBERG_VANE_DISTRIBUTED
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/execution/distributed/extension_write_task_provider.hpp"
+#include "execution/operator/iceberg_distributed_write.hpp"
+#endif
 
 namespace duckdb {
 
@@ -50,21 +55,399 @@ static bool WriteSequenceNumber(IcebergInsertVirtualColumns virtual_columns) {
 	       virtual_columns == IcebergInsertVirtualColumns::WRITE_ROW_ID_AND_SEQUENCE_NUMBER;
 }
 
+#ifdef ICEBERG_VANE_DISTRIBUTED
+static void StripTrailingSeparator(FileSystem &fs, string &path);
+#endif
+
 IcebergInsert::IcebergInsert(PhysicalPlan &physical_plan, LogicalOperator &op, TableCatalogEntry &table,
                              physical_index_vector_t<idx_t> column_index_map_p)
     : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, op.types, 1), table(&table), schema(nullptr),
       column_index_map(std::move(column_index_map_p)) {
+#ifdef ICEBERG_VANE_DISTRIBUTED
+	InitializeDistributedWritePlan();
+#endif
 }
 
 IcebergInsert::IcebergInsert(PhysicalPlan &physical_plan, LogicalOperator &op, SchemaCatalogEntry &schema,
                              unique_ptr<BoundCreateTableInfo> info)
     : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, op.types, 1), table(nullptr), schema(&schema),
       info(std::move(info)) {
+#ifdef ICEBERG_VANE_DISTRIBUTED
+	InitializeDistributedWritePlan();
+#endif
 }
 
 IcebergInsert::IcebergInsert(PhysicalPlan &physical_plan, const vector<LogicalType> &types, TableCatalogEntry &table)
     : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, types, 1), table(&table), schema(nullptr) {
+#ifdef ICEBERG_VANE_DISTRIBUTED
+	InitializeDistributedWritePlan();
+#endif
 }
+
+#ifdef ICEBERG_VANE_DISTRIBUTED
+void IcebergInsert::InitializeDistributedWritePlan() {
+	distributed_write_plan.extension_name = "iceberg";
+	distributed_write_plan.operator_name = table ? "insert" : "ctas";
+}
+
+void IcebergInsert::InitializeDistributedWriteTarget(IcebergTableEntry &table_entry, ClientContext &context) {
+	auto &metadata = table_entry.table_info.table_metadata;
+	distributed_catalog_name = table_entry.catalog.GetName();
+	distributed_schema_name = table_entry.schema.name;
+	distributed_table_name = table_entry.name;
+	distributed_table_uuid = metadata.table_uuid;
+	distributed_data_path = metadata.GetDataPath(FileSystem::GetFileSystem(context));
+	distributed_schema_id = metadata.GetCurrentSchemaId();
+	distributed_partition_spec_id = metadata.default_spec_id;
+	distributed_iceberg_version = metadata.iceberg_version;
+	distributed_sort_order_id = metadata.default_sort_order_id;
+	auto snapshot = metadata.GetLatestSnapshot();
+	distributed_has_snapshot = snapshot != nullptr;
+	distributed_snapshot_id = snapshot ? snapshot->snapshot_id : 0;
+	has_distributed_target = true;
+}
+
+void IcebergInsert::ConfigureDistributedCTAS(PhysicalIcebergCreateTable &create, PhysicalCopyToFile &native_copy,
+                                             PhysicalCopyToFile &worker_copy, string data_path,
+                                             bool has_void_partition_transform) {
+	if (!create.info) {
+		throw InternalException("Iceberg distributed CTAS create operator is missing its table definition");
+	}
+	distributed_write_plan.operator_name = "ctas";
+	distributed_catalog_name = create.schema_entry.catalog.GetName();
+	distributed_schema_name = create.schema_entry.name;
+	distributed_table_name = create.info->Base().table;
+	distributed_worker_child = &worker_copy;
+	distributed_ctas_create = &create;
+	distributed_data_path = std::move(data_path);
+	distributed_ctas_has_void_partition_transform = has_void_partition_transform;
+	children.push_back(native_copy);
+}
+
+void IcebergInsert::ConfigureDistributedUpdate(ClientContext &context, PhysicalCopyToFile &copy,
+                                               PhysicalOperator &worker_input, PhysicalOperator &delete_op) {
+	distributed_write_plan.operator_name = "update";
+	distributed_worker_child = &worker_input;
+	update_delete_op = &delete_op;
+	InitializeDistributedWriteTarget(table->Cast<IcebergTableEntry>(), context);
+	distributed_artifact_namespace = CreateIcebergDistributedArtifactNamespace();
+	auto copy_column_count = copy.expected_types.size();
+	if (worker_input.types.size() != copy_column_count + 2) {
+		throw InternalException("Iceberg distributed UPDATE worker projection has an invalid output width");
+	}
+	for (idx_t index = 0; index < copy_column_count; index++) {
+		if (worker_input.types[index] != copy.expected_types[index]) {
+			throw InternalException("Iceberg distributed UPDATE worker projection does not match its COPY input types");
+		}
+	}
+	if (worker_input.types[copy_column_count] != LogicalType::VARCHAR ||
+	    worker_input.types[copy_column_count + 1] != LogicalType::BIGINT) {
+		throw InternalException("Iceberg distributed UPDATE worker projection has invalid row-identifier types");
+	}
+	distributed_write_plan.worker_bind_data =
+	    BuildIcebergDistributedUpdateBind(context, table->Cast<IcebergTableEntry>(), copy, copy_column_count,
+	                                      copy_column_count, copy_column_count + 1, distributed_artifact_namespace);
+}
+
+void IcebergInsert::ValidateDistributedWriteShape() const {
+	if (distributed_write_plan.operator_name == "update") {
+		if (!update_delete_op || !update_delete_op->Cast<IcebergDelete>().multi_file_list ||
+		    !distributed_worker_child || !distributed_worker_plan_selected ||
+		    distributed_write_plan.worker_bind_data.empty() || distributed_artifact_namespace.empty() ||
+		    children.size() != 1) {
+			throw InvalidInputException("Distributed Iceberg UPDATE worker plan was not initialized");
+		}
+		if (distributed_iceberg_version != 2) {
+			throw NotImplementedException("Distributed Iceberg UPDATE currently supports format-version 2 tables only");
+		}
+		return;
+	}
+	if (distributed_write_plan.operator_name == "ctas") {
+		if (has_distributed_target || !distributed_write_plan.worker_bind_data.empty() || !distributed_worker_child ||
+		    !distributed_worker_plan_selected || !distributed_ctas_create || distributed_catalog_name.empty() ||
+		    distributed_schema_name.empty() || distributed_table_name.empty() || !create_state) {
+			throw InvalidInputException("Distributed Iceberg CTAS worker plan was not initialized");
+		}
+		if (children.size() != 1 || children[0].get().type != PhysicalOperatorType::COPY_TO_FILE) {
+			throw InvalidInputException(
+			    "Distributed Iceberg CTAS requires exactly one COPY child returning written-file statistics");
+		}
+		if (distributed_data_path.empty()) {
+			throw NotImplementedException(
+			    "Distributed Iceberg CTAS requires an explicit 'location' or 'write.data.path' table property so "
+			    "workers have a stable output path before coordinator finalization");
+		}
+		return;
+	}
+	if (distributed_write_plan.operator_name != "insert") {
+		throw InvalidInputException("Distributed Iceberg file write has an invalid operation name");
+	}
+	if (!has_distributed_target || !distributed_worker_plan_selected ||
+	    !distributed_write_plan.worker_bind_data.empty()) {
+		throw InvalidInputException("Distributed Iceberg INSERT target was not initialized");
+	}
+	if (children.size() != 1 || children[0].get().type != PhysicalOperatorType::COPY_TO_FILE) {
+		throw InvalidInputException(
+		    "Distributed Iceberg INSERT requires exactly one COPY child returning written-file statistics");
+	}
+}
+
+IcebergTableEntry &IcebergInsert::ResolveDistributedWriteTable(ClientContext &context) const {
+	ValidateDistributedWriteShape();
+	if (distributed_write_plan.operator_name == "ctas") {
+		throw InternalException("Distributed Iceberg CTAS target is created during coordinator finalization");
+	}
+	auto &table_entry = Catalog::GetEntry<TableCatalogEntry>(context, distributed_catalog_name, distributed_schema_name,
+	                                                         distributed_table_name)
+	                        .Cast<IcebergTableEntry>();
+	table_entry.PrepareIcebergScanFromEntry(context);
+	auto &metadata = table_entry.table_info.table_metadata;
+	if (metadata.table_uuid != distributed_table_uuid) {
+		throw TransactionException("Iceberg table %s.%s.%s was replaced after the distributed write was planned",
+		                           distributed_catalog_name, distributed_schema_name, distributed_table_name);
+	}
+	bool sort_order_changed = metadata.default_sort_order_id.IsValid() != distributed_sort_order_id.IsValid();
+	if (!sort_order_changed && metadata.default_sort_order_id.IsValid()) {
+		sort_order_changed = metadata.default_sort_order_id.GetIndex() != distributed_sort_order_id.GetIndex();
+	}
+	if (metadata.GetCurrentSchemaId() != distributed_schema_id ||
+	    metadata.default_spec_id != distributed_partition_spec_id ||
+	    metadata.iceberg_version != distributed_iceberg_version || sort_order_changed) {
+		throw TransactionException("Iceberg table %s.%s.%s layout changed after the distributed write was planned",
+		                           distributed_catalog_name, distributed_schema_name, distributed_table_name);
+	}
+	auto snapshot = metadata.GetLatestSnapshot();
+	if ((snapshot != nullptr) != distributed_has_snapshot ||
+	    (snapshot && snapshot->snapshot_id != distributed_snapshot_id)) {
+		throw TransactionException("Iceberg table %s.%s.%s snapshot changed after the distributed write was planned",
+		                           distributed_catalog_name, distributed_schema_name, distributed_table_name);
+	}
+	auto current_data_path = metadata.GetDataPath(FileSystem::GetFileSystem(context));
+	if (current_data_path != distributed_data_path) {
+		throw TransactionException("Iceberg table %s.%s.%s data path changed after the distributed write was planned",
+		                           distributed_catalog_name, distributed_schema_name, distributed_table_name);
+	}
+	if (distributed_write_plan.operator_name == "update" &&
+	    !metadata.PropertiesAllowPositionalDeletes(IcebergSnapshotOperationType::OVERWRITE)) {
+		throw NotImplementedException(IcebergCatalog::GetOnlyMergeOnReadSupportedErrorMessage(
+		    distributed_table_name, WRITE_UPDATE_MODE, metadata.GetTableProperty(WRITE_UPDATE_MODE)));
+	}
+	return table_entry;
+}
+
+optional_ptr<distributed::ExtensionWriteTaskProvider> IcebergInsert::GetExtensionWriteTaskProvider() {
+	SelectDistributedWorkerPlan();
+	return this;
+}
+
+void IcebergInsert::SelectDistributedWorkerPlan() {
+	if (distributed_worker_plan_selected) {
+		return;
+	}
+	if (children.size() != 1) {
+		throw InvalidInputException("Distributed Iceberg write requires exactly one physical child");
+	}
+	if (distributed_worker_child) {
+		children[0] = *distributed_worker_child;
+	}
+	distributed_worker_plan_selected = true;
+}
+
+const distributed::DistributedExtensionWritePlan &IcebergInsert::WritePlan() const {
+	ValidateDistributedWriteShape();
+	return distributed_write_plan;
+}
+
+void IcebergInsert::ValidateDistributedWrite(ClientContext &context) const {
+	ValidateDistributedWriteShape();
+	if (distributed_write_plan.operator_name == "ctas") {
+		if (distributed_ctas_has_void_partition_transform) {
+			throw NotImplementedException("Distributed Iceberg CTAS does not support VOID partition transforms");
+		}
+		if (distributed_ctas_create->info->Base().on_conflict != OnCreateConflict::ERROR_ON_CONFLICT) {
+			throw NotImplementedException("Distributed Iceberg CTAS does not support IF NOT EXISTS or OR REPLACE");
+		}
+		{
+			lock_guard<mutex> guard(create_state->lock);
+			if (create_state->created || create_state->table_entry) {
+				throw InvalidInputException(
+				    "A distributed Iceberg CTAS physical plan cannot be executed more than once");
+			}
+		}
+		auto &catalog = Catalog::GetCatalog(context, distributed_catalog_name).Cast<IcebergCatalog>();
+		if (!catalog.attach_options.stage_create_tables) {
+			throw NotImplementedException(
+			    "Distributed Iceberg CTAS requires stage_create_tables=true so table creation remains "
+			    "transactional until the snapshot commit");
+		}
+		return;
+	}
+	auto &table_entry = ResolveDistributedWriteTable(context);
+	ValidateIcebergDistributedTargetPartitionSpec(table_entry.table_info.table_metadata,
+	                                              distributed_write_plan.operator_name);
+	if (distributed_write_plan.operator_name == "update") {
+		auto &delete_op = update_delete_op->Cast<IcebergDelete>();
+		ValidateIcebergDistributedRowDeltaSourceBaseline(*delete_op.multi_file_list,
+		                                                 table_entry.table_info.table_metadata, "UPDATE");
+		ValidateIcebergDistributedRowDeltaSourceSpecs(*delete_op.multi_file_list,
+		                                              table_entry.table_info.table_metadata.default_spec_id, "UPDATE");
+	}
+}
+
+static void ValidateDistributedPartitionKeys(const distributed::DistributedCopyFileInfo &file,
+                                             const IcebergTableMetadata &metadata);
+
+static void AddDistributedDataFiles(ClientContext &context, IcebergInsertGlobalState &global_state,
+                                    IcebergTableEntry &table,
+                                    const vector<distributed::DistributedCopyFileInfo> &files) {
+	auto copy_return_types = GetCopyFunctionReturnLogicalTypes(CopyFunctionReturnType::WRITTEN_FILE_STATISTICS);
+	for (const auto &file : files) {
+		ValidateDistributedPartitionKeys(file, table.table_info.table_metadata);
+		DataChunk chunk;
+		chunk.Initialize(context, copy_return_types, 1);
+		chunk.SetCardinality(1);
+		chunk.SetValue(0, 0, Value(file.final_path.empty() ? file.staging_path : file.final_path));
+		chunk.SetValue(1, 0, Value::UBIGINT(file.row_count));
+		chunk.SetValue(2, 0, Value::UBIGINT(file.file_size_bytes));
+		chunk.SetValue(3, 0, file.footer_size_bytes);
+		chunk.SetValue(4, 0, file.column_statistics);
+		chunk.SetValue(5, 0, file.partition_keys);
+		global_state.AddFiles(chunk, table.name, table.table_info.table_metadata);
+	}
+}
+
+static idx_t FindDistributedDataFile(const IcebergMultiFileList &file_list, const string &path) {
+	file_list.GetTotalFileCount();
+	auto files = file_list.GetAllFiles();
+	for (idx_t index = 0; index < files.size(); index++) {
+		if (files[index].path == path) {
+			return index;
+		}
+	}
+	throw InvalidInputException("Distributed Iceberg row-delta referenced unplanned data file '%s'", path);
+}
+
+idx_t IcebergInsert::FinalizeDistributedWrite(ClientContext &context,
+                                              const vector<DistributedWriteTaskResult> &results) const {
+	ValidateDistributedWriteShape();
+	if (distributed_write_plan.operator_name == "update") {
+		auto write_info = distributed::ResolveDistributedExtensionWriteInfo(context, distributed_write_plan);
+		auto decoded =
+		    DecodeIcebergDistributedRowDeltaResults(context, distributed_data_path, distributed_artifact_namespace,
+		                                            write_info, results, IcebergDistributedRowDeltaKind::UPDATE);
+		ValidateIcebergDistributedDataFileArtifacts(context, distributed_data_path, decoded.data_files);
+		CleanupIcebergDistributedRowDelta(context, distributed_data_path, distributed_artifact_namespace,
+		                                  &decoded.selected_artifact_paths);
+		auto &iceberg_table = ResolveDistributedWriteTable(context);
+		auto &delete_op = update_delete_op->Cast<IcebergDelete>();
+		ValidateIcebergDistributedRowDeltaSourceBaseline(*delete_op.multi_file_list,
+		                                                 iceberg_table.table_info.table_metadata, "UPDATE");
+		ValidateIcebergDistributedRowDeltaSourceSpecs(
+		    *delete_op.multi_file_list, iceberg_table.table_info.table_metadata.default_spec_id, "UPDATE");
+		IcebergInsertGlobalState insert_state(context);
+		AddDistributedDataFiles(context, insert_state, iceberg_table, decoded.data_files);
+		IcebergDeleteGlobalState delete_state;
+		for (auto &file : decoded.delete_files) {
+			auto file_index = FindDistributedDataFile(*delete_op.multi_file_list, file.data_file_path);
+			auto source_entry = delete_op.multi_file_list->GetManifestEntry(file_index);
+			auto source_record_count = NumericCast<idx_t>(source_entry.entry.data_file.record_count);
+			if (source_record_count == 0 || file.pos_max_value >= source_record_count) {
+				throw InvalidInputException(
+				    "Distributed Iceberg UPDATE returned a row position outside data file '%s' (%llu records)",
+				    file.data_file_path, static_cast<unsigned long long>(source_record_count));
+			}
+			IcebergDeleteFileInfo delete_file;
+			delete_file.data_file_path = file.data_file_path;
+			delete_file.file_name = file.delete_file_path;
+			delete_file.file_format = "parquet";
+			delete_file.footer_size = file.footer_size_bytes;
+			delete_file.delete_count = file.delete_count;
+			delete_file.file_size_bytes = file.file_size_bytes;
+			delete_file.pos_min_value = file.pos_min_value;
+			delete_file.pos_max_value = file.pos_max_value;
+			delete_file.partition_info = delete_op.multi_file_list->GetPartitionInfoForDataFile(file.data_file_path);
+			if (!delete_state.written_files.emplace(file.data_file_path, std::move(delete_file)).second) {
+				throw InvalidInputException(
+				    "Distributed Iceberg UPDATE produced multiple delete files for data file '%s'",
+				    file.data_file_path);
+			}
+		}
+		delete_state.total_deleted_count = decoded.affected_rows;
+		auto written_files = GetInsertManifestEntries(insert_state);
+		auto delete_files = IcebergDelete::GenerateDeleteManifestEntries(delete_state);
+		if (decoded.affected_rows != 0 && (written_files.empty() || delete_files.empty())) {
+			throw InternalException("Distributed Iceberg UPDATE did not produce both data and delete files");
+		}
+		if (decoded.affected_rows != 0) {
+			auto &transaction = IcebergTransaction::Get(context, iceberg_table.catalog);
+			ApplyTableUpdate(iceberg_table.table_info, transaction, [&](IcebergTableInformation &table_info) {
+				auto &transaction_data = table_info.GetOrCreateTransactionData(transaction);
+				transaction_data.RetainAddedSnapshotFilesOnRollback();
+				transaction_data.AddUpdateSnapshot(std::move(delete_files), std::move(written_files),
+				                                   std::move(delete_state.altered_manifests));
+			});
+		}
+		return decoded.affected_rows;
+	}
+
+	auto write_info = distributed::ResolveDistributedExtensionWriteInfo(context, distributed_write_plan);
+	auto files = distributed::DecodeDistributedFileWriteResults(write_info, results);
+	ValidateIcebergDistributedDataFileArtifacts(context, distributed_data_path, files);
+	optional_ptr<IcebergTableEntry> iceberg_table;
+	if (distributed_write_plan.operator_name == "ctas") {
+		IcebergCreateTableGlobalState create_global_state;
+		auto &catalog = Catalog::GetCatalog(context, distributed_catalog_name);
+		auto &resolved_schema = catalog.GetSchema(context, distributed_schema_name).Cast<IcebergSchemaEntry>();
+		distributed_ctas_create->MakeCreateTableRequest(context, create_global_state, resolved_schema);
+		{
+			lock_guard<mutex> guard(create_state->lock);
+			if (!create_state->created || !create_state->table_entry) {
+				throw InternalException("Distributed Iceberg CTAS did not create its target table");
+			}
+			iceberg_table = create_state->table_entry;
+		}
+		auto &file_system = FileSystem::GetFileSystem(context);
+		auto actual_data_path = iceberg_table->table_info.table_metadata.GetDataPath(file_system);
+		StripTrailingSeparator(file_system, actual_data_path);
+		if (actual_data_path != distributed_data_path) {
+			throw TransactionException(
+			    "Iceberg CTAS catalog returned data path '%s', but distributed workers wrote to '%s'", actual_data_path,
+			    distributed_data_path);
+		}
+	} else {
+		iceberg_table = &ResolveDistributedWriteTable(context);
+	}
+	IcebergInsertGlobalState global_state(context);
+	AddDistributedDataFiles(context, global_state, *iceberg_table, files);
+	auto written_files = GetInsertManifestEntries(global_state);
+	auto affected_rows = global_state.insert_count.load();
+	if (!written_files.empty()) {
+		auto &transaction = IcebergTransaction::Get(context, iceberg_table->catalog);
+		ApplyTableUpdate(iceberg_table->table_info, transaction, [&](IcebergTableInformation &table_info) {
+			auto &transaction_data = table_info.GetOrCreateTransactionData(transaction);
+			transaction_data.RetainAddedSnapshotFilesOnRollback();
+			IcebergManifestDeletes empty_deletes;
+			transaction_data.AddSnapshot(IcebergSnapshotOperationType::APPEND, std::move(written_files),
+			                             std::move(empty_deletes));
+		});
+	}
+	return affected_rows;
+}
+
+void IcebergInsert::AbortDistributedWrite(ClientContext &context, const vector<DistributedWriteTaskResult> &) const {
+	if (distributed_write_plan.operator_name == "update") {
+		CleanupIcebergDistributedRowDelta(context, distributed_data_path, distributed_artifact_namespace);
+	}
+}
+
+void IcebergInsert::BuildPipelines(Pipeline &current, MetaPipeline &meta_pipeline) {
+	if (distributed_worker_plan_selected) {
+		throw InvalidInputException(
+		    "A distributed Iceberg worker plan cannot be executed as a native coordinator operator");
+	}
+	PhysicalOperator::BuildPipelines(current, meta_pipeline);
+}
+#endif
 
 IcebergCopyOptions::IcebergCopyOptions(unique_ptr<CopyInfo> info_p, CopyFunction copy_function_p)
     : info(std::move(info_p)), copy_function(std::move(copy_function_p)) {
@@ -142,6 +525,59 @@ static bool AllIdentityTransforms(const IcebergPartitionSpec &spec) {
 	}
 	return true;
 }
+
+#ifdef ICEBERG_VANE_DISTRIBUTED
+static void ValidateDistributedPartitionKeys(const distributed::DistributedCopyFileInfo &file,
+                                             const IcebergTableMetadata &metadata) {
+	auto copy_return_types = GetCopyFunctionReturnLogicalTypes(CopyFunctionReturnType::WRITTEN_FILE_STATISTICS);
+	if (file.partition_keys.type() != copy_return_types[5]) {
+		throw InvalidInputException("Distributed Iceberg data file has invalid partition-key metadata");
+	}
+
+	auto &partition_spec = metadata.GetLatestPartitionSpec();
+	auto &schema = metadata.GetSchemas().at(metadata.GetCurrentSchemaId());
+	vector<string> expected_names;
+	case_insensitive_set_t unique_names;
+	for (const auto &field : partition_spec.fields) {
+		if (field.transform.Type() == IcebergTransformType::VOID) {
+			continue;
+		}
+		auto name = AllIdentityTransforms(partition_spec) ? GetColumnNameBySourceId(schema->columns, field.source_id)
+		                                                  : field.GetPartitionSpecFieldName();
+		if (!unique_names.insert(name).second) {
+			throw InternalException("Iceberg partition spec contains duplicate field name '%s'", name);
+		}
+		expected_names.push_back(std::move(name));
+	}
+
+	if (file.partition_keys.IsNull()) {
+		if (!expected_names.empty()) {
+			throw InvalidInputException("Distributed Iceberg data file is missing partition keys");
+		}
+		return;
+	}
+	auto &partition_entries = MapValue::GetChildren(file.partition_keys);
+	if (partition_entries.size() != expected_names.size()) {
+		throw InvalidInputException("Distributed Iceberg data file has an incorrect number of partition keys");
+	}
+	for (idx_t index = 0; index < partition_entries.size(); index++) {
+		auto &partition_entry = partition_entries[index];
+		if (partition_entry.IsNull()) {
+			throw InvalidInputException("Distributed Iceberg data file contains a null partition-key entry");
+		}
+		auto &children = StructValue::GetChildren(partition_entry);
+		if (children.size() != 2 || children[0].IsNull()) {
+			throw InvalidInputException("Distributed Iceberg data file contains an invalid partition-key entry");
+		}
+		auto &name = StringValue::Get(children[0]);
+		if (!StringUtil::CIEquals(name, expected_names[index])) {
+			throw InvalidInputException(
+			    "Distributed Iceberg data file partition key '%s' is out of order; expected '%s'", name,
+			    expected_names[index]);
+		}
+	}
+}
+#endif
 
 static string ParseQuotedValue(const string &input, idx_t &pos) {
 	if (pos >= input.size() || input[pos] != '"') {
@@ -503,6 +939,12 @@ string IcebergInsert::GetName() const {
 
 InsertionOrderPreservingMap<string> IcebergInsert::ParamsToString() const {
 	InsertionOrderPreservingMap<string> result;
+#ifdef ICEBERG_VANE_DISTRIBUTED
+	if (!distributed_table_name.empty()) {
+		result["Table Name"] = distributed_table_name;
+		return result;
+	}
+#endif
 	if (table) {
 		result["Table Name"] = table->name;
 	} else if (info) {
@@ -1004,7 +1446,13 @@ PhysicalOperator &IcebergInsert::PlanInsert(ClientContext &context, PhysicalPlan
 	vector<LogicalType> return_types;
 	// the one return value is how many rows we are inserting
 	return_types.emplace_back(LogicalType::BIGINT);
+#ifdef ICEBERG_VANE_DISTRIBUTED
+	auto &insert = planner.Make<IcebergInsert>(return_types, table).Cast<IcebergInsert>();
+	insert.InitializeDistributedWriteTarget(table, context);
+	return insert;
+#else
 	return planner.Make<IcebergInsert>(return_types, table);
+#endif
 }
 
 PhysicalOperator &IcebergCatalog::PlanInsert(ClientContext &context, PhysicalPlanGenerator &planner, LogicalInsert &op,
@@ -1046,7 +1494,12 @@ PhysicalOperator &IcebergCatalog::PlanInsert(ClientContext &context, PhysicalPla
 
 	// Create Copy Info
 	IcebergCopyInput info(context, table_metadata, schema);
+#ifdef ICEBERG_VANE_DISTRIBUTED
+	auto &insert = planner.Make<IcebergInsert>(op, updated_table_entry, op.column_index_map).Cast<IcebergInsert>();
+	insert.InitializeDistributedWriteTarget(updated_table_entry, context);
+#else
 	auto &insert = planner.Make<IcebergInsert>(op, updated_table_entry, op.column_index_map);
+#endif
 	auto &physical_copy = IcebergInsert::PlanCopyForInsert(context, planner, info, plan);
 	insert.children.push_back(physical_copy);
 
@@ -1058,10 +1511,20 @@ static unique_ptr<IcebergTableMetadata> BuildPlaceholderMetadata(ClientContext &
 	metadata->iceberg_version = 2;
 	metadata->default_spec_id = 0;
 
-	auto schema = make_shared_ptr<IcebergTableSchema>();
+	auto &create_info = info.Base().Cast<CreateTableInfo>();
+	shared_ptr<IcebergTableSchema> schema;
+#ifdef ICEBERG_VANE_DISTRIBUTED
+	metadata->SetCurrentSchemaId(0);
+	int32_t last_column_id;
+	schema = IcebergCreateTableRequest::CreateIcebergSchema(context, *metadata, create_info.columns,
+	                                                        &create_info.constraints, last_column_id);
+	schema->schema_id = 0;
+	schema->last_column_id = NumericCast<idx_t>(last_column_id);
+	metadata->last_column_id = last_column_id;
+#else
+	schema = make_shared_ptr<IcebergTableSchema>();
 	schema->schema_id = 0;
 	int32_t next_field_id = 1;
-	auto &create_info = info.Base().Cast<CreateTableInfo>();
 	for (auto &col : create_info.columns.Logical()) {
 		auto col_def = make_uniq<IcebergColumnDefinition>();
 		col_def->id = next_field_id++;
@@ -1071,6 +1534,7 @@ static unique_ptr<IcebergTableMetadata> BuildPlaceholderMetadata(ClientContext &
 		schema->columns.push_back(std::move(col_def));
 	}
 	schema->last_column_id = static_cast<idx_t>(next_field_id - 1);
+#endif
 	metadata->AddSchemaOrGetExisting(schema);
 	metadata->SetCurrentSchemaId(0);
 
@@ -1137,6 +1601,25 @@ static PhysicalOperator &CastCtasToIcebergStorageTypes(ClientContext &context, P
 	return proj;
 }
 
+#ifdef ICEBERG_VANE_DISTRIBUTED
+static string TryResolveDistributedCTASDataPath(ClientContext &context, const IcebergTableMetadata &metadata) {
+	auto &properties = metadata.GetTableProperties();
+	auto data_path_entry = properties.find("write.data.path");
+	string result;
+	if (data_path_entry != properties.end()) {
+		result = data_path_entry->second;
+	} else {
+		auto location_entry = properties.find("location");
+		if (location_entry == properties.end() || location_entry->second.empty()) {
+			return string();
+		}
+		result = FileSystem::GetFileSystem(context).JoinPath(location_entry->second, "data");
+	}
+	StripTrailingSeparator(FileSystem::GetFileSystem(context), result);
+	return result;
+}
+#endif
+
 PhysicalOperator &IcebergCatalog::PlanCreateTableAs(ClientContext &context, PhysicalPlanGenerator &planner,
                                                     LogicalCreateTable &op, PhysicalOperator &plan_p) {
 	auto &schema = op.schema;
@@ -1166,7 +1649,26 @@ PhysicalOperator &IcebergCatalog::PlanCreateTableAs(ClientContext &context, Phys
 
 	auto &insert = planner.Make<IcebergInsert>(op, schema, unique_ptr<BoundCreateTableInfo>()).Cast<IcebergInsert>();
 	insert.create_state = std::move(create_state);
+#ifdef ICEBERG_VANE_DISTRIBUTED
+	auto distributed_data_path = TryResolveDistributedCTASDataPath(context, *placeholder_metadata);
+	bool has_void_partition_transform = false;
+	for (const auto &field : placeholder_metadata->GetLatestPartitionSpec().fields) {
+		if (field.transform.Type() == IcebergTransformType::VOID) {
+			has_void_partition_transform = true;
+			break;
+		}
+	}
+	IcebergCopyInput distributed_copy_input(context, *placeholder_metadata, placeholder_schema);
+	if (!distributed_data_path.empty()) {
+		distributed_copy_input.data_path = distributed_data_path;
+	}
+	auto &distributed_copy =
+	    IcebergInsert::PlanCopyForInsert(context, planner, distributed_copy_input, &plan).Cast<PhysicalCopyToFile>();
+	insert.ConfigureDistributedCTAS(create_op.Cast<PhysicalIcebergCreateTable>(), physical_copy, distributed_copy,
+	                                std::move(distributed_data_path), has_void_partition_transform);
+#else
 	insert.children.push_back(physical_copy);
+#endif
 	return insert;
 }
 

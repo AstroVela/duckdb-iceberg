@@ -26,6 +26,9 @@
 #include "function/copy/iceberg_copy_function.hpp"
 #include "duckdb/optimizer/optimizer_extension.hpp"
 #include "planning/iceberg_optimizer.hpp"
+#ifdef ICEBERG_VANE_DISTRIBUTED
+#include "execution/operator/iceberg_distributed_write.hpp"
+#endif
 
 namespace duckdb {
 
@@ -117,6 +120,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	// Iceberg COPY Function
 	loader.RegisterFunction(IcebergCopyFunction::Create());
+
+#ifdef ICEBERG_VANE_DISTRIBUTED
+	RegisterIcebergDistributedWrites(loader);
+#endif
 
 	SecretType secret_type;
 	secret_type.name = "iceberg";

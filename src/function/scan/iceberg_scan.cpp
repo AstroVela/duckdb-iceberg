@@ -25,6 +25,9 @@
 #include "planning/iceberg_multi_file_reader.hpp"
 #include "function/iceberg_functions.hpp"
 #include "catalog/rest/catalog_entry/table/iceberg_table_entry.hpp"
+#ifdef ICEBERG_VANE_DISTRIBUTED
+#include "function/scan/iceberg_distributed_scan.hpp"
+#endif
 
 #include <string>
 #include <numeric>
@@ -106,6 +109,9 @@ TableFunctionSet IcebergFunctions::GetIcebergScanFunction(ExtensionLoader &loade
 		AddNamedParameters(function);
 
 		function.name = "iceberg_scan";
+#ifdef ICEBERG_VANE_DISTRIBUTED
+		ConfigureIcebergDistributedScan(function);
+#endif
 	}
 
 	parquet_scan_copy.name = "iceberg_scan";

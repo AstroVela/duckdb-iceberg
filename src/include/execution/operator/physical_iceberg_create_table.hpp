@@ -54,6 +54,10 @@ public:
 	OperatorResultType Execute(ExecutionContext &context, DataChunk &input, DataChunk &chunk,
 	                           GlobalOperatorState &gstate, OperatorState &state) const override;
 	void MakeCreateTableRequest(ClientContext &context, IcebergCreateTableGlobalState &gstate) const;
+#ifdef ICEBERG_VANE_DISTRIBUTED
+	void MakeCreateTableRequest(ClientContext &context, IcebergCreateTableGlobalState &gstate,
+	                            IcebergSchemaEntry &resolved_schema_entry) const;
+#endif
 	unique_ptr<GlobalOperatorState> GetGlobalOperatorState(ClientContext &context) const override;
 
 	bool ParallelOperator() const override {

@@ -88,6 +88,9 @@ public:
 	string GetTableProperty(string property_string) const;
 	bool PropertiesAllowPositionalDeletes(IcebergSnapshotOperationType operation_type) const;
 	string ToJSON() const;
+#ifdef ICEBERG_VANE_DISTRIBUTED
+	string ToDistributedScanJSON() const;
+#endif
 	void WriteMetadata(ClientContext &context, const string &path) const;
 	void WriteVersionHint(ClientContext &context, const string &path, const string &metadata_json_path) const;
 

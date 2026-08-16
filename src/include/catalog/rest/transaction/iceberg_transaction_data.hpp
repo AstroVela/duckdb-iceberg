@@ -28,6 +28,9 @@ public:
 	                 IcebergManifestDeletes &&altered_manifests);
 	void AddUpdateSnapshot(vector<IcebergManifestEntry> &&delete_files, vector<IcebergManifestEntry> &&data_files,
 	                       IcebergManifestDeletes &&altered_manifests);
+#ifdef ICEBERG_VANE_DISTRIBUTED
+	void RetainAddedSnapshotFilesOnRollback();
+#endif
 	// add a schema update for a table
 	void TableAddSchema(int32_t schema_id);
 	void TableSetCurrentSchema();
@@ -72,6 +75,9 @@ public:
 	bool assert_schema_id = false;
 	//! Whether the current schema of the table should be updated
 	bool set_schema_id = false;
+#ifdef ICEBERG_VANE_DISTRIBUTED
+	bool retain_added_snapshot_files_on_rollback = false;
+#endif
 	mutex lock;
 };
 

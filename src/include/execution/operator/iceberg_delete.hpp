@@ -11,6 +11,9 @@
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/planner/operator/logical_delete.hpp"
 #include "duckdb/common/multi_file/multi_file_reader.hpp"
+#ifdef ICEBERG_VANE_DISTRIBUTED
+#include "duckdb/execution/distributed/extension_write_task_provider.hpp"
+#endif
 
 #include "catalog/rest/catalog_entry/table/iceberg_table_entry.hpp"
 #include "catalog/rest/catalog_entry/schema/iceberg_schema_entry.hpp"
@@ -100,7 +103,12 @@ public:
 	}
 };
 
-class IcebergDelete : public PhysicalOperator {
+class IcebergDelete : public PhysicalOperator
+#ifdef ICEBERG_VANE_DISTRIBUTED
+    ,
+                      public distributed::ExtensionWriteTaskProvider
+#endif
+{
 public:
 #ifdef ICEBERG_ENABLE_EQUALITY_DELETE_WRITES
 	IcebergDelete(PhysicalPlan &physical_plan, IcebergTableEntry &table,
@@ -135,7 +143,38 @@ public:
 
 	vector<IcebergEqualityDeletePredicate> equality_predicates;
 
+#ifdef ICEBERG_VANE_DISTRIBUTED
+	distributed::DistributedExtensionWritePlan distributed_write_plan;
+	string distributed_catalog_name;
+	string distributed_schema_name;
+	string distributed_table_name;
+	string distributed_table_uuid;
+	string distributed_data_path;
+	string distributed_artifact_namespace;
+	int32_t distributed_schema_id = -1;
+	int32_t distributed_partition_spec_id = -1;
+	int32_t distributed_iceberg_version = 0;
+	bool distributed_has_snapshot = false;
+	int64_t distributed_snapshot_id = 0;
+	optional_ptr<PhysicalOperator> distributed_worker_child;
+	bool distributed_worker_plan_selected = false;
+#endif
+
 public:
+#ifdef ICEBERG_VANE_DISTRIBUTED
+	optional_ptr<distributed::ExtensionWriteTaskProvider> GetExtensionWriteTaskProvider() override;
+	const distributed::DistributedExtensionWritePlan &WritePlan() const override;
+	void ValidateDistributedWrite(ClientContext &context) const override;
+	idx_t FinalizeDistributedWrite(ClientContext &context,
+	                               const vector<DistributedWriteTaskResult> &results) const override;
+	void AbortDistributedWrite(ClientContext &context,
+	                           const vector<DistributedWriteTaskResult> &selected_results) const override;
+	void InitializeDistributedWritePlan(ClientContext &context);
+	void SelectDistributedWorkerPlan();
+	IcebergTableEntry &ResolveDistributedWriteTable(ClientContext &context) const;
+	void BuildPipelines(Pipeline &current, MetaPipeline &meta_pipeline) override;
+#endif
+
 	// // Source interface
 	SourceResultType GetDataInternal(ExecutionContext &context, DataChunk &chunk,
 	                                 OperatorSourceInput &input) const override;

@@ -605,6 +605,46 @@ string IcebergTableMetadata::ToJSON() const {
 	return ICUtils::JsonToString(std::move(doc_p));
 }
 
+#ifdef ICEBERG_VANE_DISTRIBUTED
+string IcebergTableMetadata::ToDistributedScanJSON() const {
+	if (table_uuid.empty() || schemas.find(current_schema_id) == schemas.end() ||
+	    partition_specs.find(default_spec_id) == partition_specs.end()) {
+		throw SerializationException("Cannot serialize incomplete Iceberg metadata for a distributed scan");
+	}
+	auto doc_p = unique_ptr<yyjson_mut_doc, YyjsonDocDeleter>(yyjson_mut_doc_new(nullptr));
+	auto doc = doc_p.get();
+	if (!doc) {
+		throw SerializationException("Failed to allocate distributed Iceberg scan metadata");
+	}
+	auto root = yyjson_mut_obj(doc);
+	if (!root) {
+		throw SerializationException("Failed to allocate distributed Iceberg scan metadata");
+	}
+	yyjson_mut_doc_set_root(doc, root);
+	yyjson_mut_obj_add_int(doc, root, "format-version", iceberg_version);
+	yyjson_mut_obj_add_strcpy(doc, root, "table-uuid", table_uuid.c_str());
+	yyjson_mut_obj_add_int(doc, root, "last-updated-ms", last_updated_ms.value);
+	if (last_column_id.IsValid()) {
+		yyjson_mut_obj_add_uint(doc, root, "last-column-id", last_column_id.GetIndex());
+	}
+	yyjson_mut_obj_add_val(doc, root, "schemas", SchemasToJSON(doc));
+	yyjson_mut_obj_add_int(doc, root, "current-schema-id", current_schema_id);
+	yyjson_mut_obj_add_val(doc, root, "partition-specs", PartitionsToJSON(doc));
+	yyjson_mut_obj_add_int(doc, root, "default-spec-id", default_spec_id);
+	if (last_partition_field_id.IsValid()) {
+		yyjson_mut_obj_add_uint(doc, root, "last-partition-id", last_partition_field_id.GetIndex());
+	}
+	auto properties = yyjson_mut_obj_add_obj(doc, root, "properties");
+	auto name_mapping = table_properties.find("schema.name-mapping.default");
+	if (!properties || (name_mapping != table_properties.end() &&
+	                    !yyjson_mut_obj_add_strncpy(doc, properties, "schema.name-mapping.default",
+	                                                name_mapping->second.c_str(), name_mapping->second.size()))) {
+		throw SerializationException("Failed to serialize distributed Iceberg scan properties");
+	}
+	return ICUtils::JsonToString(std::move(doc_p));
+}
+#endif
+
 void IcebergTableMetadata::WriteMetadata(ClientContext &context, const string &path) const {
 	auto &fs = FileSystem::GetFileSystem(context);
 

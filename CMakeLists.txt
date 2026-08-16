@@ -20,6 +20,15 @@ if(ICEBERG_ENABLE_EQUALITY_DELETE_WRITES)
 	add_definitions(-DICEBERG_ENABLE_EQUALITY_DELETE_WRITES)
 endif()
 
+option(ICEBERG_VANE_DISTRIBUTED
+       "Build the explicit Vane distributed scan and write interfaces" OFF)
+if(ICEBERG_VANE_DISTRIBUTED)
+	if(NOT EXISTS "${CMAKE_SOURCE_DIR}/src/include/duckdb/function/distributed_table_function.hpp")
+		message(FATAL_ERROR "ICEBERG_VANE_DISTRIBUTED requires the Vane DuckDB source tree")
+	endif()
+	add_definitions(-DICEBERG_VANE_DISTRIBUTED)
+endif()
+
 
 set(EXTENSION_SOURCES
 	src/catalog/rest/api/api_utils.cpp
@@ -116,6 +125,8 @@ set(EXTENSION_SOURCES
 	src/storage/statistics/iceberg_statistics.cpp
 )
 
+add_subdirectory(src/execution/operator)
+add_subdirectory(src/function/scan)
 add_subdirectory(src/rest_catalog/objects)
 
 add_library(${EXTENSION_NAME} STATIC ${EXTENSION_SOURCES} ${ALL_OBJECT_FILES})

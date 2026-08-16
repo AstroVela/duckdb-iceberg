@@ -5,6 +5,10 @@
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#ifdef ICEBERG_VANE_DISTRIBUTED
+#include "duckdb/execution/operator/projection/physical_projection.hpp"
+#include "execution/operator/iceberg_distributed_write.hpp"
+#endif
 
 #include "execution/operator/iceberg_delete.hpp"
 #include "execution/operator/iceberg_insert.hpp"
@@ -255,13 +259,78 @@ PhysicalOperator &IcebergCatalog::PlanUpdate(ClientContext &context, PhysicalPla
 	auto &update_op =
 	    IcebergUpdate::PlanUpdateOperator(context, planner, updated_table_entry, op, child_plan, copy_input);
 
+#ifdef ICEBERG_VANE_DISTRIBUTED
+	vector<unique_ptr<Expression>> distributed_expressions;
+	vector<LogicalType> distributed_types;
+	for (auto &expression : update_op.expressions) {
+		distributed_types.push_back(expression->return_type);
+		distributed_expressions.push_back(expression->Copy());
+	}
+	if (table_metadata.iceberg_version >= 3) {
+		auto row_id_input_index = child_plan.types.size() - 3;
+		distributed_types.push_back(LogicalType::BIGINT);
+		distributed_expressions.push_back(make_uniq<BoundReferenceExpression>(LogicalType::BIGINT, row_id_input_index));
+	}
+	auto file_path_input_index = child_plan.types.size() - 2;
+	auto row_position_input_index = child_plan.types.size() - 1;
+	distributed_types.push_back(LogicalType::VARCHAR);
+	distributed_expressions.push_back(make_uniq<BoundReferenceExpression>(LogicalType::VARCHAR, file_path_input_index));
+	distributed_types.push_back(LogicalType::BIGINT);
+	distributed_expressions.push_back(
+	    make_uniq<BoundReferenceExpression>(LogicalType::BIGINT, row_position_input_index));
+	auto &distributed_update =
+	    planner
+	        .Make<PhysicalProjection>(std::move(distributed_types), std::move(distributed_expressions),
+	                                  child_plan.estimated_cardinality)
+	        .Cast<PhysicalProjection>();
+	distributed_update.children.push_back(child_plan);
+#endif
+
 	optional_ptr<PhysicalOperator> plan = &update_op;
+#ifdef ICEBERG_VANE_DISTRIBUTED
+	auto &copy_op = IcebergInsert::PlanCopyForInsert(context, planner, copy_input, plan).Cast<PhysicalCopyToFile>();
+#else
 	auto &copy_op = IcebergInsert::PlanCopyForInsert(context, planner, copy_input, plan);
+#endif
 
 	// Plan the insert sink and wire it up
 	auto &insert_op = IcebergInsert::PlanInsert(context, planner, updated_table_entry).Cast<IcebergInsert>();
+#ifdef ICEBERG_VANE_DISTRIBUTED
+	optional_ptr<PhysicalOperator> distributed_worker_input = &distributed_update;
+	if (copy_op.children.size() == 1 && copy_op.children[0].get().type == PhysicalOperatorType::PROJECTION) {
+		auto &partition_projection = copy_op.children[0].get().Cast<PhysicalProjection>();
+		if (partition_projection.children.size() == 1 && &partition_projection.children[0].get() == &update_op) {
+			vector<unique_ptr<Expression>> expressions;
+			vector<LogicalType> types = partition_projection.types;
+			for (auto &expression : partition_projection.select_list) {
+				expressions.push_back(expression->Copy());
+			}
+			auto delete_column_start = update_op.types.size();
+			types.push_back(LogicalType::VARCHAR);
+			expressions.push_back(make_uniq<BoundReferenceExpression>(LogicalType::VARCHAR, delete_column_start));
+			types.push_back(LogicalType::BIGINT);
+			expressions.push_back(make_uniq<BoundReferenceExpression>(LogicalType::BIGINT, delete_column_start + 1));
+			auto &distributed_partition_projection =
+			    planner
+			        .Make<PhysicalProjection>(std::move(types), std::move(expressions),
+			                                  distributed_update.estimated_cardinality)
+			        .Cast<PhysicalProjection>();
+			distributed_partition_projection.children.push_back(distributed_update);
+			distributed_worker_input = &distributed_partition_projection;
+		}
+	}
+	if (distributed_worker_input->types.size() < 2) {
+		throw InternalException("Iceberg distributed UPDATE worker input is missing row identifiers");
+	}
+	auto file_path_index = distributed_worker_input->types.size() - 2;
+	auto &distributed_repartition =
+	    PlanIcebergDistributedRowDeltaRepartition(planner, *distributed_worker_input, file_path_index);
+	insert_op.children.push_back(copy_op);
+	insert_op.ConfigureDistributedUpdate(context, copy_op, distributed_repartition, update_op.delete_op);
+#else
 	insert_op.update_delete_op = update_op.delete_op;
 	insert_op.children.push_back(copy_op);
+#endif
 	return insert_op;
 }
 

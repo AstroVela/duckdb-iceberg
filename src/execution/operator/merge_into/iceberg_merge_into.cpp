@@ -114,7 +114,11 @@ static unique_ptr<MergeIntoOperator> IcebergPlanMergeIntoAction(IcebergCatalog &
 
 	switch (action.action_type) {
 	case MergeActionType::MERGE_UPDATE: {
+#ifdef ICEBERG_VANE_DISTRIBUTED
+		LogicalUpdate update(context, op.table);
+#else
 		LogicalUpdate update(op.table);
+#endif
 		for (auto &def : op.bound_defaults) {
 			update.bound_defaults.push_back(def->Copy());
 		}
@@ -151,7 +155,11 @@ static unique_ptr<MergeIntoOperator> IcebergPlanMergeIntoAction(IcebergCatalog &
 		break;
 	}
 	case MergeActionType::MERGE_DELETE: {
+#ifdef ICEBERG_VANE_DISTRIBUTED
+		LogicalDelete delete_op(context, op.table, 0);
+#else
 		LogicalDelete delete_op(op.table, 0);
+#endif
 
 		// we only push 2 columns for positional deletes
 		idx_t column_offset = 0;
@@ -170,7 +178,11 @@ static unique_ptr<MergeIntoOperator> IcebergPlanMergeIntoAction(IcebergCatalog &
 		break;
 	}
 	case MergeActionType::MERGE_INSERT: {
+#ifdef ICEBERG_VANE_DISTRIBUTED
+		LogicalInsert insert_op(context, op.table, 0);
+#else
 		LogicalInsert insert_op(op.table, 0);
+#endif
 		insert_op.bound_constraints = std::move(bound_constraints);
 		for (auto &def : op.bound_defaults) {
 			insert_op.bound_defaults.push_back(def->Copy());

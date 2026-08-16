@@ -713,6 +713,13 @@ void IcebergTransaction::CleanupFiles() {
 				continue;
 			}
 			auto &transaction_data = table.transaction_data;
+#ifdef ICEBERG_VANE_DISTRIBUTED
+			if (transaction_data->retain_added_snapshot_files_on_rollback) {
+				// Distributed finalization has an unknown outcome once catalog commit starts.
+				// Deleting these files could corrupt a snapshot whose commit response was lost.
+				continue;
+			}
+#endif
 			for (auto &update : transaction_data->updates) {
 				if (update->type != IcebergTableUpdateType::ADD_SNAPSHOT) {
 					continue;
