@@ -23,7 +23,7 @@ endif()
 option(ICEBERG_VANE_DISTRIBUTED
        "Build the explicit Vane distributed scan and write interfaces" OFF)
 if(ICEBERG_VANE_DISTRIBUTED)
-	if(NOT EXISTS "${CMAKE_SOURCE_DIR}/src/include/duckdb/function/distributed_table_function.hpp")
+	if(NOT EXISTS "${DUCKDB_SOURCE_PATH}/src/include/duckdb/function/distributed_table_function.hpp")
 		message(FATAL_ERROR "ICEBERG_VANE_DISTRIBUTED requires the Vane DuckDB source tree")
 	endif()
 	add_definitions(-DICEBERG_VANE_DISTRIBUTED)
