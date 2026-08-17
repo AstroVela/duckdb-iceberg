@@ -110,7 +110,7 @@ void GuaranteeEqualityDeleteColumnsOptimizer::VisitOperator(unique_ptr<LogicalOp
 		auto &iceberg_list = mfbd.file_list->Cast<IcebergMultiFileList>();
 		unordered_set<int32_t> required_field_ids;
 #ifdef ICEBERG_VANE_DISTRIBUTED
-		if (iceberg_list.HasDistributedCoordinatorScanTasks()) {
+		if (iceberg_list.HasDistributedScanPlan()) {
 			for (auto field_id : iceberg_list.GetDistributedEqualityDeleteFieldIds()) {
 				required_field_ids.insert(field_id);
 			}
@@ -152,7 +152,7 @@ void GuaranteeEqualityDeleteColumnsOptimizer::VisitOperator(unique_ptr<LogicalOp
 				// problem
 #ifdef ICEBERG_VANE_DISTRIBUTED
 				optional_ptr<const IcebergColumnDefinition> col_info;
-				if (iceberg_list.HasDistributedCoordinatorScanTasks()) {
+				if (iceberg_list.HasDistributedScanPlan()) {
 					col_info = iceberg_list.GetMetadata().FindColumnByFieldId(fid);
 				} else {
 					auto table = iceberg_list.GetTable();
@@ -178,7 +178,7 @@ void GuaranteeEqualityDeleteColumnsOptimizer::VisitOperator(unique_ptr<LogicalOp
 				}
 				new_col.identifier = col_info->id;
 #ifdef ICEBERG_VANE_DISTRIBUTED
-				if (iceberg_list.HasDistributedCoordinatorScanTasks()) {
+				if (iceberg_list.HasDistributedScanPlan()) {
 					schema_idx = AddDistributedEqualityDeleteColumn(get, mfbd, new_col);
 				} else {
 #endif

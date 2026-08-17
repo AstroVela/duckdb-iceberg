@@ -143,8 +143,8 @@ string IcebergMultiFileList::GetPath() const {
 
 const IcebergTableMetadata &IcebergMultiFileList::GetMetadata() const {
 #ifdef ICEBERG_VANE_DISTRIBUTED
-	if (distributed_scan && distributed_scan->HasCoordinatorScanInfo()) {
-		return distributed_scan->GetCoordinatorMetadata();
+	if (distributed_scan && distributed_scan->HasPlannedScanInfo()) {
+		return distributed_scan->GetPlannedMetadata();
 	}
 #endif
 	return shared_state->scan_info->metadata;
@@ -152,7 +152,7 @@ const IcebergTableMetadata &IcebergMultiFileList::GetMetadata() const {
 
 bool IcebergMultiFileList::HasTransactionData() const {
 #ifdef ICEBERG_VANE_DISTRIBUTED
-	if (distributed_scan && distributed_scan->HasCoordinatorScanInfo()) {
+	if (distributed_scan && distributed_scan->HasPlannedScanInfo()) {
 		return false;
 	}
 #endif
@@ -161,8 +161,8 @@ bool IcebergMultiFileList::HasTransactionData() const {
 
 const IcebergTransactionData &IcebergMultiFileList::GetTransactionData() const {
 #ifdef ICEBERG_VANE_DISTRIBUTED
-	if (distributed_scan && distributed_scan->HasCoordinatorScanInfo()) {
-		throw InternalException("Materialized distributed Iceberg scans do not retain transaction data");
+	if (distributed_scan && distributed_scan->HasPlannedScanInfo()) {
+		throw InternalException("Planned distributed Iceberg scans do not retain transaction data");
 	}
 #endif
 	D_ASSERT(HasTransactionData());
@@ -171,8 +171,8 @@ const IcebergTransactionData &IcebergMultiFileList::GetTransactionData() const {
 
 const IcebergSnapshotScanInfo &IcebergMultiFileList::GetSnapshot() const {
 #ifdef ICEBERG_VANE_DISTRIBUTED
-	if (distributed_scan && distributed_scan->HasCoordinatorScanInfo()) {
-		return distributed_scan->GetCoordinatorSnapshot();
+	if (distributed_scan && distributed_scan->HasPlannedScanInfo()) {
+		return distributed_scan->GetPlannedSnapshot();
 	}
 #endif
 	return shared_state->scan_info->snapshot_info;
@@ -180,8 +180,8 @@ const IcebergSnapshotScanInfo &IcebergMultiFileList::GetSnapshot() const {
 
 const IcebergTableSchema &IcebergMultiFileList::GetSchema() const {
 #ifdef ICEBERG_VANE_DISTRIBUTED
-	if (distributed_scan && distributed_scan->HasCoordinatorScanInfo()) {
-		return distributed_scan->GetCoordinatorSchema();
+	if (distributed_scan && distributed_scan->HasPlannedScanInfo()) {
+		return distributed_scan->GetPlannedSchema();
 	}
 #endif
 	return shared_state->scan_info->schema;
@@ -193,7 +193,7 @@ bool IcebergMultiFileList::FinishedScanningDeletes() const {
 
 IcebergTableEntry *IcebergMultiFileList::GetTable() const {
 #ifdef ICEBERG_VANE_DISTRIBUTED
-	if (distributed_scan && distributed_scan->HasCoordinatorScanInfo()) {
+	if (distributed_scan && distributed_scan->HasPlannedScanInfo()) {
 		return nullptr;
 	}
 #endif
@@ -1325,8 +1325,8 @@ void IcebergMultiFileList::ProcessDeletes(const vector<MultiFileColumnDefinition
                                           const vector<idx_t> &projection_ids) const {
 #ifdef ICEBERG_VANE_DISTRIBUTED
 	if (distributed_scan) {
-		if (distributed_scan->IsCoordinatorTaskSet()) {
-			throw InvalidInputException("A frozen distributed Iceberg coordinator scan cannot be executed directly; "
+		if (distributed_scan->HasPlannedTasks()) {
+			throw InvalidInputException("A planned distributed Iceberg scan cannot be executed directly; "
 			                            "create a worker bind and assign its scan tasks");
 		}
 		return;
@@ -1480,75 +1480,74 @@ shared_ptr<IcebergDeleteData> IcebergMultiFileList::GetExistingPositionalDeleteD
 }
 
 #ifdef ICEBERG_VANE_DISTRIBUTED
-void IcebergMultiFileList::InstallDistributedCoordinatorScanTasks(vector<string> payloads,
-                                                                  shared_ptr<IcebergScanInfo> scan_info,
-                                                                  string scan_set_id, string table_uuid,
-                                                                  bool has_snapshot, int64_t snapshot_id) {
+void IcebergMultiFileList::InitializeDistributedScanPlan(vector<string> payloads, shared_ptr<IcebergScanInfo> scan_info,
+                                                         string scan_task_set_id, string table_uuid, bool has_snapshot,
+                                                         int64_t snapshot_id) {
 	if (!distributed_scan) {
 		distributed_scan = make_shared_ptr<IcebergDistributedScanState>();
 	}
-	distributed_scan->InstallCoordinatorTasks(std::move(payloads), std::move(scan_info), std::move(scan_set_id),
-	                                          std::move(table_uuid), has_snapshot, snapshot_id);
+	distributed_scan->InitializePlannedScan(std::move(payloads), std::move(scan_info), std::move(scan_task_set_id),
+	                                        std::move(table_uuid), has_snapshot, snapshot_id);
 }
 
-void IcebergMultiFileList::ConfigureDistributedWorkerEqualityDeleteMapping(
-    unordered_map<int32_t, idx_t> field_id_to_output_index, unordered_map<int32_t, LogicalType> field_id_to_type,
-    string scan_set_id) {
+void IcebergMultiFileList::InitializeDistributedWorkerScan(unordered_map<int32_t, idx_t> field_id_to_output_index,
+                                                           unordered_map<int32_t, LogicalType> field_id_to_type,
+                                                           string scan_task_set_id) {
 	if (!distributed_scan) {
 		distributed_scan = make_shared_ptr<IcebergDistributedScanState>();
 	}
-	distributed_scan->ConfigureWorkerEqualityDeleteMapping(std::move(field_id_to_output_index),
-	                                                       std::move(field_id_to_type), std::move(scan_set_id));
+	distributed_scan->InitializeWorkerScan(std::move(field_id_to_output_index), std::move(field_id_to_type),
+	                                       std::move(scan_task_set_id));
 }
 
-void IcebergMultiFileList::InstallDistributedWorkerScanTasks(vector<string> payloads) {
+void IcebergMultiFileList::AssignDistributedScanTasks(vector<string> payloads) {
 	if (!distributed_scan) {
 		throw InternalException("Distributed Iceberg worker scan was not configured before task assignment");
 	}
-	distributed_scan->InstallWorkerTasks(std::move(payloads));
+	distributed_scan->AssignWorkerTasks(std::move(payloads));
 }
 
-bool IcebergMultiFileList::HasDistributedCoordinatorScanTasks() const {
-	return distributed_scan && distributed_scan->IsCoordinatorTaskSet();
+bool IcebergMultiFileList::HasDistributedScanPlan() const {
+	return distributed_scan && distributed_scan->HasPlannedTasks();
 }
 
-bool IcebergMultiFileList::HasDistributedWorkerScanTasks() const {
-	return distributed_scan && distributed_scan->IsWorkerTaskSet();
+bool IcebergMultiFileList::HasDistributedWorkerScan() const {
+	return distributed_scan && distributed_scan->HasWorkerScan();
 }
 
-const string &IcebergMultiFileList::GetDistributedCoordinatorScanSetId() const {
+const string &IcebergMultiFileList::GetDistributedScanTaskSetId() const {
 	if (!distributed_scan) {
-		throw InternalException("Distributed Iceberg scan has no coordinator identity");
+		throw InternalException("Distributed Iceberg scan has no planned identity");
 	}
-	return distributed_scan->GetCoordinatorScanSetId();
+	return distributed_scan->GetScanTaskSetId();
 }
 
-const string &IcebergMultiFileList::GetDistributedCoordinatorTableUUID() const {
+const string &IcebergMultiFileList::GetDistributedScanTableUUID() const {
 	if (!distributed_scan) {
-		throw InternalException("Distributed Iceberg scan has no coordinator identity");
+		throw InternalException("Distributed Iceberg scan has no planned identity");
 	}
-	return distributed_scan->GetCoordinatorTableUUID();
+	return distributed_scan->GetPlannedTableUUID();
 }
 
-bool IcebergMultiFileList::DistributedCoordinatorHasSnapshot() const {
+bool IcebergMultiFileList::DistributedScanHasSnapshot() const {
 	if (!distributed_scan) {
-		throw InternalException("Distributed Iceberg scan has no coordinator identity");
+		throw InternalException("Distributed Iceberg scan has no planned identity");
 	}
-	return distributed_scan->CoordinatorHasSnapshot();
+	return distributed_scan->PlannedScanHasSnapshot();
 }
 
-int64_t IcebergMultiFileList::GetDistributedCoordinatorSnapshotId() const {
+int64_t IcebergMultiFileList::GetDistributedScanSnapshotId() const {
 	if (!distributed_scan) {
-		throw InternalException("Distributed Iceberg scan has no coordinator identity");
+		throw InternalException("Distributed Iceberg scan has no planned identity");
 	}
-	return distributed_scan->GetCoordinatorSnapshotId();
+	return distributed_scan->GetPlannedSnapshotId();
 }
 
 string IcebergMultiFileList::GetDistributedScanTaskPayload(idx_t file_id) const {
 	if (!distributed_scan) {
-		throw InternalException("Distributed Iceberg scan has no materialized task set");
+		throw InternalException("Distributed Iceberg scan has no planned task set");
 	}
-	return distributed_scan->GetTaskPayload(file_id);
+	return distributed_scan->GetPlannedTaskPayload(file_id);
 }
 
 vector<int32_t> IcebergMultiFileList::GetDistributedEqualityDeleteFieldIds() const {

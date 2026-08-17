@@ -138,19 +138,18 @@ public:
 	vector<BoundIcebergManifestEntry> GetDeleteManifestEntries() const;
 	shared_ptr<IcebergDeleteData> GetExistingPositionalDeleteData(const string &file_path) const;
 #ifdef ICEBERG_VANE_DISTRIBUTED
-	void InstallDistributedCoordinatorScanTasks(vector<string> payloads, shared_ptr<IcebergScanInfo> scan_info,
-	                                            string scan_set_id, string table_uuid, bool has_snapshot,
-	                                            int64_t snapshot_id);
-	void ConfigureDistributedWorkerEqualityDeleteMapping(unordered_map<int32_t, idx_t> field_id_to_output_index,
-	                                                     unordered_map<int32_t, LogicalType> field_id_to_type,
-	                                                     string scan_set_id);
-	void InstallDistributedWorkerScanTasks(vector<string> payloads);
-	bool HasDistributedCoordinatorScanTasks() const;
-	bool HasDistributedWorkerScanTasks() const;
-	const string &GetDistributedCoordinatorScanSetId() const;
-	const string &GetDistributedCoordinatorTableUUID() const;
-	bool DistributedCoordinatorHasSnapshot() const;
-	int64_t GetDistributedCoordinatorSnapshotId() const;
+	void InitializeDistributedScanPlan(vector<string> payloads, shared_ptr<IcebergScanInfo> scan_info,
+	                                   string scan_task_set_id, string table_uuid, bool has_snapshot,
+	                                   int64_t snapshot_id);
+	void InitializeDistributedWorkerScan(unordered_map<int32_t, idx_t> field_id_to_output_index,
+	                                     unordered_map<int32_t, LogicalType> field_id_to_type, string scan_task_set_id);
+	void AssignDistributedScanTasks(vector<string> payloads);
+	bool HasDistributedScanPlan() const;
+	bool HasDistributedWorkerScan() const;
+	const string &GetDistributedScanTaskSetId() const;
+	const string &GetDistributedScanTableUUID() const;
+	bool DistributedScanHasSnapshot() const;
+	int64_t GetDistributedScanSnapshotId() const;
 	string GetDistributedScanTaskPayload(idx_t file_id) const;
 	vector<int32_t> GetDistributedEqualityDeleteFieldIds() const;
 #endif

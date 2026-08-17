@@ -44,10 +44,10 @@ void ValidateIcebergDistributedTargetPartitionSpec(const IcebergTableMetadata &m
 void ValidateIcebergDistributedRowDeltaSourceBaseline(const IcebergMultiFileList &file_list,
                                                       const IcebergTableMetadata &target_metadata,
                                                       const string &operation_name) {
-	if (!file_list.HasDistributedCoordinatorScanTasks()) {
-		throw InvalidInputException("Distributed Iceberg %s requires a frozen source scan", operation_name);
+	if (!file_list.HasDistributedScanPlan()) {
+		throw InvalidInputException("Distributed Iceberg %s requires a planned source scan", operation_name);
 	}
-	if (file_list.GetDistributedCoordinatorTableUUID() != target_metadata.table_uuid) {
+	if (file_list.GetDistributedScanTableUUID() != target_metadata.table_uuid) {
 		throw TransactionException(
 		    "Iceberg table identity changed between the distributed %s source scan and write planning", operation_name);
 	}
@@ -56,9 +56,9 @@ void ValidateIcebergDistributedRowDeltaSourceBaseline(const IcebergMultiFileList
 		    "Iceberg table schema changed between the distributed %s source scan and write planning", operation_name);
 	}
 	auto target_snapshot = target_metadata.GetLatestSnapshot();
-	auto source_has_snapshot = file_list.DistributedCoordinatorHasSnapshot();
+	auto source_has_snapshot = file_list.DistributedScanHasSnapshot();
 	if (source_has_snapshot != (target_snapshot != nullptr) ||
-	    (target_snapshot && file_list.GetDistributedCoordinatorSnapshotId() != target_snapshot->snapshot_id)) {
+	    (target_snapshot && file_list.GetDistributedScanSnapshotId() != target_snapshot->snapshot_id)) {
 		throw TransactionException(
 		    "Iceberg table snapshot changed between the distributed %s source scan and write planning", operation_name);
 	}

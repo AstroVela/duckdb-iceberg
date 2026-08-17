@@ -162,6 +162,7 @@ public:
 
 public:
 #ifdef ICEBERG_VANE_DISTRIBUTED
+	//! Vane distributed-write runtime interface.
 	optional_ptr<distributed::ExtensionWriteTaskProvider> GetExtensionWriteTaskProvider() override;
 	const distributed::DistributedExtensionWritePlan &WritePlan() const override;
 	void ValidateDistributedWrite(ClientContext &context) const override;
@@ -169,12 +170,17 @@ public:
 	                               const vector<DistributedWriteTaskResult> &results) const override;
 	void AbortDistributedWrite(ClientContext &context,
 	                           const vector<DistributedWriteTaskResult> &selected_results) const override;
-	void InitializeDistributedWritePlan(ClientContext &context);
-	void SelectDistributedWorkerPlan();
-	IcebergTableEntry &ResolveDistributedWriteTable(ClientContext &context) const;
 	void BuildPipelines(Pipeline &current, MetaPipeline &meta_pipeline) override;
 #endif
 
+private:
+#ifdef ICEBERG_VANE_DISTRIBUTED
+	void InitializeDistributedWritePlan(ClientContext &context);
+	void SelectDistributedWorkerPlan();
+	IcebergTableEntry &ResolveDistributedWriteTable(ClientContext &context) const;
+#endif
+
+public:
 	// // Source interface
 	SourceResultType GetDataInternal(ExecutionContext &context, DataChunk &chunk,
 	                                 OperatorSourceInput &input) const override;

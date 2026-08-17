@@ -146,6 +146,7 @@ public:
 
 public:
 #ifdef ICEBERG_VANE_DISTRIBUTED
+	//! Vane distributed-write runtime interface.
 	optional_ptr<distributed::ExtensionWriteTaskProvider> GetExtensionWriteTaskProvider() override;
 	const distributed::DistributedExtensionWritePlan &WritePlan() const override;
 	void ValidateDistributedWrite(ClientContext &context) const override;
@@ -154,18 +155,24 @@ public:
 	void AbortDistributedWrite(ClientContext &context,
 	                           const vector<DistributedWriteTaskResult> &selected_results) const override;
 
-	void InitializeDistributedWritePlan();
+	//! Distributed-write planning entry points used by other physical planners.
 	void InitializeDistributedWriteTarget(IcebergTableEntry &table_entry, ClientContext &context);
 	void ConfigureDistributedCTAS(PhysicalIcebergCreateTable &create, PhysicalCopyToFile &native_copy,
 	                              PhysicalCopyToFile &worker_copy, string data_path, bool has_void_partition_transform);
 	void ConfigureDistributedUpdate(ClientContext &context, PhysicalCopyToFile &copy, PhysicalOperator &worker_input,
 	                                PhysicalOperator &delete_op);
-	void SelectDistributedWorkerPlan();
-	void ValidateDistributedWriteShape() const;
-	IcebergTableEntry &ResolveDistributedWriteTable(ClientContext &context) const;
 	void BuildPipelines(Pipeline &current, MetaPipeline &meta_pipeline) override;
 #endif
 
+private:
+#ifdef ICEBERG_VANE_DISTRIBUTED
+	void InitializeDistributedWritePlan();
+	void SelectDistributedWorkerPlan();
+	void ValidateDistributedWriteShape() const;
+	IcebergTableEntry &ResolveDistributedWriteTable(ClientContext &context) const;
+#endif
+
+public:
 	// Source interface
 	SourceResultType GetDataInternal(ExecutionContext &context, DataChunk &chunk,
 	                                 OperatorSourceInput &input) const override;
