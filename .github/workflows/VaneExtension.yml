@@ -15,9 +15,9 @@ permissions:
 jobs:
   vane-native:
     # The called workflow verifies its exact SHA from GitHub job metadata.
-    uses: AstroVela/vane-extension-ci-tools/.github/workflows/_vane_extension_ci.yml@b3229fa44b261890e4555d8b595f1b5863562366
+    uses: AstroVela/vane-extension-ci-tools/.github/workflows/_vane_extension_ci.yml@28c253d71645b627e90307a8c0f42bf74bda0046
     with:
-      ci_tools_version: b3229fa44b261890e4555d8b595f1b5863562366
+      ci_tools_version: 28c253d71645b627e90307a8c0f42bf74bda0046
       manifest: vane-extension.toml
       build_jobs: 12
       run_native_tests: true
