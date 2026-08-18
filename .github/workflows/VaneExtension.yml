@@ -19,5 +19,5 @@ jobs:
     with:
       ci_tools_version: b3229fa44b261890e4555d8b595f1b5863562366
       manifest: vane-extension.toml
-      build_jobs: 8
+      build_jobs: 12
       run_native_tests: true
