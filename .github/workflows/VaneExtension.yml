@@ -21,3 +21,71 @@ jobs:
       manifest: vane-extension.toml
       build_jobs: 12
       run_native_tests: true
+
+  vane-wheel-iceberg-integration:
+    name: Vane wheel local Iceberg integration
+    needs: vane-native
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      VANE_RUNNER: local-fast
+
+    steps:
+      - name: Checkout extension
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Download verified Vane wheel
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: vane-iceberg-wheel
+          path: vane-wheel
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Start local Iceberg fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p data/generated/iceberg/spark-rest data/generated/intermediates
+          docker compose -f scripts/docker-compose.yml down -v
+          docker compose -f scripts/docker-compose.yml up -d
+
+      - name: Wait for fixture initialization
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 90); do
+            if docker compose -f scripts/docker-compose.yml logs mc 2>&1 | grep -Fq \
+              'MinIO warehouse and default namespace initialized.'; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker compose -f scripts/docker-compose.yml logs
+          exit 1
+
+      - name: Exercise Iceberg through the packaged Vane wheel
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m venv .venv-vane-wheel-integration
+          . .venv-vane-wheel-integration/bin/activate
+          mapfile -t wheels < <(find vane-wheel -maxdepth 1 -type f -name '*.whl' -print | sort)
+          if [ "${#wheels[@]}" -ne 1 ]; then
+            printf 'expected exactly one Vane wheel, found %s\n' "${#wheels[@]}" >&2
+            exit 1
+          fi
+          python -m pip install --disable-pip-version-check "${wheels[0]}"
+          python -I test/vane/test_vane_wheel_iceberg.py
+
+      - name: Stop local Iceberg fixture
+        if: always()
+        run: docker compose -f scripts/docker-compose.yml down -v
