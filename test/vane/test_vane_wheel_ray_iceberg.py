@@ -137,20 +137,23 @@ def count_distributed_scan_tasks(vane: object, connection: object) -> int:
     return sum(len(tasks) for tasks in plan.scan_task_descriptor_map().values())
 
 
-def annotate_worker_node(table: object) -> object:
-    import pyarrow as pa
-    import ray
+class AnnotateWorkerNode:
+    """Zero-argument actor UDF that records the Ray node for each batch."""
 
-    # Several batches stay runnable long enough for both one-CPU worker nodes
-    # to consume the Iceberg-backed stream.
-    time.sleep(0.05)
-    node_id = str(ray.get_runtime_context().get_node_id())
-    return pa.table(
-        {
-            "id": table.column("id"),
-            "worker_node_id": [node_id] * table.num_rows,
-        }
-    )
+    def __call__(self, table: object) -> object:
+        import pyarrow as pa
+        import ray
+
+        # Several batches stay runnable long enough for both one-CPU worker
+        # nodes to consume the Iceberg-backed stream.
+        time.sleep(0.05)
+        node_id = str(ray.get_runtime_context().get_node_id())
+        return pa.table(
+            {
+                "id": table.column("id"),
+                "worker_node_id": [node_id] * table.num_rows,
+            }
+        )
 
 
 def assert_vane_worker_topology(ray: object, runner: object) -> None:
@@ -235,7 +238,7 @@ def main() -> None:
             )
 
         annotated_rows = connection.sql(f"SELECT id, payload FROM {SOURCE_TABLE}").map_batches(
-            annotate_worker_node,
+            AnnotateWorkerNode,
             schema={"id": vane.sqltype("INTEGER"), "worker_node_id": vane.sqltype("VARCHAR")},
             batch_size=64,
             cpus=1.0,
