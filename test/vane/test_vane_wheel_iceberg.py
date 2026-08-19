@@ -38,8 +38,7 @@ def wait_for_http_endpoint(endpoint: str) -> None:
 
 def verify_extension_is_wheel_linked(connection: object) -> None:
     extension = connection.execute(
-        "SELECT loaded, install_mode FROM duckdb_extensions() "
-        "WHERE extension_name = 'iceberg'"
+        "SELECT loaded, install_mode FROM duckdb_extensions() " "WHERE extension_name = 'iceberg'"
     ).fetchone()
     if extension is None:
         raise AssertionError("the packaged Vane wheel does not contain iceberg")
@@ -47,8 +46,7 @@ def verify_extension_is_wheel_linked(connection: object) -> None:
 
     connection.execute("LOAD iceberg")
     loaded = connection.execute(
-        "SELECT loaded, install_mode FROM duckdb_extensions() "
-        "WHERE extension_name = 'iceberg'"
+        "SELECT loaded, install_mode FROM duckdb_extensions() " "WHERE extension_name = 'iceberg'"
     ).fetchone()
     require_equal(loaded, (True, "STATICALLY_LINKED"), "iceberg after LOAD")
     connection.execute("LOAD httpfs")
@@ -88,26 +86,18 @@ def main() -> None:
         )
         connection.execute(f"CREATE SCHEMA IF NOT EXISTS {CATALOG_NAME}.default")
         connection.execute(f"DROP TABLE IF EXISTS {TABLE}")
-        connection.execute(
-            f"CREATE TABLE {TABLE} (id INTEGER, payload VARCHAR) "
-            "WITH ('format-version' = '2')"
-        )
-        connection.execute(
-            f"INSERT INTO {TABLE} VALUES (1, 'one'), (2, 'two'), (3, 'three')"
-        )
+        connection.execute(f"CREATE TABLE {TABLE} (id INTEGER, payload VARCHAR) " "WITH ('format-version' = '2')")
+        connection.execute(f"INSERT INTO {TABLE} VALUES (1, 'one'), (2, 'two'), (3, 'three')")
         require_equal(
             connection.execute(f"SELECT id, payload FROM {TABLE} ORDER BY id").fetchall(),
             [(1, "one"), (2, "two"), (3, "three")],
             "Iceberg scan after INSERT",
         )
 
-        connection.execute(
-            f"CALL set_iceberg_table_properties({TABLE}, {{'vane.integration': 'wheel'}})"
-        )
+        connection.execute(f"CALL set_iceberg_table_properties({TABLE}, {{'vane.integration': 'wheel'}})")
         require_equal(
             connection.execute(
-                f"SELECT key, value FROM iceberg_table_properties({TABLE}) "
-                "WHERE key = 'vane.integration'"
+                f"SELECT key, value FROM iceberg_table_properties({TABLE}) " "WHERE key = 'vane.integration'"
             ).fetchall(),
             [("vane.integration", "wheel")],
             "Iceberg metadata update",
