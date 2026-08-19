@@ -582,6 +582,25 @@ public:
 
 	IcebergDistributedScanBindData() = default;
 
+	static IcebergDistributedScanBindData FromPlannedState(const MultiFileBindData &source, int32_t schema_id_p,
+	                                                       string metadata_json_p, string scan_task_set_id_p,
+	                                                       string table_uuid_p, bool has_snapshot_p,
+	                                                       int64_t snapshot_id_p) {
+		IcebergDistributedScanBindData result;
+		result.InitializePortableBindState(source);
+		if (metadata_json_p.empty() || scan_task_set_id_p.empty() || table_uuid_p.empty() ||
+		    (!has_snapshot_p && snapshot_id_p != 0)) {
+			throw SerializationException("Distributed Iceberg planned scan has an incomplete identity");
+		}
+		result.schema_id = schema_id_p;
+		result.metadata_json = std::move(metadata_json_p);
+		result.scan_task_set_id = std::move(scan_task_set_id_p);
+		result.table_uuid = std::move(table_uuid_p);
+		result.has_snapshot = has_snapshot_p;
+		result.snapshot_id = snapshot_id_p;
+		return result;
+	}
+
 	static IcebergDistributedScanBindData FromWorkerTemplate(const MultiFileBindData &source,
 	                                                         const IcebergDistributedWorkerScanInfo &worker_scan_info) {
 		IcebergDistributedScanBindData result;
@@ -792,8 +811,8 @@ static void IcebergDistributedScanSerialize(Serializer &serializer, const option
 		serializer.WriteProperty(3, "planned_tasks", vector<string> {});
 		return;
 	}
-	auto &multi_bind = bind_data->CastNoConst<MultiFileBindData>();
-	auto &file_list = multi_bind.file_list->Cast<IcebergMultiFileList>();
+	const auto &multi_bind = bind_data->Cast<MultiFileBindData>();
+	const auto &file_list = multi_bind.file_list->Cast<IcebergMultiFileList>();
 	if (file_list.HasDistributedWorkerScan()) {
 		// Vane materializes and then clones worker fragment templates for each task
 		// attempt. Keep the worker bind stable across every template serde round-trip;
@@ -819,9 +838,17 @@ static void IcebergDistributedScanSerialize(Serializer &serializer, const option
 		auto metadata_json = SerializeWorkerMetadata(metadata);
 		auto has_snapshot = snapshot.snapshot != nullptr;
 		auto snapshot_id = has_snapshot ? snapshot.snapshot->snapshot_id : 0;
-		auto owned_scan_info = CreateOwnedDistributedScanInfo(metadata_json, schema_id);
-		file_list.InitializeDistributedScanPlan(planned_tasks, std::move(owned_scan_info), std::move(scan_task_set_id),
-		                                        metadata.table_uuid, has_snapshot, snapshot_id);
+		// DuckDB also invokes table-function serializers while deriving native
+		// optimizer plan signatures. Build an isolated transport snapshot so that
+		// serialization never turns the executable coordinator bind into planned
+		// driver state.
+		auto planned_bind_state = IcebergDistributedScanBindData::FromPlannedState(
+		    multi_bind, schema_id, std::move(metadata_json), std::move(scan_task_set_id), metadata.table_uuid,
+		    has_snapshot, snapshot_id);
+		serializer.WriteProperty(1, "bind_kind", static_cast<uint8_t>(IcebergDistributedBindKind::PLANNED));
+		serializer.WriteObject(2, "scan_bind", [&](Serializer &object) { planned_bind_state.Serialize(object); });
+		serializer.WriteProperty(3, "planned_tasks", planned_tasks);
+		return;
 	} else {
 		auto task_count = multi_bind.file_list->GetTotalFileCount();
 		planned_tasks.reserve(task_count);

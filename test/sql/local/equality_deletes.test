@@ -80,6 +80,15 @@ SELECT filename[17:32], name FROM ICEBERG_SCAN('__WORKING_DIRECTORY__/data/persi
 equality_deletes	d
 equality_deletes	e
 
+# Materialized multi-file columns are not Iceberg equality-delete keys.
+query IIII
+SELECT id, name, bir, filename[17:32]
+FROM ICEBERG_SCAN('__WORKING_DIRECTORY__/data/persistent/equality_deletes/warehouse/mydb/mytable', filename = true)
+ORDER BY id;
+----
+4	d	2025-01-04	equality_deletes
+5	e	2025-01-05	equality_deletes
+
 query I
 SELECT count(*) FROM ICEBERG_SCAN('__WORKING_DIRECTORY__/data/persistent/equality_deletes/warehouse/mydb/mytable');
 ----
@@ -152,6 +161,16 @@ SELECT filename[17:32], name FROM ICEBERG_SCAN('__WORKING_DIRECTORY__/data/persi
 equality_deletes	a
 equality_deletes	d
 equality_deletes	e
+
+# Materialized filename also remains outside the Iceberg schema for partitioned tables.
+query IIII
+SELECT id, name, bir, filename[17:32]
+FROM ICEBERG_SCAN('__WORKING_DIRECTORY__/data/persistent/equality_deletes/warehouse/mydb/mytable_partitioned', filename = true)
+ORDER BY id;
+----
+1	a	2025-01-01	equality_deletes
+4	d	2025-01-04	equality_deletes
+5	e	2025-01-05	equality_deletes
 
 query I
 SELECT count(*) FROM ICEBERG_SCAN('__WORKING_DIRECTORY__/data/persistent/equality_deletes/warehouse/mydb/mytable_partitioned');
