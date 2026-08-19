@@ -176,9 +176,7 @@ static Value TransformPartitionValue(const Value &value, const LogicalType &type
 }
 
 static void ApplyPartitionConstants(const IcebergMultiFileList &multi_file_list, MultiFileReaderData &reader_data,
-#ifdef ICEBERG_VANE_DISTRIBUTED
                                     const MultiFileReaderBindData &options,
-#endif
                                     const vector<MultiFileColumnDefinition> &global_columns,
                                     const vector<ColumnIndex> &global_column_ids, ClientContext &context) {
 	// Get the metadata for this file
@@ -226,7 +224,6 @@ static void ApplyPartitionConstants(const IcebergMultiFileList &multi_file_list,
 		if (global_id.IsVirtualColumn()) {
 			continue;
 		}
-#ifdef ICEBERG_VANE_DISTRIBUTED
 		auto column_id = global_id.GetPrimaryIndex();
 		if (options.filename_idx.IsValid() && column_id == options.filename_idx.GetIndex()) {
 			continue;
@@ -239,9 +236,6 @@ static void ApplyPartitionConstants(const IcebergMultiFileList &multi_file_list,
 			throw InternalException("Iceberg partition constant column '%s' does not have a field ID",
 			                        global_column.name);
 		}
-#else
-		auto &global_column = global_columns[global_id.GetPrimaryIndex()];
-#endif
 		auto field_id = static_cast<uint64_t>(global_column.identifier.GetValue<int32_t>());
 		if (local_field_id_to_index.count(field_id)) {
 			//! Column exists in the local columns of the file
@@ -322,11 +316,7 @@ void IcebergMultiFileReader::FinalizeBind(MultiFileReaderData &reader_data, cons
 			ApplyFieldMapping(local_column, mappings, root.field_mapping_indexes, context);
 		}
 	}
-	ApplyPartitionConstants(multi_file_list, reader_data,
-#ifdef ICEBERG_VANE_DISTRIBUTED
-	                        options,
-#endif
-	                        global_columns, global_column_ids, context);
+	ApplyPartitionConstants(multi_file_list, reader_data, options, global_columns, global_column_ids, context);
 }
 
 void IcebergMultiFileReader::FinalizeBind(MultiFileReaderData &reader_data, const MultiFileOptions &file_options,
