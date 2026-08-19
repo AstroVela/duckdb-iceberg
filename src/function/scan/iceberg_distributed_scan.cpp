@@ -558,30 +558,10 @@ BuildWorkerEqualityDeleteMapping(const TableFunctionDistributedScanInput &input)
 class IcebergDistributedScanBindData : public TableFunctionData {
 public:
 	explicit IcebergDistributedScanBindData(const MultiFileBindData &source) {
-		if (!source.multi_file_reader || !source.file_list || !source.interface || !source.bind_data) {
-			throw InvalidInputException("Iceberg distributed scan requires complete multi-file bind state");
-		}
+		InitializePortableBindState(source);
 		auto &file_list = source.file_list->Cast<IcebergMultiFileList>();
 		if (!file_list.HasDistributedScanPlan()) {
 			throw InvalidInputException("Distributed Iceberg worker bind requires planned scan state");
-		}
-		types = source.types;
-		names = source.names;
-		table_columns = source.table_columns;
-		reader_bind = source.reader_bind;
-		parquet_options =
-		    ParquetMultiFileInfo::SerializeBindData(source, initial_file_row_groups, initial_file_cardinality);
-		if (parquet_options.parquet_options.encryption_config) {
-			throw NotImplementedException(
-			    "Distributed Iceberg scans do not transport Parquet encryption keys; configure worker credentials "
-			    "independently");
-		}
-		if (parquet_options.parquet_options.explicit_cardinality != 0) {
-			throw NotImplementedException(
-			    "Distributed Iceberg scans do not support the parquet explicit_cardinality option");
-		}
-		if (parquet_options.parquet_options.variant_legacy_encoding) {
-			throw NotImplementedException("Distributed Iceberg scans do not support legacy Parquet VARIANT decoding");
 		}
 		schema_id = file_list.GetSnapshot().schema_id;
 		metadata_json = SerializeWorkerMetadata(file_list.GetMetadata());
@@ -597,21 +577,36 @@ public:
 	explicit IcebergDistributedScanBindData(const TableFunctionDistributedScanInput &input)
 	    : IcebergDistributedScanBindData(input.bind_data.Cast<MultiFileBindData>()) {
 		auto mapping = BuildWorkerEqualityDeleteMapping(input);
-		vector<int32_t> sorted_field_ids;
-		sorted_field_ids.reserve(mapping.output_indexes.size());
-		for (const auto &entry : mapping.output_indexes) {
-			sorted_field_ids.push_back(entry.first);
-		}
-		std::sort(sorted_field_ids.begin(), sorted_field_ids.end());
-		for (auto field_id : sorted_field_ids) {
-			equality_delete_field_ids.push_back(field_id);
-			equality_delete_output_indexes.push_back(mapping.output_indexes.at(field_id));
-			equality_delete_types.push_back(mapping.types.at(field_id));
-		}
-		output_column_count = mapping.output_column_count;
+		SetWorkerMapping(mapping.output_indexes, mapping.types, mapping.output_column_count);
 	}
 
 	IcebergDistributedScanBindData() = default;
+
+	static IcebergDistributedScanBindData FromWorkerTemplate(const MultiFileBindData &source,
+	                                                         const IcebergDistributedWorkerScanInfo &worker_scan_info) {
+		IcebergDistributedScanBindData result;
+		result.InitializePortableBindState(source);
+		auto &file_list = source.file_list->Cast<IcebergMultiFileList>();
+		if (!file_list.HasDistributedWorkerScan() || file_list.HasAssignedDistributedScanTasks()) {
+			throw SerializationException(
+			    "Distributed Iceberg worker bind serialization requires an unassigned worker scan template");
+		}
+		if (worker_scan_info.schema_id != file_list.GetSnapshot().schema_id ||
+		    worker_scan_info.table_uuid != file_list.GetMetadata().table_uuid ||
+		    worker_scan_info.metadata_json.empty() || worker_scan_info.scan_task_set_id.empty() ||
+		    (!worker_scan_info.has_snapshot && worker_scan_info.snapshot_id != 0)) {
+			throw SerializationException("Distributed Iceberg worker scan template has an inconsistent identity");
+		}
+		result.schema_id = worker_scan_info.schema_id;
+		result.metadata_json = worker_scan_info.metadata_json;
+		result.table_uuid = worker_scan_info.table_uuid;
+		result.has_snapshot = worker_scan_info.has_snapshot;
+		result.snapshot_id = worker_scan_info.snapshot_id;
+		result.scan_task_set_id = worker_scan_info.scan_task_set_id;
+		result.SetWorkerMapping(worker_scan_info.field_id_to_output_index, worker_scan_info.field_id_to_type,
+		                        worker_scan_info.output_column_count);
+		return result;
+	}
 
 	unique_ptr<FunctionData> Copy() const override {
 		return make_uniq<IcebergDistributedScanBindData>(*this);
@@ -713,6 +708,57 @@ public:
 		return result;
 	}
 
+private:
+	void InitializePortableBindState(const MultiFileBindData &source) {
+		if (!source.multi_file_reader || !source.file_list || !source.interface || !source.bind_data) {
+			throw InvalidInputException("Iceberg distributed scan requires complete multi-file bind state");
+		}
+		types = source.types;
+		names = source.names;
+		table_columns = source.table_columns;
+		reader_bind = source.reader_bind;
+		parquet_options =
+		    ParquetMultiFileInfo::SerializeBindData(source, initial_file_row_groups, initial_file_cardinality);
+		if (parquet_options.parquet_options.encryption_config) {
+			throw NotImplementedException(
+			    "Distributed Iceberg scans do not transport Parquet encryption keys; configure worker credentials "
+			    "independently");
+		}
+		if (parquet_options.parquet_options.explicit_cardinality != 0) {
+			throw NotImplementedException(
+			    "Distributed Iceberg scans do not support the parquet explicit_cardinality option");
+		}
+		if (parquet_options.parquet_options.variant_legacy_encoding) {
+			throw NotImplementedException("Distributed Iceberg scans do not support legacy Parquet VARIANT decoding");
+		}
+	}
+
+	void SetWorkerMapping(const unordered_map<int32_t, idx_t> &output_indexes,
+	                      const unordered_map<int32_t, LogicalType> &types_p, idx_t output_count) {
+		if (output_indexes.size() != types_p.size()) {
+			throw SerializationException("Distributed Iceberg worker bind has an inconsistent equality-delete mapping");
+		}
+		vector<int32_t> sorted_field_ids;
+		sorted_field_ids.reserve(output_indexes.size());
+		for (const auto &entry : output_indexes) {
+			sorted_field_ids.push_back(entry.first);
+		}
+		std::sort(sorted_field_ids.begin(), sorted_field_ids.end());
+		for (auto field_id : sorted_field_ids) {
+			auto output_index = output_indexes.at(field_id);
+			auto type = types_p.find(field_id);
+			if (field_id <= 0 || output_index >= output_count || type == types_p.end() ||
+			    type->second.id() == LogicalTypeId::INVALID) {
+				throw SerializationException("Distributed Iceberg worker bind has an invalid equality-delete mapping");
+			}
+			equality_delete_field_ids.push_back(field_id);
+			equality_delete_output_indexes.push_back(output_index);
+			equality_delete_types.push_back(type->second);
+		}
+		output_column_count = output_count;
+	}
+
+public:
 	vector<LogicalType> types;
 	vector<string> names;
 	vector<string> table_columns;
@@ -739,40 +785,51 @@ static void IcebergDistributedScanSerialize(Serializer &serializer, const option
 	if (!bind_data) {
 		throw SerializationException("Cannot serialize empty distributed Iceberg scan bind data");
 	}
-	auto worker_bind = dynamic_cast<const IcebergDistributedScanBindData *>(bind_data.get());
-	if (worker_bind) {
+	auto transport_bind = dynamic_cast<const IcebergDistributedScanBindData *>(bind_data.get());
+	if (transport_bind) {
 		serializer.WriteProperty(1, "bind_kind", static_cast<uint8_t>(IcebergDistributedBindKind::WORKER));
-		serializer.WriteObject(2, "scan_bind", [&](Serializer &object) { worker_bind->Serialize(object); });
+		serializer.WriteObject(2, "scan_bind", [&](Serializer &object) { transport_bind->Serialize(object); });
 		serializer.WriteProperty(3, "planned_tasks", vector<string> {});
 		return;
 	}
-	auto &planned_bind = bind_data->CastNoConst<MultiFileBindData>();
-	auto &planned_file_list = planned_bind.file_list->Cast<IcebergMultiFileList>();
-	if (planned_file_list.HasDistributedWorkerScan()) {
-		throw SerializationException("Distributed Iceberg worker bind cannot be serialized as planned scan state");
+	auto &multi_bind = bind_data->CastNoConst<MultiFileBindData>();
+	auto &file_list = multi_bind.file_list->Cast<IcebergMultiFileList>();
+	if (file_list.HasDistributedWorkerScan()) {
+		// Vane materializes and then clones worker fragment templates for each task
+		// attempt. Keep the worker bind stable across every template serde round-trip;
+		// assigned task payloads remain exclusively in the scan task descriptor.
+		if (file_list.HasAssignedDistributedScanTasks()) {
+			throw SerializationException(
+			    "Distributed Iceberg worker scan tasks cannot be serialized into the worker template");
+		}
+		auto worker_bind =
+		    IcebergDistributedScanBindData::FromWorkerTemplate(multi_bind, file_list.GetDistributedWorkerScanInfo());
+		serializer.WriteProperty(1, "bind_kind", static_cast<uint8_t>(IcebergDistributedBindKind::WORKER));
+		serializer.WriteObject(2, "scan_bind", [&](Serializer &object) { worker_bind.Serialize(object); });
+		serializer.WriteProperty(3, "planned_tasks", vector<string> {});
+		return;
 	}
 	vector<string> planned_tasks;
-	if (!planned_file_list.HasDistributedScanPlan()) {
+	if (!file_list.HasDistributedScanPlan()) {
 		auto scan_task_set_id = UUID::ToString(UUID::GenerateRandomUUID());
-		planned_tasks = PlanDistributedScanTaskPayloads(planned_bind, scan_task_set_id);
-		auto &snapshot = planned_file_list.GetSnapshot();
-		auto &metadata = planned_file_list.GetMetadata();
+		planned_tasks = PlanDistributedScanTaskPayloads(multi_bind, scan_task_set_id);
+		auto &snapshot = file_list.GetSnapshot();
+		auto &metadata = file_list.GetMetadata();
 		auto schema_id = snapshot.schema_id;
 		auto metadata_json = SerializeWorkerMetadata(metadata);
 		auto has_snapshot = snapshot.snapshot != nullptr;
 		auto snapshot_id = has_snapshot ? snapshot.snapshot->snapshot_id : 0;
 		auto owned_scan_info = CreateOwnedDistributedScanInfo(metadata_json, schema_id);
-		planned_file_list.InitializeDistributedScanPlan(planned_tasks, std::move(owned_scan_info),
-		                                                std::move(scan_task_set_id), metadata.table_uuid, has_snapshot,
-		                                                snapshot_id);
+		file_list.InitializeDistributedScanPlan(planned_tasks, std::move(owned_scan_info), std::move(scan_task_set_id),
+		                                        metadata.table_uuid, has_snapshot, snapshot_id);
 	} else {
-		auto task_count = planned_bind.file_list->GetTotalFileCount();
+		auto task_count = multi_bind.file_list->GetTotalFileCount();
 		planned_tasks.reserve(task_count);
 		for (idx_t task_index = 0; task_index < task_count; task_index++) {
-			planned_tasks.push_back(planned_file_list.GetDistributedScanTaskPayload(task_index));
+			planned_tasks.push_back(file_list.GetDistributedScanTaskPayload(task_index));
 		}
 	}
-	IcebergDistributedScanBindData planned_bind_state(planned_bind);
+	IcebergDistributedScanBindData planned_bind_state(multi_bind);
 	serializer.WriteProperty(1, "bind_kind", static_cast<uint8_t>(IcebergDistributedBindKind::PLANNED));
 	serializer.WriteObject(2, "scan_bind", [&](Serializer &object) { planned_bind_state.Serialize(object); });
 	serializer.WriteProperty(3, "planned_tasks", planned_tasks);
@@ -812,20 +869,25 @@ static unique_ptr<FunctionData> IcebergDistributedScanDeserialize(Deserializer &
 		file_list->InitializeDistributedScanPlan(std::move(planned_tasks), scan_info, std::move(state.scan_task_set_id),
 		                                         std::move(state.table_uuid), state.has_snapshot, state.snapshot_id);
 	} else {
-		unordered_map<int32_t, idx_t> equality_delete_mapping;
-		unordered_map<int32_t, LogicalType> equality_delete_types;
+		IcebergDistributedWorkerScanInfo worker_scan_info;
+		worker_scan_info.schema_id = state.schema_id;
+		worker_scan_info.metadata_json = state.metadata_json;
+		worker_scan_info.scan_task_set_id = state.scan_task_set_id;
+		worker_scan_info.table_uuid = state.table_uuid;
+		worker_scan_info.has_snapshot = state.has_snapshot;
+		worker_scan_info.snapshot_id = state.snapshot_id;
+		worker_scan_info.output_column_count = state.output_column_count;
 		for (idx_t index = 0; index < state.equality_delete_field_ids.size(); index++) {
 			auto field_id = state.equality_delete_field_ids[index];
 			auto output_index = state.equality_delete_output_indexes[index];
 			auto &type = state.equality_delete_types[index];
 			if (field_id <= 0 || output_index >= state.output_column_count || type.id() == LogicalTypeId::INVALID ||
-			    !equality_delete_mapping.emplace(field_id, output_index).second ||
-			    !equality_delete_types.emplace(field_id, type).second) {
+			    !worker_scan_info.field_id_to_output_index.emplace(field_id, output_index).second ||
+			    !worker_scan_info.field_id_to_type.emplace(field_id, type).second) {
 				throw SerializationException("Distributed Iceberg worker bind has an invalid equality-delete mapping");
 			}
 		}
-		file_list->InitializeDistributedWorkerScan(std::move(equality_delete_mapping), std::move(equality_delete_types),
-		                                           std::move(state.scan_task_set_id));
+		file_list->InitializeDistributedWorkerScan(std::move(worker_scan_info));
 	}
 	auto interface = make_uniq<ParquetMultiFileInfo>();
 	interface->InitializeInterface(context, *multi_file_reader, *file_list);
@@ -1099,54 +1161,54 @@ void IcebergDistributedScanState::InitializePlannedScan(vector<string> payloads,
 		throw InternalException("Distributed Iceberg planned scan has an invalid source identity");
 	}
 	LoadTaskPayloads(std::move(payloads), scan_task_set_id, nullptr, nullptr);
-	planned_tasks_initialized = true;
 	planned_scan_info = std::move(scan_info);
 	planned_scan_task_set_id = std::move(scan_task_set_id);
 	planned_table_uuid = std::move(table_uuid);
 	planned_scan_has_snapshot = has_snapshot;
 	planned_snapshot_id = snapshot_id;
-	worker_scan_initialized = false;
-	worker_tasks_assigned = false;
-	worker_scan_task_set_id.clear();
-	worker_field_id_to_output_index.clear();
-	worker_field_id_to_type.clear();
+	phase = Phase::PLANNED;
+	worker_scan_info = IcebergDistributedWorkerScanInfo();
 }
 
-void IcebergDistributedScanState::InitializeWorkerScan(unordered_map<int32_t, idx_t> field_id_to_output_index,
-                                                       unordered_map<int32_t, LogicalType> field_id_to_type,
-                                                       string scan_task_set_id) {
-	if (field_id_to_output_index.size() != field_id_to_type.size() || scan_task_set_id.empty()) {
-		throw InternalException("Distributed Iceberg worker equality-delete mapping is inconsistent");
+void IcebergDistributedScanState::InitializeWorkerScan(IcebergDistributedWorkerScanInfo worker_scan_info_p) {
+	if (worker_scan_info_p.field_id_to_output_index.size() != worker_scan_info_p.field_id_to_type.size() ||
+	    worker_scan_info_p.metadata_json.empty() || worker_scan_info_p.scan_task_set_id.empty() ||
+	    worker_scan_info_p.table_uuid.empty() ||
+	    (!worker_scan_info_p.has_snapshot && worker_scan_info_p.snapshot_id != 0)) {
+		throw InternalException("Distributed Iceberg worker scan state is inconsistent");
 	}
-	planned_tasks_initialized = false;
+	for (const auto &entry : worker_scan_info_p.field_id_to_output_index) {
+		auto type = worker_scan_info_p.field_id_to_type.find(entry.first);
+		if (entry.first <= 0 || entry.second >= worker_scan_info_p.output_column_count ||
+		    type == worker_scan_info_p.field_id_to_type.end() || type->second.id() == LogicalTypeId::INVALID) {
+			throw InternalException("Distributed Iceberg worker equality-delete mapping is inconsistent");
+		}
+	}
 	planned_scan_info.reset();
 	planned_scan_task_set_id.clear();
 	planned_table_uuid.clear();
 	planned_scan_has_snapshot = false;
 	planned_snapshot_id = 0;
-	worker_scan_initialized = true;
-	worker_tasks_assigned = false;
-	worker_scan_task_set_id = std::move(scan_task_set_id);
-	worker_field_id_to_output_index = std::move(field_id_to_output_index);
-	worker_field_id_to_type = std::move(field_id_to_type);
+	phase = Phase::WORKER_TEMPLATE;
+	worker_scan_info = std::move(worker_scan_info_p);
 	files.clear();
 }
 
 void IcebergDistributedScanState::AssignWorkerTasks(vector<string> payloads) {
-	if (!worker_scan_initialized || planned_tasks_initialized) {
-		throw InternalException("Distributed Iceberg worker scan received tasks before its output mapping");
+	if (phase != Phase::WORKER_TEMPLATE) {
+		throw InternalException("Distributed Iceberg task assignment requires an unassigned worker scan template");
 	}
-	LoadTaskPayloads(std::move(payloads), worker_scan_task_set_id, worker_field_id_to_output_index,
-	                 worker_field_id_to_type);
-	worker_tasks_assigned = true;
+	LoadTaskPayloads(std::move(payloads), worker_scan_info.scan_task_set_id, worker_scan_info.field_id_to_output_index,
+	                 worker_scan_info.field_id_to_type);
+	phase = Phase::WORKER_ASSIGNED;
 }
 
 bool IcebergDistributedScanState::HasPlannedTasks() const {
-	return planned_tasks_initialized;
+	return phase == Phase::PLANNED;
 }
 
 bool IcebergDistributedScanState::HasPlannedScanInfo() const {
-	return planned_tasks_initialized && planned_scan_info != nullptr;
+	return phase == Phase::PLANNED && planned_scan_info != nullptr;
 }
 
 const IcebergTableMetadata &IcebergDistributedScanState::GetPlannedMetadata() const {
@@ -1199,11 +1261,22 @@ int64_t IcebergDistributedScanState::GetPlannedSnapshotId() const {
 }
 
 bool IcebergDistributedScanState::HasWorkerScan() const {
-	return worker_scan_initialized;
+	return phase == Phase::WORKER_TEMPLATE || phase == Phase::WORKER_ASSIGNED;
+}
+
+bool IcebergDistributedScanState::HasWorkerTasksAssigned() const {
+	return phase == Phase::WORKER_ASSIGNED;
+}
+
+const IcebergDistributedWorkerScanInfo &IcebergDistributedScanState::GetWorkerScanInfo() const {
+	if (!HasWorkerScan()) {
+		throw InternalException("Distributed Iceberg worker scan state is unavailable");
+	}
+	return worker_scan_info;
 }
 
 string IcebergDistributedScanState::GetPlannedTaskPayload(idx_t file_id) const {
-	if (!planned_tasks_initialized || file_id >= files.size()) {
+	if (phase != Phase::PLANNED || file_id >= files.size()) {
 		throw InternalException("Distributed Iceberg planned task index %llu is unavailable",
 		                        static_cast<unsigned long long>(file_id));
 	}
@@ -1224,8 +1297,11 @@ vector<int32_t> IcebergDistributedScanState::GetEqualityDeleteFieldIds() const {
 }
 
 void IcebergDistributedScanState::RequireWorkerTasksAssigned() const {
-	if (worker_scan_initialized && !worker_tasks_assigned) {
+	if (phase == Phase::WORKER_TEMPLATE) {
 		throw InvalidInputException("Distributed Iceberg worker scan has no explicit task assignment");
+	}
+	if (phase == Phase::EMPTY) {
+		throw InternalException("Distributed Iceberg scan state is not initialized");
 	}
 }
 

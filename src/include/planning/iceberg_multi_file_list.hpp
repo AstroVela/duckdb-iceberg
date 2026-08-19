@@ -35,6 +35,7 @@ class IcebergTableEntry;
 struct IcebergMultiFileList;
 #ifdef ICEBERG_VANE_DISTRIBUTED
 class IcebergDistributedScanState;
+struct IcebergDistributedWorkerScanInfo;
 #endif
 
 struct IcebergManifestScanningState {
@@ -141,11 +142,12 @@ public:
 	void InitializeDistributedScanPlan(vector<string> payloads, shared_ptr<IcebergScanInfo> scan_info,
 	                                   string scan_task_set_id, string table_uuid, bool has_snapshot,
 	                                   int64_t snapshot_id);
-	void InitializeDistributedWorkerScan(unordered_map<int32_t, idx_t> field_id_to_output_index,
-	                                     unordered_map<int32_t, LogicalType> field_id_to_type, string scan_task_set_id);
+	void InitializeDistributedWorkerScan(IcebergDistributedWorkerScanInfo worker_scan_info);
 	void AssignDistributedScanTasks(vector<string> payloads);
 	bool HasDistributedScanPlan() const;
 	bool HasDistributedWorkerScan() const;
+	bool HasAssignedDistributedScanTasks() const;
+	const IcebergDistributedWorkerScanInfo &GetDistributedWorkerScanInfo() const;
 	const string &GetDistributedScanTaskSetId() const;
 	const string &GetDistributedScanTableUUID() const;
 	bool DistributedScanHasSnapshot() const;

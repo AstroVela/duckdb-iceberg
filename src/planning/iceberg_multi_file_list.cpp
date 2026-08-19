@@ -1490,14 +1490,11 @@ void IcebergMultiFileList::InitializeDistributedScanPlan(vector<string> payloads
 	                                        std::move(table_uuid), has_snapshot, snapshot_id);
 }
 
-void IcebergMultiFileList::InitializeDistributedWorkerScan(unordered_map<int32_t, idx_t> field_id_to_output_index,
-                                                           unordered_map<int32_t, LogicalType> field_id_to_type,
-                                                           string scan_task_set_id) {
+void IcebergMultiFileList::InitializeDistributedWorkerScan(IcebergDistributedWorkerScanInfo worker_scan_info) {
 	if (!distributed_scan) {
 		distributed_scan = make_shared_ptr<IcebergDistributedScanState>();
 	}
-	distributed_scan->InitializeWorkerScan(std::move(field_id_to_output_index), std::move(field_id_to_type),
-	                                       std::move(scan_task_set_id));
+	distributed_scan->InitializeWorkerScan(std::move(worker_scan_info));
 }
 
 void IcebergMultiFileList::AssignDistributedScanTasks(vector<string> payloads) {
@@ -1513,6 +1510,17 @@ bool IcebergMultiFileList::HasDistributedScanPlan() const {
 
 bool IcebergMultiFileList::HasDistributedWorkerScan() const {
 	return distributed_scan && distributed_scan->HasWorkerScan();
+}
+
+bool IcebergMultiFileList::HasAssignedDistributedScanTasks() const {
+	return distributed_scan && distributed_scan->HasWorkerTasksAssigned();
+}
+
+const IcebergDistributedWorkerScanInfo &IcebergMultiFileList::GetDistributedWorkerScanInfo() const {
+	if (!distributed_scan) {
+		throw InternalException("Distributed Iceberg scan has no worker template state");
+	}
+	return distributed_scan->GetWorkerScanInfo();
 }
 
 const string &IcebergMultiFileList::GetDistributedScanTaskSetId() const {

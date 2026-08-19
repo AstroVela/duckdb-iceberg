@@ -23,6 +23,18 @@ struct IcebergSnapshotScanInfo;
 struct IcebergTableMetadata;
 class IcebergTableSchema;
 
+struct IcebergDistributedWorkerScanInfo {
+	int32_t schema_id = 0;
+	string metadata_json;
+	string scan_task_set_id;
+	string table_uuid;
+	bool has_snapshot = false;
+	int64_t snapshot_id = 0;
+	idx_t output_column_count = 0;
+	unordered_map<int32_t, idx_t> field_id_to_output_index;
+	unordered_map<int32_t, LogicalType> field_id_to_type;
+};
+
 class IcebergDistributedScanState {
 public:
 	IcebergDistributedScanState();
@@ -31,12 +43,13 @@ public:
 public:
 	void InitializePlannedScan(vector<string> payloads, shared_ptr<IcebergScanInfo> scan_info, string scan_task_set_id,
 	                           string table_uuid, bool has_snapshot, int64_t snapshot_id);
-	void InitializeWorkerScan(unordered_map<int32_t, idx_t> field_id_to_output_index,
-	                          unordered_map<int32_t, LogicalType> field_id_to_type, string scan_task_set_id);
+	void InitializeWorkerScan(IcebergDistributedWorkerScanInfo worker_scan_info);
 	void AssignWorkerTasks(vector<string> payloads);
 	bool HasPlannedTasks() const;
 	bool HasPlannedScanInfo() const;
 	bool HasWorkerScan() const;
+	bool HasWorkerTasksAssigned() const;
+	const IcebergDistributedWorkerScanInfo &GetWorkerScanInfo() const;
 	const IcebergTableMetadata &GetPlannedMetadata() const;
 	const IcebergSnapshotScanInfo &GetPlannedSnapshot() const;
 	const IcebergTableSchema &GetPlannedSchema() const;
@@ -59,6 +72,8 @@ public:
 	vector<reference<const IcebergEqualityDeleteRow>> GetEqualityDeletes(const BoundIcebergManifestEntry &entry) const;
 
 private:
+	enum class Phase : uint8_t { EMPTY, PLANNED, WORKER_TEMPLATE, WORKER_ASSIGNED };
+
 	struct FileState;
 	void LoadTaskPayloads(vector<string> payloads, const string &expected_scan_task_set_id,
 	                      optional_ptr<const unordered_map<int32_t, idx_t>> field_id_to_output_index,
@@ -70,12 +85,8 @@ private:
 	string planned_table_uuid;
 	bool planned_scan_has_snapshot = false;
 	int64_t planned_snapshot_id = 0;
-	bool planned_tasks_initialized = false;
-	bool worker_scan_initialized = false;
-	bool worker_tasks_assigned = false;
-	string worker_scan_task_set_id;
-	unordered_map<int32_t, idx_t> worker_field_id_to_output_index;
-	unordered_map<int32_t, LogicalType> worker_field_id_to_type;
+	Phase phase = Phase::EMPTY;
+	IcebergDistributedWorkerScanInfo worker_scan_info;
 };
 
 void ConfigureIcebergDistributedScan(TableFunction &function);
