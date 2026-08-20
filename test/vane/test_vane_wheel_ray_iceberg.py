@@ -11,7 +11,6 @@ import uuid
 from collections.abc import Callable
 from pathlib import Path
 
-
 CATALOG_ENDPOINT = "http://127.0.0.1:8181"
 MINIO_ENDPOINT = "http://127.0.0.1:9000"
 MINIO_READY_ENDPOINT = f"{MINIO_ENDPOINT}/minio/health/ready"
@@ -290,6 +289,46 @@ class AnnotateWorkerNode:
         )
 
 
+def seed_source_table_with_local_fast(harness: RayIcebergHarness) -> None:
+    connection = harness.connection
+    configured_runner = os.environ.get("VANE_RUNNER")
+    previous_write_count = harness.write_dispatch_count
+
+    # range() does not expose file-backed scan tasks for a Ray extension write.
+    # Select local-fast explicitly for setup, persist four Iceberg files, and
+    # restore Ray before any distributed assertion.
+    os.environ["VANE_RUNNER"] = "local-fast"
+    try:
+        connection.execute(
+            f"CREATE TABLE {SOURCE_TABLE} (id INTEGER, payload VARCHAR) "
+            f"WITH ('format-version' = '2', 'write.data.path' = '{DATA_ROOT}/source')"
+        )
+        for partition_index in range(SOURCE_PARTITIONS):
+            start = partition_index * ROWS_PER_PARTITION
+            stop = start + ROWS_PER_PARTITION
+            source_batch = connection.sql(
+                "SELECT i::INTEGER AS id, ('value-' || i::VARCHAR)::VARCHAR AS payload "
+                f"FROM range({start}, {stop}) AS source(i)"
+            )
+            source_batch.insert_into(SOURCE_TABLE)
+    finally:
+        if configured_runner is None:
+            os.environ.pop("VANE_RUNNER", None)
+        else:
+            os.environ["VANE_RUNNER"] = configured_runner
+
+    require_equal(
+        harness.write_dispatch_count,
+        previous_write_count,
+        "local-fast Iceberg seed Ray dispatch count",
+    )
+    require_equal(
+        connection.execute(f"SELECT count(*)::BIGINT FROM {SOURCE_TABLE}").fetchone(),
+        (SOURCE_ROW_COUNT,),
+        "local-fast Iceberg seed row count",
+    )
+
+
 def exercise_persistent_distributed_reads(harness: RayIcebergHarness) -> None:
     equality_scan = persistent_scan(
         "data/persistent/equality_deletes/warehouse/mydb/mytable",
@@ -377,25 +416,11 @@ def exercise_source_target_and_topology(
     connection = harness.connection
     vane = harness.vane
 
-    connection.execute(
-        f"CREATE TABLE {SOURCE_TABLE} (id INTEGER, payload VARCHAR) "
-        f"WITH ('format-version' = '2', 'write.data.path' = '{DATA_ROOT}/source')"
-    )
-    for partition_index in range(SOURCE_PARTITIONS):
-        start = partition_index * ROWS_PER_PARTITION
-        stop = start + ROWS_PER_PARTITION
-        source_batch = connection.sql(
-            "SELECT i::INTEGER AS id, ('value-' || i::VARCHAR)::VARCHAR AS payload "
-            f"FROM range({start}, {stop}) AS source(i)"
-        )
-        harness.require_write(
-            f"distributed Iceberg INSERT partition {partition_index}",
-            lambda source_batch=source_batch: source_batch.insert_into(SOURCE_TABLE),
-        )
+    seed_source_table_with_local_fast(harness)
 
     harness.require_query(
         f"SELECT count(*)::BIGINT FROM {SOURCE_TABLE}",
-        "distributed Iceberg INSERT result",
+        "distributed scan of the local-fast Iceberg seed",
         [(SOURCE_ROW_COUNT,)],
     )
     scan_task_count = sum(harness.scan_task_counts(f"SELECT id, payload FROM {SOURCE_TABLE}").values())
@@ -554,11 +579,14 @@ def exercise_partitioned_mutations(harness: RayIcebergHarness) -> None:
         f"WITH ('format-version' = '2', 'write.data.path' = '{DATA_ROOT}/partitioned')"
     )
     values = connection.sql(
-        "SELECT * FROM (VALUES "
-        "(1, 'A', TIMESTAMP '2020-01-15', 'a'), (2, NULL, NULL, 'b'), "
-        "(3, 'B', TIMESTAMP '2021-06-01', 'c'), (4, 'A', TIMESTAMP '2020-09-01', 'd'), "
-        "(5, NULL, TIMESTAMP '2022-03-20', 'e'), (6, 'C', TIMESTAMP '2022-11-05', 'f')) "
-        "AS rows(id, category, ts, payload)"
+        "SELECT id + 1 AS id, "
+        "CASE id WHEN 0 THEN 'A' WHEN 2 THEN 'B' WHEN 3 THEN 'A' WHEN 5 THEN 'C' END::VARCHAR AS category, "
+        "CASE id WHEN 0 THEN TIMESTAMP '2020-01-15' WHEN 2 THEN TIMESTAMP '2021-06-01' "
+        "WHEN 3 THEN TIMESTAMP '2020-09-01' WHEN 4 THEN TIMESTAMP '2022-03-20' "
+        "WHEN 5 THEN TIMESTAMP '2022-11-05' END AS ts, "
+        "CASE id WHEN 0 THEN 'a' WHEN 1 THEN 'b' WHEN 2 THEN 'c' WHEN 3 THEN 'd' "
+        "WHEN 4 THEN 'e' WHEN 5 THEN 'f' END::VARCHAR AS payload "
+        f"FROM {SOURCE_TABLE} WHERE id < 6"
     )
     harness.require_write(
         "distributed identity-and-year-partitioned INSERT",
@@ -617,7 +645,9 @@ def exercise_schema_evolution(harness: RayIcebergHarness) -> None:
         f"CREATE TABLE {SCHEMA_EVOLUTION_TABLE} (id INTEGER, measure INTEGER, obsolete VARCHAR) "
         f"WITH ('format-version' = '2', 'write.data.path' = '{DATA_ROOT}/schema-evolution')"
     )
-    initial_values = connection.sql("SELECT 1::INTEGER AS id, 10::INTEGER AS measure, 'old'::VARCHAR AS obsolete")
+    initial_values = connection.sql(
+        f"SELECT id + 1 AS id, id + 10 AS measure, 'old'::VARCHAR AS obsolete " f"FROM {SOURCE_TABLE} WHERE id = 0"
+    )
     harness.require_write(
         "distributed INSERT before Iceberg schema evolution",
         lambda: initial_values.insert_into(SCHEMA_EVOLUTION_TABLE),
@@ -629,7 +659,8 @@ def exercise_schema_evolution(harness: RayIcebergHarness) -> None:
     connection.execute(f"ALTER TABLE {SCHEMA_EVOLUTION_TABLE} DROP COLUMN obsolete")
 
     evolved_values = connection.sql(
-        "SELECT 2::INTEGER AS id, 9223372036854770000::BIGINT AS metric, 'new'::VARCHAR AS added"
+        f"SELECT id + 1 AS id, 9223372036854770000::BIGINT AS metric, 'new'::VARCHAR AS added "
+        f"FROM {SOURCE_TABLE} WHERE id = 1"
     )
     harness.require_write(
         "distributed INSERT after rename, promotion, add, and drop",
@@ -651,7 +682,7 @@ def exercise_conflicts_and_fail_closed_writes(harness: RayIcebergHarness) -> Non
         f"CREATE TABLE {CONFLICT_TABLE} (id INTEGER, category VARCHAR) PARTITIONED BY (category) "
         f"WITH ('format-version' = '2', 'write.data.path' = '{DATA_ROOT}/conflict')"
     )
-    initial_values = connection.sql("SELECT 1::INTEGER AS id, 'A'::VARCHAR AS category")
+    initial_values = connection.sql(f"SELECT id + 1 AS id, 'A'::VARCHAR AS category FROM {SOURCE_TABLE} WHERE id = 0")
     harness.require_write("distributed conflict-table INSERT", lambda: initial_values.insert_into(CONFLICT_TABLE))
 
     stale_plan = harness.capture_write_plan(
@@ -684,7 +715,7 @@ def exercise_conflicts_and_fail_closed_writes(harness: RayIcebergHarness) -> Non
     snapshots_before_void_rejection = connection.execute(
         f"SELECT count(*) FROM iceberg_snapshots({CONFLICT_TABLE})"
     ).fetchone()
-    rejected_values = connection.sql("SELECT 3::INTEGER AS id, 'C'::VARCHAR AS category")
+    rejected_values = connection.sql(f"SELECT id + 1 AS id, 'C'::VARCHAR AS category FROM {SOURCE_TABLE} WHERE id = 2")
     harness.require_rejected_write(
         "distributed INSERT with a VOID partition transform",
         lambda: rejected_values.insert_into(CONFLICT_TABLE),
@@ -767,7 +798,7 @@ def main() -> None:
             lambda: exercise_conflicts_and_fail_closed_writes(harness),
         )
         require_true(harness.read_dispatch_count >= 15, "comprehensive suite did not exercise enough Ray reads")
-        require_true(harness.write_dispatch_count >= 15, "comprehensive suite did not exercise enough Ray writes")
+        require_true(harness.write_dispatch_count >= 14, "comprehensive suite did not exercise enough Ray writes")
 
         drop_test_tables(connection)
     finally:
