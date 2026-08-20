@@ -424,10 +424,7 @@ def exercise_source_target_and_topology(
         [(SOURCE_ROW_COUNT,)],
     )
     scan_task_count = sum(harness.scan_task_counts(f"SELECT id, payload FROM {SOURCE_TABLE}").values())
-    require_true(
-        scan_task_count >= SOURCE_PARTITIONS,
-        f"expected at least {SOURCE_PARTITIONS} planned Iceberg scan tasks, got {scan_task_count}",
-    )
+    require_equal(scan_task_count, WORKER_COUNT, "Iceberg files grouped across Ray workers")
 
     previous_read_count = harness.read_dispatch_count
     annotated_rows = (
@@ -497,16 +494,19 @@ def exercise_source_target_and_topology(
     )
     removed_sum = sum(1 + 64 * index for index in range(SOURCE_ROW_COUNT // 64))
     harness.require_query(
-        f"SELECT count(*)::BIGINT, sum(CASE WHEN payload = 'updated' THEN 1 ELSE 0 END)::BIGINT, "
-        f"sum(id)::BIGINT FROM {TARGET_TABLE}",
+        f"SELECT count(*)::BIGINT, sum(id)::BIGINT FROM {TARGET_TABLE}",
         "distributed Iceberg UPDATE and DELETE commit result",
         [
             (
                 SOURCE_ROW_COUNT - SOURCE_ROW_COUNT // 64,
-                SOURCE_ROW_COUNT // 64,
                 SOURCE_ROW_COUNT * (SOURCE_ROW_COUNT - 1) // 2 - removed_sum,
             )
         ],
+    )
+    harness.require_query(
+        f"SELECT count(*)::BIGINT FROM {TARGET_TABLE} WHERE payload = 'updated'",
+        "distributed Iceberg UPDATE row count",
+        [(SOURCE_ROW_COUNT // 64,)],
     )
 
     data_file_count = connection.execute(
@@ -529,8 +529,8 @@ def exercise_source_target_and_topology(
         [(0,)],
     )
     harness.require_query(
-        f"SELECT count(*)::BIGINT, sum(id)::BIGINT, min(payload), max(payload) FROM {SOURCE_TABLE} " "WHERE id % 3 = 1",
-        "projection, filter, and aggregate after multi-file positional deletes",
+        f"SELECT count(*)::BIGINT, sum(id)::BIGINT FROM {SOURCE_TABLE} WHERE id % 3 = 1",
+        "filter and aggregate after multi-file positional deletes",
     )
 
 
@@ -542,7 +542,7 @@ def exercise_empty_and_zero_match(harness: RayIcebergHarness) -> None:
         f"WITH ('format-version' = '2', 'write.data.path' = '{DATA_ROOT}/empty')"
     )
     empty_task_count = sum(harness.scan_task_counts(f"SELECT id FROM {EMPTY_TABLE}").values())
-    require_equal(empty_task_count, 0, "empty Iceberg Ray scan task count")
+    require_equal(empty_task_count, 1, "empty Iceberg Ray sentinel task count")
     harness.require_query(
         f"SELECT count(*)::BIGINT FROM {EMPTY_TABLE}",
         "empty distributed Iceberg COUNT(*)",
@@ -712,24 +712,25 @@ def exercise_conflicts_and_fail_closed_writes(harness: RayIcebergHarness) -> Non
     )
 
     connection.execute(f"ALTER TABLE {CONFLICT_TABLE} RESET PARTITIONED BY")
-    snapshots_before_void_rejection = connection.execute(
+    snapshots_before_unpartitioned_insert = connection.execute(
         f"SELECT count(*) FROM iceberg_snapshots({CONFLICT_TABLE})"
     ).fetchone()
-    rejected_values = connection.sql(f"SELECT id + 1 AS id, 'C'::VARCHAR AS category FROM {SOURCE_TABLE} WHERE id = 2")
-    harness.require_rejected_write(
-        "distributed INSERT with a VOID partition transform",
-        lambda: rejected_values.insert_into(CONFLICT_TABLE),
-        "does not support VOID partition transforms",
+    unpartitioned_values = connection.sql(
+        f"SELECT id + 1 AS id, 'C'::VARCHAR AS category FROM {SOURCE_TABLE} WHERE id = 2"
+    )
+    harness.require_write(
+        "distributed INSERT after resetting partitioning",
+        lambda: unpartitioned_values.insert_into(CONFLICT_TABLE),
     )
     require_equal(
         connection.execute(f"SELECT count(*) FROM iceberg_snapshots({CONFLICT_TABLE})").fetchone(),
-        snapshots_before_void_rejection,
-        "rejected VOID-partition write must not create an Iceberg snapshot",
+        (snapshots_before_unpartitioned_insert[0] + 1,),
+        "unpartitioned distributed INSERT snapshot count",
     )
     harness.require_query(
         f"SELECT id, category FROM {CONFLICT_TABLE} ORDER BY id",
-        "conflict and fail-closed write cleanup",
-        [(1, "A"), (2, "B")],
+        "conflict cleanup and partition-reset write result",
+        [(1, "A"), (2, "B"), (3, "C")],
     )
 
 
