@@ -240,14 +240,14 @@ class RayIcebergHarness:
         else:
             raise AssertionError(f"{description}: operation unexpectedly succeeded")
 
-    def scan_task_counts(self, query: str) -> dict[str, int]:
+    def scan_split_counts(self, query: str) -> dict[str, int]:
         self._plan_counter += 1
         relation = self.connection.sql(query)
         plan = self.vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(
             relation,
             f"vane-wheel-ray-iceberg-plan-{self._plan_counter}",
         ).to_physical_plan(self.connection)
-        return {str(scan_id): len(tasks) for scan_id, tasks in plan.scan_task_descriptor_map().items()}
+        return {str(scan_id): len(batches) for scan_id, batches in plan.scan_split_batch_map().items()}
 
     def capture_write_plan(self, operation: Callable[[], object]) -> object:
         captured: list[object] = []
@@ -294,7 +294,7 @@ def seed_source_table_with_local_fast(harness: RayIcebergHarness) -> None:
     configured_runner = os.environ.get("VANE_RUNNER")
     previous_write_count = harness.write_dispatch_count
 
-    # range() does not expose file-backed scan tasks for a Ray extension write.
+    # range() does not expose file-backed scan splits for a Ray extension write.
     # Select local-fast explicitly for setup, persist four Iceberg files, and
     # restore Ray before any distributed assertion.
     os.environ["VANE_RUNNER"] = "local-fast"
@@ -374,16 +374,16 @@ def exercise_persistent_distributed_reads(harness: RayIcebergHarness) -> None:
     )
 
     large_scan = persistent_scan("data/persistent/large_partitioned_table/metadata/v2.metadata.json")
-    full_task_count = sum(harness.scan_task_counts(f"SELECT id FROM {large_scan}").values())
+    full_split_count = sum(harness.scan_split_counts(f"SELECT id FROM {large_scan}").values())
     filtered_query = (
         f"SELECT count(id)::BIGINT, min(id), max(id), sum(id)::BIGINT FROM {large_scan} "
         "WHERE joined >= TIMESTAMPTZ '1984-12-01 00:00:00+01'"
     )
-    filtered_task_count = sum(harness.scan_task_counts(filtered_query).values())
-    require_true(full_task_count > 1, "large Iceberg fixture did not produce multiple Ray scan tasks")
+    filtered_split_count = sum(harness.scan_split_counts(filtered_query).values())
+    require_true(full_split_count > 1, "large Iceberg fixture did not produce multiple Ray scan splits")
     require_true(
-        1 <= filtered_task_count <= full_task_count,
-        "filtered Iceberg planning produced an invalid Ray scan task count",
+        1 <= filtered_split_count <= full_split_count,
+        "filtered Iceberg planning produced an invalid Ray scan split count",
     )
     harness.require_query(filtered_query, "filtered aggregate over a multi-file Iceberg table")
 
@@ -400,10 +400,10 @@ def exercise_persistent_distributed_reads(harness: RayIcebergHarness) -> None:
         ") "
         "SELECT count(*)::BIGINT, sum(id)::BIGINT, max(row_number)::BIGINT FROM matched"
     )
-    complex_task_counts = harness.scan_task_counts(complex_query)
+    complex_split_counts = harness.scan_split_counts(complex_query)
     require_true(
-        len(complex_task_counts) >= 2 and all(task_count >= 1 for task_count in complex_task_counts.values()),
-        f"complex Iceberg query did not preserve two independent Ray scan nodes: {complex_task_counts!r}",
+        len(complex_split_counts) >= 2 and all(split_count >= 1 for split_count in complex_split_counts.values()),
+        f"complex Iceberg query did not preserve two independent Ray scan nodes: {complex_split_counts!r}",
     )
     harness.require_query(complex_query, "two-scan join, filter, aggregate, CTE, and window query")
 
@@ -423,8 +423,8 @@ def exercise_source_target_and_topology(
         "distributed scan of the local-fast Iceberg seed",
         [(SOURCE_ROW_COUNT,)],
     )
-    scan_task_count = sum(harness.scan_task_counts(f"SELECT id, payload FROM {SOURCE_TABLE}").values())
-    require_equal(scan_task_count, WORKER_COUNT, "Iceberg files grouped across Ray workers")
+    scan_split_count = sum(harness.scan_split_counts(f"SELECT id, payload FROM {SOURCE_TABLE}").values())
+    require_equal(scan_split_count, SOURCE_PARTITIONS, "independently schedulable Iceberg file splits")
 
     previous_read_count = harness.read_dispatch_count
     annotated_rows = (
@@ -541,8 +541,8 @@ def exercise_empty_and_zero_match(harness: RayIcebergHarness) -> None:
         f"CREATE TABLE {EMPTY_TABLE} (id INTEGER, payload VARCHAR) "
         f"WITH ('format-version' = '2', 'write.data.path' = '{DATA_ROOT}/empty')"
     )
-    empty_task_count = sum(harness.scan_task_counts(f"SELECT id FROM {EMPTY_TABLE}").values())
-    require_equal(empty_task_count, 1, "empty Iceberg Ray sentinel task count")
+    empty_split_count = sum(harness.scan_split_counts(f"SELECT id FROM {EMPTY_TABLE}").values())
+    require_equal(empty_split_count, 1, "empty Iceberg Ray sentinel split count")
     harness.require_query(
         f"SELECT count(*)::BIGINT FROM {EMPTY_TABLE}",
         "empty distributed Iceberg COUNT(*)",
@@ -593,17 +593,17 @@ def exercise_partitioned_mutations(harness: RayIcebergHarness) -> None:
         lambda: values.insert_into(PARTITION_TABLE),
     )
 
-    full_task_count = sum(harness.scan_task_counts(f"SELECT id FROM {PARTITION_TABLE}").values())
-    filtered_task_count = sum(
-        harness.scan_task_counts(
+    full_split_count = sum(harness.scan_split_counts(f"SELECT id FROM {PARTITION_TABLE}").values())
+    filtered_split_count = sum(
+        harness.scan_split_counts(
             f"SELECT id FROM {PARTITION_TABLE} WHERE category = 'A' "
             "AND ts >= TIMESTAMP '2020-01-01' AND ts < TIMESTAMP '2021-01-01'"
         ).values()
     )
-    require_true(full_task_count > 1, "partitioned Iceberg table did not produce multiple Ray scan tasks")
+    require_true(full_split_count > 1, "partitioned Iceberg table did not produce multiple Ray scan splits")
     require_true(
-        1 <= filtered_task_count <= full_task_count,
-        "identity/year partition filtering produced an invalid Ray scan task count",
+        1 <= filtered_split_count <= full_split_count,
+        "identity/year partition filtering produced an invalid Ray scan split count",
     )
     harness.require_query(
         f"SELECT id, category, ts::VARCHAR, payload FROM {PARTITION_TABLE} WHERE category = 'A' "
@@ -666,8 +666,8 @@ def exercise_schema_evolution(harness: RayIcebergHarness) -> None:
         "distributed INSERT after rename, promotion, add, and drop",
         lambda: evolved_values.insert_into(SCHEMA_EVOLUTION_TABLE),
     )
-    task_count = sum(harness.scan_task_counts(f"SELECT id, metric, added FROM {SCHEMA_EVOLUTION_TABLE}").values())
-    require_true(task_count >= 2, "schema-evolved Iceberg table did not preserve multiple data files")
+    split_count = sum(harness.scan_split_counts(f"SELECT id, metric, added FROM {SCHEMA_EVOLUTION_TABLE}").values())
+    require_true(split_count >= 2, "schema-evolved Iceberg table did not preserve multiple data files")
     harness.require_query(
         f"SELECT id, metric, added FROM {SCHEMA_EVOLUTION_TABLE} ORDER BY id",
         "distributed read across Iceberg schema evolution",
@@ -742,6 +742,10 @@ def drop_test_tables(connection: object) -> None:
 def main() -> None:
     if os.environ.get("VANE_RUNNER") != "ray":
         raise RuntimeError("the distributed wheel integration test requires VANE_RUNNER=ray")
+
+    # Keep every file split independently schedulable so the topology case can
+    # prove that both one-CPU Ray workers consume Iceberg input.
+    os.environ["VANE_FTE_DYNAMIC_SCAN_MAX_SPLITS_PER_PARTITION"] = "1"
 
     wait_for_http_endpoint(MINIO_READY_ENDPOINT)
     wait_for_http_endpoint(f"{CATALOG_ENDPOINT}/v1/config")

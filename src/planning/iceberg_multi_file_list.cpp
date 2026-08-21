@@ -489,7 +489,7 @@ const IcebergManifestFile &IcebergMultiFileList::GetManifestFileForEntry(const B
 void IcebergMultiFileList::GetStatistics(vector<PartitionStatistics> &result) const {
 #ifdef ICEBERG_VANE_DISTRIBUTED
 	if (distributed_scan) {
-		// The task snapshot contains data-file record counts, but positional and
+		// The split snapshot contains data-file record counts, but positional and
 		// equality deletes make them unsuitable for an exact partition count.
 		return;
 	}
@@ -1325,9 +1325,9 @@ void IcebergMultiFileList::ProcessDeletes(const vector<MultiFileColumnDefinition
                                           const vector<idx_t> &projection_ids) const {
 #ifdef ICEBERG_VANE_DISTRIBUTED
 	if (distributed_scan) {
-		if (distributed_scan->HasPlannedTasks()) {
+		if (distributed_scan->HasPlannedSplits()) {
 			throw InvalidInputException("A planned distributed Iceberg scan cannot be executed directly; "
-			                            "create a worker bind and assign its scan tasks");
+			                            "create a worker bind and assign its scan splits");
 		}
 		return;
 	}
@@ -1481,12 +1481,12 @@ shared_ptr<IcebergDeleteData> IcebergMultiFileList::GetExistingPositionalDeleteD
 
 #ifdef ICEBERG_VANE_DISTRIBUTED
 void IcebergMultiFileList::InitializeDistributedScanPlan(vector<string> payloads, shared_ptr<IcebergScanInfo> scan_info,
-                                                         string scan_task_set_id, string table_uuid, bool has_snapshot,
+                                                         string scan_split_set_id, string table_uuid, bool has_snapshot,
                                                          int64_t snapshot_id) {
 	if (!distributed_scan) {
 		distributed_scan = make_shared_ptr<IcebergDistributedScanState>();
 	}
-	distributed_scan->InitializePlannedScan(std::move(payloads), std::move(scan_info), std::move(scan_task_set_id),
+	distributed_scan->InitializePlannedScan(std::move(payloads), std::move(scan_info), std::move(scan_split_set_id),
 	                                        std::move(table_uuid), has_snapshot, snapshot_id);
 }
 
@@ -1497,23 +1497,23 @@ void IcebergMultiFileList::InitializeDistributedWorkerScan(IcebergDistributedWor
 	distributed_scan->InitializeWorkerScan(std::move(worker_scan_info));
 }
 
-void IcebergMultiFileList::AssignDistributedScanTasks(vector<string> payloads) {
+void IcebergMultiFileList::AssignDistributedScanSplits(vector<string> payloads) {
 	if (!distributed_scan) {
-		throw InternalException("Distributed Iceberg worker scan was not configured before task assignment");
+		throw InternalException("Distributed Iceberg worker scan was not configured before split assignment");
 	}
-	distributed_scan->AssignWorkerTasks(std::move(payloads));
+	distributed_scan->AssignWorkerSplits(std::move(payloads));
 }
 
 bool IcebergMultiFileList::HasDistributedScanPlan() const {
-	return distributed_scan && distributed_scan->HasPlannedTasks();
+	return distributed_scan && distributed_scan->HasPlannedSplits();
 }
 
 bool IcebergMultiFileList::HasDistributedWorkerScan() const {
 	return distributed_scan && distributed_scan->HasWorkerScan();
 }
 
-bool IcebergMultiFileList::HasAssignedDistributedScanTasks() const {
-	return distributed_scan && distributed_scan->HasWorkerTasksAssigned();
+bool IcebergMultiFileList::HasAssignedDistributedScanSplits() const {
+	return distributed_scan && distributed_scan->HasWorkerSplitsAssigned();
 }
 
 const IcebergDistributedWorkerScanInfo &IcebergMultiFileList::GetDistributedWorkerScanInfo() const {
@@ -1523,11 +1523,11 @@ const IcebergDistributedWorkerScanInfo &IcebergMultiFileList::GetDistributedWork
 	return distributed_scan->GetWorkerScanInfo();
 }
 
-const string &IcebergMultiFileList::GetDistributedScanTaskSetId() const {
+const string &IcebergMultiFileList::GetDistributedScanSplitSetId() const {
 	if (!distributed_scan) {
 		throw InternalException("Distributed Iceberg scan has no planned identity");
 	}
-	return distributed_scan->GetScanTaskSetId();
+	return distributed_scan->GetScanSplitSetId();
 }
 
 const string &IcebergMultiFileList::GetDistributedScanTableUUID() const {
@@ -1551,11 +1551,11 @@ int64_t IcebergMultiFileList::GetDistributedScanSnapshotId() const {
 	return distributed_scan->GetPlannedSnapshotId();
 }
 
-string IcebergMultiFileList::GetDistributedScanTaskPayload(idx_t file_id) const {
+string IcebergMultiFileList::GetDistributedScanSplitPayload(idx_t file_id) const {
 	if (!distributed_scan) {
-		throw InternalException("Distributed Iceberg scan has no planned task set");
+		throw InternalException("Distributed Iceberg scan has no planned split set");
 	}
-	return distributed_scan->GetPlannedTaskPayload(file_id);
+	return distributed_scan->GetPlannedSplitPayload(file_id);
 }
 
 vector<int32_t> IcebergMultiFileList::GetDistributedEqualityDeleteFieldIds() const {

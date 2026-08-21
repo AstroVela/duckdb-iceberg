@@ -26,7 +26,7 @@ class IcebergTableSchema;
 struct IcebergDistributedWorkerScanInfo {
 	int32_t schema_id = 0;
 	string metadata_json;
-	string scan_task_set_id;
+	string scan_split_set_id;
 	string table_uuid;
 	bool has_snapshot = false;
 	int64_t snapshot_id = 0;
@@ -41,23 +41,23 @@ public:
 	~IcebergDistributedScanState();
 
 public:
-	void InitializePlannedScan(vector<string> payloads, shared_ptr<IcebergScanInfo> scan_info, string scan_task_set_id,
+	void InitializePlannedScan(vector<string> payloads, shared_ptr<IcebergScanInfo> scan_info, string scan_split_set_id,
 	                           string table_uuid, bool has_snapshot, int64_t snapshot_id);
 	void InitializeWorkerScan(IcebergDistributedWorkerScanInfo worker_scan_info);
-	void AssignWorkerTasks(vector<string> payloads);
-	bool HasPlannedTasks() const;
+	void AssignWorkerSplits(vector<string> payloads);
+	bool HasPlannedSplits() const;
 	bool HasPlannedScanInfo() const;
 	bool HasWorkerScan() const;
-	bool HasWorkerTasksAssigned() const;
+	bool HasWorkerSplitsAssigned() const;
 	const IcebergDistributedWorkerScanInfo &GetWorkerScanInfo() const;
 	const IcebergTableMetadata &GetPlannedMetadata() const;
 	const IcebergSnapshotScanInfo &GetPlannedSnapshot() const;
 	const IcebergTableSchema &GetPlannedSchema() const;
-	const string &GetScanTaskSetId() const;
+	const string &GetScanSplitSetId() const;
 	const string &GetPlannedTableUUID() const;
 	bool PlannedScanHasSnapshot() const;
 	int64_t GetPlannedSnapshotId() const;
-	string GetPlannedTaskPayload(idx_t file_id) const;
+	string GetPlannedSplitPayload(idx_t file_id) const;
 	vector<int32_t> GetEqualityDeleteFieldIds() const;
 	vector<OpenFileInfo> GetAllFiles() const;
 	FileExpandResult GetExpandResult() const;
@@ -75,13 +75,13 @@ private:
 	enum class Phase : uint8_t { EMPTY, PLANNED, WORKER_TEMPLATE, WORKER_ASSIGNED };
 
 	struct FileState;
-	void LoadTaskPayloads(vector<string> payloads, const string &expected_scan_task_set_id,
-	                      optional_ptr<const unordered_map<int32_t, idx_t>> field_id_to_output_index,
-	                      optional_ptr<const unordered_map<int32_t, LogicalType>> field_id_to_type);
-	void RequireWorkerTasksAssigned() const;
+	void LoadSplitPayloads(vector<string> payloads, const string &expected_scan_split_set_id,
+	                       optional_ptr<const unordered_map<int32_t, idx_t>> field_id_to_output_index,
+	                       optional_ptr<const unordered_map<int32_t, LogicalType>> field_id_to_type);
+	void RequireWorkerSplitsAssigned() const;
 	vector<unique_ptr<FileState>> files;
 	shared_ptr<IcebergScanInfo> planned_scan_info;
-	string planned_scan_task_set_id;
+	string planned_scan_split_set_id;
 	string planned_table_uuid;
 	bool planned_scan_has_snapshot = false;
 	int64_t planned_snapshot_id = 0;

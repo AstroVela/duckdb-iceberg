@@ -65,7 +65,7 @@ initial snapshot commit. Distributed writes reject a current partition spec
 containing a `VOID` transform. Format-version 2 tables support distributed `UPDATE` and `DELETE`
 through positional-delete files; a distributed row-delta operation fails if
 any selected source file uses a partition spec other than the current default.
-Scan tasks materialize the coordinator's selected files and delete state,
+Scan splits materialize the coordinator's selected files and delete state,
 including transaction-local changes visible when the plan is created.
 
 Workers produce immutable data/delete artifacts. Coordinator finalization

@@ -140,19 +140,19 @@ public:
 	shared_ptr<IcebergDeleteData> GetExistingPositionalDeleteData(const string &file_path) const;
 #ifdef ICEBERG_VANE_DISTRIBUTED
 	void InitializeDistributedScanPlan(vector<string> payloads, shared_ptr<IcebergScanInfo> scan_info,
-	                                   string scan_task_set_id, string table_uuid, bool has_snapshot,
+	                                   string scan_split_set_id, string table_uuid, bool has_snapshot,
 	                                   int64_t snapshot_id);
 	void InitializeDistributedWorkerScan(IcebergDistributedWorkerScanInfo worker_scan_info);
-	void AssignDistributedScanTasks(vector<string> payloads);
+	void AssignDistributedScanSplits(vector<string> payloads);
 	bool HasDistributedScanPlan() const;
 	bool HasDistributedWorkerScan() const;
-	bool HasAssignedDistributedScanTasks() const;
+	bool HasAssignedDistributedScanSplits() const;
 	const IcebergDistributedWorkerScanInfo &GetDistributedWorkerScanInfo() const;
-	const string &GetDistributedScanTaskSetId() const;
+	const string &GetDistributedScanSplitSetId() const;
 	const string &GetDistributedScanTableUUID() const;
 	bool DistributedScanHasSnapshot() const;
 	int64_t GetDistributedScanSnapshotId() const;
-	string GetDistributedScanTaskPayload(idx_t file_id) const;
+	string GetDistributedScanSplitPayload(idx_t file_id) const;
 	vector<int32_t> GetDistributedEqualityDeleteFieldIds() const;
 #endif
 
