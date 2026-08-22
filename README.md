@@ -45,6 +45,7 @@ the standard DuckDB build above. Vane builds use the separate
 `vane-extension.toml`:
 
 ```shell
+git submodule update --init --recursive
 VCPKG_TOOLCHAIN_PATH='<path_to_your_vcpkg_repo>/scripts/buildsystems/vcpkg.cmake' \
   make vane_ci
 ```

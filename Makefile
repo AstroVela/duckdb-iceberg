@@ -13,7 +13,7 @@ CORE_EXTENSIONS='httpfs;parquet;tpch'
 include extension-ci-tools/makefiles/duckdb_extension.Makefile
 
 # Add Vane-only targets without replacing DuckDB's upstream extension workflow.
-include vane-extension-ci-tools/makefiles/vane_extension.Makefile
+-include vane-extension-ci-tools/makefiles/vane_extension.Makefile
 
 include make/util.mk
 include make/catalogs/fixture.mk

@@ -5,7 +5,7 @@ on:
   push:
     branches:
       - "vane/**"
-      - v1.5-variegata
+      - v1.5-variegata_vane
   workflow_dispatch:
 
 concurrency:
@@ -17,9 +17,9 @@ permissions:
 
 jobs:
   native:
-    uses: AstroVela/vane-extension-ci-tools/.github/workflows/_vane_extension_ci.yml@2e8b13eacc65d496333c96f1c27ca1be0a78faf9
+    uses: AstroVela/vane-extension-ci-tools/.github/workflows/_vane_extension_ci.yml@28c253d71645b627e90307a8c0f42bf74bda0046
     with:
-      ci_tools_version: 2e8b13eacc65d496333c96f1c27ca1be0a78faf9
+      ci_tools_version: 28c253d71645b627e90307a8c0f42bf74bda0046
       manifest: vane-extension.toml
       build_jobs: 4
       run_native_tests: true
