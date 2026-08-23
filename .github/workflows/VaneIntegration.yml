@@ -1,0 +1,25 @@
+name: Vane integration
+
+on:
+  pull_request:
+  push:
+    branches:
+      - "vane/**"
+      - v1.5-variegata_vane
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    uses: AstroVela/vane-extension-ci-tools/.github/workflows/_vane_extension_ci.yml@28c253d71645b627e90307a8c0f42bf74bda0046
+    with:
+      ci_tools_version: 28c253d71645b627e90307a8c0f42bf74bda0046
+      manifest: vane-extension.toml
+      build_jobs: 4
+      run_native_tests: true

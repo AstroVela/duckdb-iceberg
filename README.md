@@ -37,6 +37,23 @@ This will build both the separate loadable extension and a duckdb binary with th
 ./build/release/extension/iceberg/iceberg.duckdb_extension
 ```
 
+### Vane integration
+
+The upstream `duckdb` and `extension-ci-tools` submodules remain the source of
+the standard DuckDB build above. Vane builds use the separate
+`vane-extension-ci-tools` submodule and an exact `AstroVela/vane` revision from
+`vane-extension.toml`:
+
+```shell
+git submodule update --init --recursive
+VCPKG_TOOLCHAIN_PATH='<path_to_your_vcpkg_repo>/scripts/buildsystems/vcpkg.cmake' \
+  make vane_ci
+```
+
+This compiles Iceberg against `AstroVela/vane/external/duckdb` and runs the
+selected native Iceberg test. It does not replace either upstream submodule and
+does not select a fallback DuckDB source.
+
 ### Running tests
 
 #### Generating test data
