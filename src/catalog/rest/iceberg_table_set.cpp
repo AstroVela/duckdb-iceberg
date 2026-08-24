@@ -8,7 +8,6 @@
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/planner/tableref/bound_at_clause.hpp"
-#include "duckdb/planner/expression_binder/table_function_binder.hpp"
 
 #include "catalog/rest/api/catalog_api.hpp"
 #include "catalog/rest/api/catalog_utils.hpp"
@@ -159,25 +158,6 @@ void IcebergTableSet::LoadEntries(ClientContext &context) {
 	iceberg_transaction.listed_schemas.insert(schema.name);
 }
 
-static Value ParseTableProperty(TableFunctionBinder &binder, ClientContext &context, const ParsedExpression &expr_ref,
-                                const string &property_name, const LogicalType &type) {
-	auto expr = expr_ref.Copy();
-	auto bound_expr = binder.Bind(expr);
-	if (bound_expr->HasParameter()) {
-		throw ParameterNotResolvedException();
-	}
-
-	auto val = ExpressionExecutor::EvaluateScalar(context, *bound_expr, true);
-	if (val.IsNull()) {
-		throw BinderException("NULL is not supported as a valid option for '%s'", property_name);
-	}
-	if (!val.DefaultTryCastAs(type, true)) {
-		throw InvalidInputException("Can't cast '%s' property (%s) to %s", property_name, val.ToString(),
-		                            type.ToString());
-	}
-	return val;
-}
-
 shared_ptr<IcebergTableInformation>
 IcebergTableSet::CreateEntryInternal(lock_guard<mutex> &guard, const string &name, IcebergTableInformation &&table,
                                      shared_ptr<IcebergTableInformation> &old_entry) {
@@ -194,31 +174,7 @@ IcebergTableSet::CreateEntryInternal(lock_guard<mutex> &guard, const string &nam
 IcebergTableInformation &IcebergTableSet::CreateNewEntry(ClientContext &context, IcebergCatalog &catalog,
                                                          IcebergSchemaEntry &schema, CreateTableInfo &info) {
 	auto &iceberg_transaction = IcebergTransaction::Get(context, catalog);
-
-	auto binder = Binder::CreateBinder(context);
-	TableFunctionBinder property_binder(*binder, context, "format-version");
-
-	optional_idx iceberg_version;
-	case_insensitive_map_t<Value> table_properties;
-	// format version must be verified
-	auto format_version_it = info.options.find("format-version");
-	if (format_version_it != info.options.end()) {
-		iceberg_version = ParseTableProperty(property_binder, context, *format_version_it->second, "format-version",
-		                                     LogicalType::INTEGER)
-		                      .GetValue<int32_t>();
-		if (iceberg_version.GetIndex() < 1) {
-			throw InvalidInputException("The lowest supported iceberg version is 1!");
-		}
-	} else {
-		iceberg_version = 2;
-	}
-
-	string location;
-	auto location_it = info.options.find("location");
-	if (location_it != info.options.end()) {
-		location = ParseTableProperty(property_binder, context, *location_it->second, "location", LogicalType::VARCHAR)
-		               .GetValue<string>();
-	}
+	auto create_options = IcebergCreateTableRequest::ParseCreateTableOptions(context, info);
 
 	auto key = IcebergTableInformation::GetTableKey(schema.namespace_items, info.table);
 	auto &alter_update = iceberg_transaction.GetOrCreateAlter();
@@ -228,7 +184,9 @@ IcebergTableInformation &IcebergTableSet::CreateNewEntry(ClientContext &context,
 	auto table_entry = make_uniq<IcebergTableEntry>(table_info, catalog, schema, info, 0);
 	auto table_ptr = table_entry.get();
 	table_info.schema_versions[0] = std::move(table_entry);
-	table_metadata.iceberg_version = iceberg_version.GetIndex();
+	table_metadata.iceberg_version = create_options.iceberg_version;
+	table_metadata.location = std::move(create_options.location);
+	table_metadata.table_properties = std::move(create_options.table_properties);
 	int32_t last_column_id;
 
 	auto new_schema = IcebergCreateTableRequest::CreateIcebergSchema(context, table_metadata, table_ptr->GetColumns(),
@@ -241,20 +199,6 @@ IcebergTableInformation &IcebergTableSet::CreateNewEntry(ClientContext &context,
 	}
 	table_metadata.SetCurrentSchemaId(0);
 	table_metadata.last_column_id = last_column_id;
-
-	// Get Location
-	if (!location.empty()) {
-		table_metadata.location = location;
-	}
-	for (auto &option : info.options) {
-		if (option.first == "format-version" || option.first == "location") {
-			continue;
-		}
-		auto option_val =
-		    ParseTableProperty(property_binder, context, *option.second, option.first, LogicalType::VARCHAR)
-		        .GetValue<string>();
-		table_metadata.table_properties.emplace(option.first, option_val);
-	}
 
 	auto &current_schema = table_info.table_metadata.GetLatestSchema();
 	table_ptr->table_info.table_metadata.default_spec_id = 0;

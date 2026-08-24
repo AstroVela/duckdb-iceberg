@@ -40,6 +40,7 @@
 #ifdef ICEBERG_VANE_DISTRIBUTED
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/execution/distributed/extension_write_task_provider.hpp"
+#include "duckdb/parser/expression/constant_expression.hpp"
 #include "execution/operator/iceberg_distributed_write.hpp"
 #endif
 
@@ -1508,12 +1509,32 @@ PhysicalOperator &IcebergCatalog::PlanInsert(ClientContext &context, PhysicalPla
 
 static unique_ptr<IcebergTableMetadata> BuildPlaceholderMetadata(ClientContext &context, BoundCreateTableInfo &info) {
 	auto metadata = make_uniq<IcebergTableMetadata>();
-	metadata->iceberg_version = 2;
 	metadata->default_spec_id = 0;
 
 	auto &create_info = info.Base().Cast<CreateTableInfo>();
 	shared_ptr<IcebergTableSchema> schema;
 #ifdef ICEBERG_VANE_DISTRIBUTED
+	auto create_options = IcebergCreateTableRequest::ParseCreateTableOptions(context, create_info);
+	// The physical plan outlives its planning transaction. Materialize every option now so
+	// coordinator finalization creates the table with the exact values used by the worker COPY plan.
+	for (auto &option : create_info.options) {
+		Value resolved_value;
+		if (StringUtil::CIEquals(option.first, "format-version")) {
+			resolved_value = Value::INTEGER(create_options.iceberg_version);
+		} else if (StringUtil::CIEquals(option.first, "location")) {
+			resolved_value = Value(create_options.location);
+		} else {
+			auto resolved_property = create_options.table_properties.find(option.first);
+			if (resolved_property == create_options.table_properties.end()) {
+				throw InternalException("Resolved Iceberg CTAS property '%s' is missing", option.first);
+			}
+			resolved_value = Value(resolved_property->second);
+		}
+		option.second = make_uniq<ConstantExpression>(std::move(resolved_value));
+	}
+	metadata->iceberg_version = create_options.iceberg_version;
+	metadata->location = std::move(create_options.location);
+	metadata->table_properties = std::move(create_options.table_properties);
 	metadata->SetCurrentSchemaId(0);
 	int32_t last_column_id;
 	schema = IcebergCreateTableRequest::CreateIcebergSchema(context, *metadata, create_info.columns,
@@ -1522,6 +1543,7 @@ static unique_ptr<IcebergTableMetadata> BuildPlaceholderMetadata(ClientContext &
 	schema->last_column_id = NumericCast<idx_t>(last_column_id);
 	metadata->last_column_id = last_column_id;
 #else
+	metadata->iceberg_version = 2;
 	schema = make_shared_ptr<IcebergTableSchema>();
 	schema->schema_id = 0;
 	int32_t next_field_id = 1;
@@ -1538,6 +1560,7 @@ static unique_ptr<IcebergTableMetadata> BuildPlaceholderMetadata(ClientContext &
 	metadata->AddSchemaOrGetExisting(schema);
 	metadata->SetCurrentSchemaId(0);
 
+#ifndef ICEBERG_VANE_DISTRIBUTED
 	auto binder = Binder::CreateBinder(context);
 	TableFunctionBinder property_binder(*binder, context, "format-version");
 	for (auto &option : create_info.options) {
@@ -1549,6 +1572,7 @@ static unique_ptr<IcebergTableMetadata> BuildPlaceholderMetadata(ClientContext &
 		auto val = ExpressionExecutor::EvaluateScalar(context, *bound_expr, true);
 		metadata->table_properties[option.first] = val.GetValue<string>();
 	}
+#endif
 
 	// Build a placeholder partition spec from the parsed PARTITIONED BY clause so that
 	// PlanCopyForInsert appends the partition projection at plan time. The real spec is
@@ -1609,11 +1633,10 @@ static string TryResolveDistributedCTASDataPath(ClientContext &context, const Ic
 	if (data_path_entry != properties.end()) {
 		result = data_path_entry->second;
 	} else {
-		auto location_entry = properties.find("location");
-		if (location_entry == properties.end() || location_entry->second.empty()) {
+		if (metadata.location.empty()) {
 			return string();
 		}
-		result = FileSystem::GetFileSystem(context).JoinPath(location_entry->second, "data");
+		result = FileSystem::GetFileSystem(context).JoinPath(metadata.location, "data");
 	}
 	StripTrailingSeparator(FileSystem::GetFileSystem(context), result);
 	return result;

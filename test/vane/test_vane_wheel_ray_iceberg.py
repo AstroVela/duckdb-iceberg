@@ -21,12 +21,16 @@ EMPTY_NAME = "vane_wheel_ray_empty"
 PARTITION_NAME = "vane_wheel_ray_partitioned"
 SCHEMA_EVOLUTION_NAME = "vane_wheel_ray_schema_evolution"
 CONFLICT_NAME = "vane_wheel_ray_conflict"
+V3_CTAS_NAME = "vane_wheel_ray_v3_ctas"
+FAILED_CTAS_NAME = "vane_wheel_ray_failed_ctas"
 SOURCE_TABLE = f"{CATALOG_NAME}.default.{SOURCE_NAME}"
 TARGET_TABLE = f"{CATALOG_NAME}.default.{TARGET_NAME}"
 EMPTY_TABLE = f"{CATALOG_NAME}.default.{EMPTY_NAME}"
 PARTITION_TABLE = f"{CATALOG_NAME}.default.{PARTITION_NAME}"
 SCHEMA_EVOLUTION_TABLE = f"{CATALOG_NAME}.default.{SCHEMA_EVOLUTION_NAME}"
 CONFLICT_TABLE = f"{CATALOG_NAME}.default.{CONFLICT_NAME}"
+V3_CTAS_TABLE = f"{CATALOG_NAME}.default.{V3_CTAS_NAME}"
+FAILED_CTAS_TABLE = f"{CATALOG_NAME}.default.{FAILED_CTAS_NAME}"
 TABLES = (
     TARGET_TABLE,
     SOURCE_TABLE,
@@ -34,6 +38,8 @@ TABLES = (
     PARTITION_TABLE,
     SCHEMA_EVOLUTION_TABLE,
     CONFLICT_TABLE,
+    V3_CTAS_TABLE,
+    FAILED_CTAS_TABLE,
 )
 DATA_ROOT = "s3://warehouse/vane-wheel-ray-integration"
 WORKER_COUNT = 2
@@ -449,7 +455,7 @@ def exercise_source_target_and_topology(
     require_equal(observed_nodes, expected_nodes, "Ray nodes consuming the Iceberg scan")
     assert_vane_worker_topology(ray, harness.runner)
 
-    ctas_source = connection.sql(f"SELECT id, payload FROM {SOURCE_TABLE}")
+    ctas_source = connection.sql(f"SELECT id, payload, (id % 4)::INTEGER AS partition_key FROM {SOURCE_TABLE}")
     harness.require_rejected_write(
         "distributed Iceberg CTAS without an explicit worker data path",
         lambda: ctas_source.create(TARGET_TABLE),
@@ -461,21 +467,30 @@ def exercise_source_target_and_topology(
     ).fetchone()
     require_equal(target_exists, (0,), "rejected distributed CTAS catalog cleanup")
 
-    # Vane's current Relation.create() API cannot carry Iceberg table
-    # properties. Create the target as coordinator-side test setup, then
-    # exercise its writes exclusively through distributed Relation APIs.
-    connection.execute(
-        f"CREATE TABLE {TARGET_TABLE} (id INTEGER, payload VARCHAR) "
-        f"WITH ('format-version' = '2', 'write.data.path' = '{DATA_ROOT}/target')"
-    )
-    target_source = connection.sql(f"SELECT id, payload FROM {SOURCE_TABLE}")
+    ctas_source = connection.sql(f"SELECT id, payload, (id % 4)::INTEGER AS partition_key FROM {SOURCE_TABLE}")
     harness.require_write(
-        "distributed Iceberg INSERT SELECT",
-        lambda: target_source.insert_into(TARGET_TABLE),
+        "distributed partitioned Iceberg v2 CTAS",
+        lambda: ctas_source.create(
+            TARGET_TABLE,
+            properties={
+                "format-version": 2,
+                "location": f"{DATA_ROOT}/target",
+            },
+            partition_by=["partition_key"],
+        ),
+    )
+    target_partitions = connection.execute(
+        f"SELECT DISTINCT regexp_extract(file_path, 'partition_key=([^/]+)', 1) AS partition_value "
+        f"FROM iceberg_metadata({TARGET_TABLE}) WHERE manifest_content = 'DATA' ORDER BY partition_value"
+    ).fetchall()
+    require_equal(
+        target_partitions,
+        [("0",), ("1",), ("2",), ("3",)],
+        "distributed Iceberg v2 CTAS identity partitions",
     )
     harness.require_query(
         f"SELECT count(*)::BIGINT, sum(id)::BIGINT FROM {TARGET_TABLE}",
-        "distributed Iceberg INSERT SELECT result",
+        "distributed Iceberg v2 CTAS result",
         [(SOURCE_ROW_COUNT, SOURCE_ROW_COUNT * (SOURCE_ROW_COUNT - 1) // 2)],
     )
 
@@ -508,6 +523,139 @@ def exercise_source_target_and_topology(
         "distributed Iceberg UPDATE row count",
         [(SOURCE_ROW_COUNT // 64,)],
     )
+
+
+def exercise_versioned_ctas(harness: RayIcebergHarness) -> None:
+    connection = harness.connection
+    vane = harness.vane
+
+    nested_source = connection.sql(
+        "SELECT id, "
+        "{'label': payload, 'ordinal': id::BIGINT} AS details, "
+        "[id, id + 1]::INTEGER[] AS scores, "
+        "map(['key'], [payload]) AS attributes, "
+        f"(id % 4)::INTEGER AS partition_key FROM {SOURCE_TABLE}"
+    )
+    harness.require_write(
+        "distributed partitioned Iceberg v3 CTAS",
+        lambda: nested_source.to_table(
+            V3_CTAS_TABLE,
+            properties={
+                "format-version": 3,
+                "write.data.path": f"{DATA_ROOT}/v3-ctas",
+            },
+            partition_by=[vane.ColumnExpression("partition_key")],
+        ),
+    )
+
+    harness.require_query(
+        f"SELECT count(*)::BIGINT, min(_row_id), max(_row_id), min(_last_updated_sequence_number), "
+        f"max(_last_updated_sequence_number) FROM {V3_CTAS_TABLE}",
+        "distributed Iceberg v3 CTAS row lineage",
+        [(SOURCE_ROW_COUNT, 0, SOURCE_ROW_COUNT - 1, 1, 1)],
+    )
+    harness.require_query(
+        f"SELECT _row_id FROM {V3_CTAS_TABLE} ORDER BY _row_id",
+        "distributed Iceberg v3 CTAS unique row IDs",
+        [(row_id,) for row_id in range(SOURCE_ROW_COUNT)],
+    )
+    harness.require_query(
+        f"SELECT id, details.label, details.ordinal, scores[1], scores[2], "
+        f"attributes['key'], partition_key FROM {V3_CTAS_TABLE} "
+        f"WHERE id IN (0, 257, {SOURCE_ROW_COUNT - 1}) ORDER BY id",
+        "distributed Iceberg v3 CTAS nested values",
+        [
+            (0, "value-0", 0, 0, 1, "value-0", 0),
+            (257, "value-257", 257, 257, 258, "value-257", 1),
+            (
+                SOURCE_ROW_COUNT - 1,
+                f"value-{SOURCE_ROW_COUNT - 1}",
+                SOURCE_ROW_COUNT - 1,
+                SOURCE_ROW_COUNT - 1,
+                SOURCE_ROW_COUNT,
+                f"value-{SOURCE_ROW_COUNT - 1}",
+                3,
+            ),
+        ],
+    )
+
+    data_file = connection.execute(
+        f"SELECT file_path FROM iceberg_metadata({V3_CTAS_TABLE}) "
+        "WHERE manifest_content = 'DATA' ORDER BY file_path LIMIT 1"
+    ).fetchone()
+    require_true(data_file is not None, "distributed Iceberg v3 CTAS did not create a data file")
+    field_ids = connection.execute(
+        "SELECT name, field_id FROM parquet_schema(?) "
+        "WHERE name IN ('id', 'details', 'label', 'ordinal', 'scores', 'element', "
+        "'attributes', 'key', 'value', 'partition_key') ORDER BY field_id",
+        [data_file[0]],
+    ).fetchall()
+    require_equal(
+        field_ids,
+        [
+            ("id", 1),
+            ("details", 2),
+            ("scores", 3),
+            ("attributes", 4),
+            ("partition_key", 5),
+            ("label", 6),
+            ("ordinal", 7),
+            ("element", 8),
+            ("key", 9),
+            ("value", 10),
+        ],
+        "distributed Iceberg v3 CTAS nested Parquet field IDs",
+    )
+    partitions = connection.execute(
+        f"SELECT DISTINCT regexp_extract(file_path, 'partition_key=([^/]+)', 1) AS partition_value "
+        f"FROM iceberg_metadata({V3_CTAS_TABLE}) WHERE manifest_content = 'DATA' ORDER BY partition_value"
+    ).fetchall()
+    require_equal(
+        partitions,
+        [("0",), ("1",), ("2",), ("3",)],
+        "distributed Iceberg v3 CTAS identity partitions",
+    )
+    snapshots = connection.execute(
+        f"SELECT count(*)::BIGINT, min(sequence_number), min(operation) " f"FROM iceberg_snapshots({V3_CTAS_TABLE})"
+    ).fetchone()
+    require_equal(
+        snapshots,
+        (1, 1, "append"),
+        "distributed Iceberg v3 CTAS initial snapshot",
+    )
+
+
+def exercise_ctas_failure_cleanup(harness: RayIcebergHarness) -> None:
+    connection = harness.connection
+    failing_source = connection.sql(
+        f"SELECT CASE WHEN id < 512 THEN id ELSE payload::INTEGER END AS id FROM {SOURCE_TABLE}"
+    )
+    harness.require_rejected_write(
+        "distributed Iceberg CTAS worker failure before catalog finalization",
+        lambda: failing_source.create(
+            FAILED_CTAS_TABLE,
+            properties={
+                "format-version": 2,
+                "write.data.path": f"{DATA_ROOT}/failed-ctas",
+            },
+        ),
+        "Could not convert string",
+    )
+    target_exists = connection.execute(
+        "SELECT count(*) FROM information_schema.tables "
+        f"WHERE table_catalog = '{CATALOG_NAME}' AND table_schema = 'default' "
+        f"AND table_name = '{FAILED_CTAS_NAME}'"
+    ).fetchone()
+    require_equal(target_exists, (0,), "failed distributed CTAS catalog cleanup")
+    remaining_files = connection.execute(
+        f"SELECT count(*) FROM glob('{DATA_ROOT}/failed-ctas/**/*.parquet')"
+    ).fetchone()
+    require_equal(remaining_files, (0,), "failed distributed CTAS worker artifact cleanup")
+
+
+def exercise_source_positional_deletes(harness: RayIcebergHarness) -> None:
+    connection = harness.connection
+    vane = harness.vane
 
     data_file_count = connection.execute(
         f"SELECT count(DISTINCT file_path) FROM iceberg_metadata({SOURCE_TABLE}) " "WHERE manifest_content = 'DATA'"
@@ -795,6 +943,9 @@ def main() -> None:
             "source/target writes and worker topology",
             lambda: exercise_source_target_and_topology(harness, ray, expected_nodes),
         )
+        run_scenario("version-aware distributed CTAS", lambda: exercise_versioned_ctas(harness))
+        run_scenario("distributed CTAS failure cleanup", lambda: exercise_ctas_failure_cleanup(harness))
+        run_scenario("source positional deletes", lambda: exercise_source_positional_deletes(harness))
         run_scenario("empty and zero-match operations", lambda: exercise_empty_and_zero_match(harness))
         run_scenario("partitioned mutations", lambda: exercise_partitioned_mutations(harness))
         run_scenario("schema evolution", lambda: exercise_schema_evolution(harness))
@@ -803,7 +954,7 @@ def main() -> None:
             lambda: exercise_conflicts_and_fail_closed_writes(harness),
         )
         require_true(harness.read_dispatch_count >= 15, "comprehensive suite did not exercise enough Ray reads")
-        require_true(harness.write_dispatch_count >= 14, "comprehensive suite did not exercise enough Ray writes")
+        require_true(harness.write_dispatch_count >= 16, "comprehensive suite did not exercise enough Ray writes")
 
         drop_test_tables(connection)
     finally:

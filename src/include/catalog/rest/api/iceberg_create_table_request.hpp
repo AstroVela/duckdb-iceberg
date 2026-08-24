@@ -2,6 +2,7 @@
 
 #include "duckdb/common/vector.hpp"
 #include "duckdb/common/string.hpp"
+#include "duckdb/common/case_insensitive_map.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/value.hpp"
 
@@ -18,12 +19,21 @@ namespace duckdb {
 
 struct YyjsonDocDeleter;
 struct IcebergTableInformation;
+struct CreateTableInfo;
 class IcebergTableEntry;
+
+struct IcebergCreateTableOptions {
+	int32_t iceberg_version = 2;
+	string location;
+	case_insensitive_map_t<string> table_properties;
+};
 
 struct IcebergCreateTableRequest {
 	explicit IcebergCreateTableRequest(const IcebergTableInformation &table_info);
 
 public:
+	static IcebergCreateTableOptions ParseCreateTableOptions(ClientContext &context, const CreateTableInfo &info);
+
 	static unique_ptr<IcebergColumnDefinition>
 	CreateIcebergColumn(const ColumnDefinition &coldef, IcebergDefaultBinder &default_binder, bool is_required,
 	                    const std::function<idx_t(void)> &next_field_id, idx_t iceberg_version);
