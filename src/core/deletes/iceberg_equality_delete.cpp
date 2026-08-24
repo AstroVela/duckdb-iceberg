@@ -93,7 +93,12 @@ void IcebergMultiFileList::ScanEqualityDeleteFile(const BoundIcebergManifestEntr
 		if (IsVirtualColumn(global_col.GetPrimaryIndex())) {
 			continue;
 		}
-		D_ASSERT(global_col.GetPrimaryIndex() < global_columns.size());
+		// Multi-file options can append materialized columns, such as filename,
+		// after the Iceberg schema. They are constants supplied by the reader and
+		// cannot be equality-delete keys.
+		if (global_col.GetPrimaryIndex() >= global_columns.size()) {
+			continue;
+		}
 		// index_in_global_columns = index in input_chunk
 		auto index_in_global_columns = global_col.GetPrimaryIndex();
 		auto &col = global_columns[index_in_global_columns];

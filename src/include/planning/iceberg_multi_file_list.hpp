@@ -33,6 +33,10 @@ namespace duckdb {
 
 class IcebergTableEntry;
 struct IcebergMultiFileList;
+#ifdef ICEBERG_VANE_DISTRIBUTED
+class IcebergDistributedScanState;
+struct IcebergDistributedWorkerScanInfo;
+#endif
 
 struct IcebergManifestScanningState {
 public:
@@ -134,6 +138,23 @@ public:
 	                                                   IcebergManifestContentType type) const;
 	vector<BoundIcebergManifestEntry> GetDeleteManifestEntries() const;
 	shared_ptr<IcebergDeleteData> GetExistingPositionalDeleteData(const string &file_path) const;
+#ifdef ICEBERG_VANE_DISTRIBUTED
+	void InitializeDistributedScanPlan(vector<string> payloads, shared_ptr<IcebergScanInfo> scan_info,
+	                                   string scan_split_set_id, string table_uuid, bool has_snapshot,
+	                                   int64_t snapshot_id);
+	void InitializeDistributedWorkerScan(IcebergDistributedWorkerScanInfo worker_scan_info);
+	void AssignDistributedScanSplits(vector<string> payloads);
+	bool HasDistributedScanPlan() const;
+	bool HasDistributedWorkerScan() const;
+	bool HasAssignedDistributedScanSplits() const;
+	const IcebergDistributedWorkerScanInfo &GetDistributedWorkerScanInfo() const;
+	const string &GetDistributedScanSplitSetId() const;
+	const string &GetDistributedScanTableUUID() const;
+	bool DistributedScanHasSnapshot() const;
+	int64_t GetDistributedScanSnapshotId() const;
+	string GetDistributedScanSplitPayload(idx_t file_id) const;
+	vector<int32_t> GetDistributedEqualityDeleteFieldIds() const;
+#endif
 
 public:
 	//! MultiFileList API
@@ -212,6 +233,9 @@ private:
 	//! Combination of committed + transaction data manifests
 	mutable vector<BoundIcebergManifestListEntry> data_manifests;
 	mutable vector<bool> data_manifest_matches;
+#ifdef ICEBERG_VANE_DISTRIBUTED
+	shared_ptr<IcebergDistributedScanState> distributed_scan;
+#endif
 };
 
 } // namespace duckdb

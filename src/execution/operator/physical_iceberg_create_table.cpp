@@ -72,6 +72,54 @@ void PhysicalIcebergCreateTable::MakeCreateTableRequest(ClientContext &client_co
 	});
 }
 
+#ifdef ICEBERG_VANE_DISTRIBUTED
+void PhysicalIcebergCreateTable::MakeCreateTableRequest(ClientContext &client_context,
+                                                        IcebergCreateTableGlobalState &gstate,
+                                                        IcebergSchemaEntry &resolved_schema_entry) const {
+	std::call_once(gstate.init_flag, [&]() {
+		auto &catalog = resolved_schema_entry.catalog;
+		auto transaction = catalog.GetCatalogTransaction(client_context);
+
+		auto table = resolved_schema_entry.CreateTable(transaction, client_context, *info);
+		if (!table) {
+			throw InternalException("Iceberg CTAS: CreateTable request failed");
+		}
+		auto &ic_table = table->Cast<IcebergTableEntry>();
+		// Load any per-table credentials (e.g. SigV4 for the data location).
+		ic_table.PrepareIcebergScanFromEntry(client_context);
+
+		auto &table_metadata = ic_table.table_info.table_metadata;
+		auto &table_schema = table_metadata.GetLatestSchema();
+
+		IcebergCopyInput copy_input(client_context, table_metadata, table_schema);
+		auto copy_options = IcebergInsert::GetCopyOptions(client_context, copy_input);
+
+		auto &copy_op = copy_to_file_op.get();
+		copy_op.bind_data = std::move(copy_options.bind_data);
+		copy_op.file_path = std::move(copy_options.file_path);
+		copy_op.filename_pattern = std::move(copy_options.filename_pattern);
+		copy_op.file_extension = std::move(copy_options.file_extension);
+		copy_op.overwrite_mode = copy_options.overwrite_mode;
+		copy_op.per_thread_output = copy_options.per_thread_output;
+		copy_op.file_size_bytes = copy_options.file_size_bytes;
+		copy_op.rotate = copy_options.rotate;
+		copy_op.return_type = copy_options.return_type;
+		copy_op.partition_output = copy_options.partition_output;
+		copy_op.write_partition_columns = copy_options.write_partition_columns;
+		copy_op.write_empty_file = copy_options.write_empty_file;
+		copy_op.partition_columns = std::move(copy_options.partition_columns);
+		copy_op.names = std::move(copy_options.names);
+		copy_op.expected_types = std::move(copy_options.expected_types);
+
+		{
+			lock_guard<mutex> guard(create_state->lock);
+			create_state->table_entry = &ic_table;
+			create_state->created = true;
+		}
+	});
+}
+#endif
+
 OperatorResultType PhysicalIcebergCreateTable::Execute(ExecutionContext &context, DataChunk &input, DataChunk &chunk,
                                                        GlobalOperatorState &gstate_p, OperatorState &state) const {
 	chunk.Reference(input);

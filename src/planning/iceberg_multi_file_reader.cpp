@@ -176,6 +176,7 @@ static Value TransformPartitionValue(const Value &value, const LogicalType &type
 }
 
 static void ApplyPartitionConstants(const IcebergMultiFileList &multi_file_list, MultiFileReaderData &reader_data,
+                                    const MultiFileReaderBindData &options,
                                     const vector<MultiFileColumnDefinition> &global_columns,
                                     const vector<ColumnIndex> &global_column_ids, ClientContext &context) {
 	// Get the metadata for this file
@@ -223,7 +224,18 @@ static void ApplyPartitionConstants(const IcebergMultiFileList &multi_file_list,
 		if (global_id.IsVirtualColumn()) {
 			continue;
 		}
-		auto &global_column = global_columns[global_id.GetPrimaryIndex()];
+		auto column_id = global_id.GetPrimaryIndex();
+		if (options.filename_idx.IsValid() && column_id == options.filename_idx.GetIndex()) {
+			continue;
+		}
+		if (column_id >= global_columns.size()) {
+			throw InternalException("Iceberg partition constant column index %llu is out of bounds", column_id);
+		}
+		auto &global_column = global_columns[column_id];
+		if (global_column.identifier.IsNull() || global_column.identifier.type().id() != LogicalTypeId::INTEGER) {
+			throw InternalException("Iceberg partition constant column '%s' does not have a field ID",
+			                        global_column.name);
+		}
 		auto field_id = static_cast<uint64_t>(global_column.identifier.GetValue<int32_t>());
 		if (local_field_id_to_index.count(field_id)) {
 			//! Column exists in the local columns of the file
@@ -304,7 +316,7 @@ void IcebergMultiFileReader::FinalizeBind(MultiFileReaderData &reader_data, cons
 			ApplyFieldMapping(local_column, mappings, root.field_mapping_indexes, context);
 		}
 	}
-	ApplyPartitionConstants(multi_file_list, reader_data, global_columns, global_column_ids, context);
+	ApplyPartitionConstants(multi_file_list, reader_data, options, global_columns, global_column_ids, context);
 }
 
 void IcebergMultiFileReader::FinalizeBind(MultiFileReaderData &reader_data, const MultiFileOptions &file_options,

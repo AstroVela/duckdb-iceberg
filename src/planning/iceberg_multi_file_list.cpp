@@ -29,6 +29,9 @@
 #include "planning/metadata_io/manifest/iceberg_manifest_reader.hpp"
 #include "planning/metadata_io/manifest_list/iceberg_manifest_list_reader.hpp"
 #include "planning/metadata_io/manifest_list/bound_iceberg_manifest_list_entry.hpp"
+#ifdef ICEBERG_VANE_DISTRIBUTED
+#include "function/scan/iceberg_distributed_scan.hpp"
+#endif
 
 namespace duckdb {
 
@@ -139,23 +142,48 @@ string IcebergMultiFileList::GetPath() const {
 }
 
 const IcebergTableMetadata &IcebergMultiFileList::GetMetadata() const {
+#ifdef ICEBERG_VANE_DISTRIBUTED
+	if (distributed_scan && distributed_scan->HasPlannedScanInfo()) {
+		return distributed_scan->GetPlannedMetadata();
+	}
+#endif
 	return shared_state->scan_info->metadata;
 }
 
 bool IcebergMultiFileList::HasTransactionData() const {
+#ifdef ICEBERG_VANE_DISTRIBUTED
+	if (distributed_scan && distributed_scan->HasPlannedScanInfo()) {
+		return false;
+	}
+#endif
 	return shared_state->scan_info->transaction_data;
 }
 
 const IcebergTransactionData &IcebergMultiFileList::GetTransactionData() const {
+#ifdef ICEBERG_VANE_DISTRIBUTED
+	if (distributed_scan && distributed_scan->HasPlannedScanInfo()) {
+		throw InternalException("Planned distributed Iceberg scans do not retain transaction data");
+	}
+#endif
 	D_ASSERT(HasTransactionData());
 	return *shared_state->scan_info->transaction_data;
 }
 
 const IcebergSnapshotScanInfo &IcebergMultiFileList::GetSnapshot() const {
+#ifdef ICEBERG_VANE_DISTRIBUTED
+	if (distributed_scan && distributed_scan->HasPlannedScanInfo()) {
+		return distributed_scan->GetPlannedSnapshot();
+	}
+#endif
 	return shared_state->scan_info->snapshot_info;
 }
 
 const IcebergTableSchema &IcebergMultiFileList::GetSchema() const {
+#ifdef ICEBERG_VANE_DISTRIBUTED
+	if (distributed_scan && distributed_scan->HasPlannedScanInfo()) {
+		return distributed_scan->GetPlannedSchema();
+	}
+#endif
 	return shared_state->scan_info->schema;
 }
 
@@ -164,6 +192,11 @@ bool IcebergMultiFileList::FinishedScanningDeletes() const {
 }
 
 IcebergTableEntry *IcebergMultiFileList::GetTable() const {
+#ifdef ICEBERG_VANE_DISTRIBUTED
+	if (distributed_scan && distributed_scan->HasPlannedScanInfo()) {
+		return nullptr;
+	}
+#endif
 	return shared_state->table;
 }
 
@@ -276,6 +309,9 @@ unique_ptr<IcebergMultiFileList> IcebergMultiFileList::PushdownInternal(ClientCo
 	filtered_list->names = names;
 	filtered_list->types = types;
 	filtered_list->have_bound = true;
+#ifdef ICEBERG_VANE_DISTRIBUTED
+	filtered_list->distributed_scan = distributed_scan;
+#endif
 	return filtered_list;
 }
 
@@ -329,6 +365,11 @@ unique_ptr<MultiFileList> IcebergMultiFileList::ComplexFilterPushdown(ClientCont
 }
 
 vector<OpenFileInfo> IcebergMultiFileList::GetAllFiles() const {
+#ifdef ICEBERG_VANE_DISTRIBUTED
+	if (distributed_scan) {
+		return distributed_scan->GetAllFiles();
+	}
+#endif
 	vector<OpenFileInfo> file_list;
 	//! Lock is required because it reads the 'manifest_entries' vector
 	lock_guard<mutex> guard(shared_state->lock);
@@ -339,6 +380,11 @@ vector<OpenFileInfo> IcebergMultiFileList::GetAllFiles() const {
 }
 
 FileExpandResult IcebergMultiFileList::GetExpandResult() const {
+#ifdef ICEBERG_VANE_DISTRIBUTED
+	if (distributed_scan) {
+		return distributed_scan->GetExpandResult();
+	}
+#endif
 	// GetFileInternal(1) will ensure files with index 0 and index 1 are expanded if they are available
 	lock_guard<mutex> guard(shared_state->lock);
 	GetFileInternal(1, guard);
@@ -349,6 +395,11 @@ FileExpandResult IcebergMultiFileList::GetExpandResult() const {
 }
 
 idx_t IcebergMultiFileList::GetTotalFileCount() const {
+#ifdef ICEBERG_VANE_DISTRIBUTED
+	if (distributed_scan) {
+		return distributed_scan->GetTotalFileCount();
+	}
+#endif
 	// FIXME: the 'added_files_count' + the 'existing_files_count'
 	// in the Manifest List should give us this information without scanning the manifest file(s)
 	lock_guard<mutex> guard(shared_state->lock);
@@ -361,6 +412,11 @@ idx_t IcebergMultiFileList::GetTotalFileCount() const {
 }
 
 unique_ptr<NodeStatistics> IcebergMultiFileList::GetCardinality(ClientContext &context) const {
+#ifdef ICEBERG_VANE_DISTRIBUTED
+	if (distributed_scan) {
+		return distributed_scan->GetCardinality();
+	}
+#endif
 	if (GetMetadata().iceberg_version == 1) {
 		//! We collect no cardinality information from manifests for V1 tables.
 		return nullptr;
@@ -390,11 +446,21 @@ unique_ptr<NodeStatistics> IcebergMultiFileList::GetCardinality(ClientContext &c
 }
 
 BoundIcebergManifestEntry IcebergMultiFileList::GetManifestEntry(idx_t file_id) const {
+#ifdef ICEBERG_VANE_DISTRIBUTED
+	if (distributed_scan) {
+		return distributed_scan->GetManifestEntry(file_id);
+	}
+#endif
 	lock_guard<mutex> guard(shared_state->lock);
 	return data_manifest_entries[file_id];
 }
 
 vector<IcebergPartitionInfo> IcebergMultiFileList::GetPartitionInfoForDataFile(const string &file_path) const {
+#ifdef ICEBERG_VANE_DISTRIBUTED
+	if (distributed_scan) {
+		return distributed_scan->GetPartitionInfo(file_path);
+	}
+#endif
 	lock_guard<mutex> guard(shared_state->lock);
 	auto entry = shared_state->data_file_partition_info.find(file_path);
 	if (entry != shared_state->data_file_partition_info.end()) {
@@ -405,6 +471,14 @@ vector<IcebergPartitionInfo> IcebergMultiFileList::GetPartitionInfoForDataFile(c
 
 const IcebergManifestFile &IcebergMultiFileList::GetManifestFileForEntry(const BoundIcebergManifestEntry &entry,
                                                                          IcebergManifestContentType type) const {
+#ifdef ICEBERG_VANE_DISTRIBUTED
+	if (distributed_scan) {
+		if (type != IcebergManifestContentType::DATA) {
+			throw InternalException("Distributed Iceberg workers do not scan delete manifests");
+		}
+		return distributed_scan->GetManifestFile(entry);
+	}
+#endif
 	if (type == IcebergManifestContentType::DATA) {
 		return data_manifests[entry.manifest_file_idx].entry.file;
 	} else {
@@ -413,6 +487,13 @@ const IcebergManifestFile &IcebergMultiFileList::GetManifestFileForEntry(const B
 }
 
 void IcebergMultiFileList::GetStatistics(vector<PartitionStatistics> &result) const {
+#ifdef ICEBERG_VANE_DISTRIBUTED
+	if (distributed_scan) {
+		// The split snapshot contains data-file record counts, but positional and
+		// equality deletes make them unsuitable for an exact partition count.
+		return;
+	}
+#endif
 	if (GetMetadata().iceberg_version == 1) {
 		//! We collect no statistics information from manifests for V1 tables.
 		return;
@@ -895,6 +976,11 @@ OpenFileInfo IcebergMultiFileList::GetFileInternal(idx_t file_id, lock_guard<mut
 }
 
 OpenFileInfo IcebergMultiFileList::GetFile(idx_t file_id) const {
+#ifdef ICEBERG_VANE_DISTRIBUTED
+	if (distributed_scan) {
+		return distributed_scan->GetFile(file_id);
+	}
+#endif
 	lock_guard<mutex> guard(shared_state->lock);
 	return GetFileInternal(file_id, guard);
 }
@@ -966,6 +1052,11 @@ bool IcebergMultiFileList::ManifestMatchesFilter(const IcebergManifestFile &mani
 
 vector<reference<const IcebergEqualityDeleteRow>>
 IcebergMultiFileList::GetEqualityDeletesForFile(const BoundIcebergManifestEntry &bound_manifest_entry) const {
+#ifdef ICEBERG_VANE_DISTRIBUTED
+	if (distributed_scan) {
+		return distributed_scan->GetEqualityDeletes(bound_manifest_entry);
+	}
+#endif
 	lock_guard<mutex> guard(shared_state->delete_lock);
 	vector<reference<const IcebergEqualityDeleteRow>> result;
 
@@ -1232,6 +1323,15 @@ void IcebergMultiFileList::ScanDeleteFiles(const vector<MultiFileColumnDefinitio
 void IcebergMultiFileList::ProcessDeletes(const vector<MultiFileColumnDefinition> &global_columns,
                                           const vector<ColumnIndex> &global_column_ids,
                                           const vector<idx_t> &projection_ids) const {
+#ifdef ICEBERG_VANE_DISTRIBUTED
+	if (distributed_scan) {
+		if (distributed_scan->HasPlannedSplits()) {
+			throw InvalidInputException("A planned distributed Iceberg scan cannot be executed directly; "
+			                            "create a worker bind and assign its scan splits");
+		}
+		return;
+	}
+#endif
 	lock_guard<mutex> guard(shared_state->lock);
 	InitializeFiles(guard);
 	lock_guard<mutex> delete_guard(shared_state->delete_lock);
@@ -1351,6 +1451,11 @@ void IcebergMultiFileList::ScanDeleteFile(const BoundIcebergManifestEntry &bound
 }
 
 unique_ptr<DeleteFilter> IcebergMultiFileList::GetPositionalDeletesForFile(const string &file_path) const {
+#ifdef ICEBERG_VANE_DISTRIBUTED
+	if (distributed_scan) {
+		return distributed_scan->GetPositionalDeletes(file_path);
+	}
+#endif
 	lock_guard<mutex> guard(shared_state->delete_lock);
 	auto it = shared_state->positional_delete_data.find(file_path);
 	if (it != shared_state->positional_delete_data.end()) {
@@ -1361,6 +1466,11 @@ unique_ptr<DeleteFilter> IcebergMultiFileList::GetPositionalDeletesForFile(const
 }
 
 shared_ptr<IcebergDeleteData> IcebergMultiFileList::GetExistingPositionalDeleteData(const string &file_path) const {
+#ifdef ICEBERG_VANE_DISTRIBUTED
+	if (distributed_scan) {
+		return distributed_scan->GetPositionalDeleteData(file_path);
+	}
+#endif
 	lock_guard<mutex> guard(shared_state->delete_lock);
 	auto it = shared_state->positional_delete_data.find(file_path);
 	if (it == shared_state->positional_delete_data.end()) {
@@ -1368,5 +1478,92 @@ shared_ptr<IcebergDeleteData> IcebergMultiFileList::GetExistingPositionalDeleteD
 	}
 	return it->second;
 }
+
+#ifdef ICEBERG_VANE_DISTRIBUTED
+void IcebergMultiFileList::InitializeDistributedScanPlan(vector<string> payloads, shared_ptr<IcebergScanInfo> scan_info,
+                                                         string scan_split_set_id, string table_uuid, bool has_snapshot,
+                                                         int64_t snapshot_id) {
+	if (!distributed_scan) {
+		distributed_scan = make_shared_ptr<IcebergDistributedScanState>();
+	}
+	distributed_scan->InitializePlannedScan(std::move(payloads), std::move(scan_info), std::move(scan_split_set_id),
+	                                        std::move(table_uuid), has_snapshot, snapshot_id);
+}
+
+void IcebergMultiFileList::InitializeDistributedWorkerScan(IcebergDistributedWorkerScanInfo worker_scan_info) {
+	if (!distributed_scan) {
+		distributed_scan = make_shared_ptr<IcebergDistributedScanState>();
+	}
+	distributed_scan->InitializeWorkerScan(std::move(worker_scan_info));
+}
+
+void IcebergMultiFileList::AssignDistributedScanSplits(vector<string> payloads) {
+	if (!distributed_scan) {
+		throw InternalException("Distributed Iceberg worker scan was not configured before split assignment");
+	}
+	distributed_scan->AssignWorkerSplits(std::move(payloads));
+}
+
+bool IcebergMultiFileList::HasDistributedScanPlan() const {
+	return distributed_scan && distributed_scan->HasPlannedSplits();
+}
+
+bool IcebergMultiFileList::HasDistributedWorkerScan() const {
+	return distributed_scan && distributed_scan->HasWorkerScan();
+}
+
+bool IcebergMultiFileList::HasAssignedDistributedScanSplits() const {
+	return distributed_scan && distributed_scan->HasWorkerSplitsAssigned();
+}
+
+const IcebergDistributedWorkerScanInfo &IcebergMultiFileList::GetDistributedWorkerScanInfo() const {
+	if (!distributed_scan) {
+		throw InternalException("Distributed Iceberg scan has no worker template state");
+	}
+	return distributed_scan->GetWorkerScanInfo();
+}
+
+const string &IcebergMultiFileList::GetDistributedScanSplitSetId() const {
+	if (!distributed_scan) {
+		throw InternalException("Distributed Iceberg scan has no planned identity");
+	}
+	return distributed_scan->GetScanSplitSetId();
+}
+
+const string &IcebergMultiFileList::GetDistributedScanTableUUID() const {
+	if (!distributed_scan) {
+		throw InternalException("Distributed Iceberg scan has no planned identity");
+	}
+	return distributed_scan->GetPlannedTableUUID();
+}
+
+bool IcebergMultiFileList::DistributedScanHasSnapshot() const {
+	if (!distributed_scan) {
+		throw InternalException("Distributed Iceberg scan has no planned identity");
+	}
+	return distributed_scan->PlannedScanHasSnapshot();
+}
+
+int64_t IcebergMultiFileList::GetDistributedScanSnapshotId() const {
+	if (!distributed_scan) {
+		throw InternalException("Distributed Iceberg scan has no planned identity");
+	}
+	return distributed_scan->GetPlannedSnapshotId();
+}
+
+string IcebergMultiFileList::GetDistributedScanSplitPayload(idx_t file_id) const {
+	if (!distributed_scan) {
+		throw InternalException("Distributed Iceberg scan has no planned split set");
+	}
+	return distributed_scan->GetPlannedSplitPayload(file_id);
+}
+
+vector<int32_t> IcebergMultiFileList::GetDistributedEqualityDeleteFieldIds() const {
+	if (!distributed_scan) {
+		return {};
+	}
+	return distributed_scan->GetEqualityDeleteFieldIds();
+}
+#endif
 
 } // namespace duckdb

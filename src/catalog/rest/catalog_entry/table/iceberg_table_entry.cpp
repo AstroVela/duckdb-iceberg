@@ -254,6 +254,16 @@ TableStorageInfo IcebergTableEntry::GetStorageInfo(ClientContext &context) {
 	return result;
 }
 
+#ifdef ICEBERG_VANE_DISTRIBUTED
+string IcebergTableEntry::GetLogicalWriteTargetIdentity() const {
+	auto &table_uuid = table_info.table_metadata.table_uuid;
+	if (table_uuid.empty()) {
+		throw InternalException("Iceberg table '%s' has no stable table UUID", name);
+	}
+	return table_uuid;
+}
+#endif
+
 string IcebergTableEntry::GetUUID() const {
 	return table_info.table_id;
 }

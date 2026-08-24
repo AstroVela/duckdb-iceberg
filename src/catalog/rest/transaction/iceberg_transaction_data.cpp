@@ -24,6 +24,12 @@ IcebergTransactionData::IcebergTransactionData(ClientContext &context, const Ice
 	initial_schema_id = table_info.table_metadata.GetCurrentSchemaId();
 }
 
+#ifdef ICEBERG_VANE_DISTRIBUTED
+void IcebergTransactionData::RetainAddedSnapshotFilesOnRollback() {
+	retain_added_snapshot_files_on_rollback = true;
+}
+#endif
+
 void IcebergTransactionData::CacheExistingManifestList(lock_guard<mutex> &guard, const IcebergTableMetadata &metadata) {
 	if (!alters.empty()) {
 		return;

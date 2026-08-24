@@ -1,6 +1,11 @@
 #include "execution/operator/iceberg_delete.hpp"
 
 #include "iceberg_logging.hpp"
+#ifdef ICEBERG_VANE_DISTRIBUTED
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/execution/distributed/extension_write_task_provider.hpp"
+#include "execution/operator/iceberg_distributed_write.hpp"
+#endif
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
 #include "duckdb/catalog/catalog_entry/copy_function_catalog_entry.hpp"
@@ -37,6 +42,181 @@ IcebergDelete::IcebergDelete(PhysicalPlan &physical_plan, IcebergTableEntry &tab
       multi_file_list(multi_file_list), row_id_indexes(std::move(row_id_indexes)) {
 	children.push_back(child);
 }
+
+#ifdef ICEBERG_VANE_DISTRIBUTED
+void IcebergDelete::InitializeDistributedWritePlan(ClientContext &context) {
+	distributed_write_plan.extension_name = "iceberg";
+	distributed_write_plan.operator_name = "delete";
+	distributed_artifact_namespace = CreateIcebergDistributedArtifactNamespace();
+	distributed_write_plan.worker_bind_data =
+	    BuildIcebergDistributedDeleteBind(context, table, row_id_indexes, distributed_artifact_namespace);
+	auto &metadata = table.table_info.table_metadata;
+	distributed_catalog_name = table.catalog.GetName();
+	distributed_schema_name = table.schema.name;
+	distributed_table_name = table.name;
+	distributed_table_uuid = metadata.table_uuid;
+	distributed_data_path = metadata.GetDataPath(FileSystem::GetFileSystem(context));
+	distributed_schema_id = metadata.GetCurrentSchemaId();
+	distributed_partition_spec_id = metadata.default_spec_id;
+	distributed_iceberg_version = metadata.iceberg_version;
+	auto snapshot = metadata.GetLatestSnapshot();
+	distributed_has_snapshot = snapshot != nullptr;
+	distributed_snapshot_id = snapshot ? snapshot->snapshot_id : 0;
+}
+
+optional_ptr<distributed::ExtensionWriteTaskProvider> IcebergDelete::GetExtensionWriteTaskProvider() {
+	SelectDistributedWorkerPlan();
+	return this;
+}
+
+void IcebergDelete::SelectDistributedWorkerPlan() {
+	if (distributed_worker_plan_selected) {
+		return;
+	}
+	if (!distributed_worker_child || children.size() != 1) {
+		throw InvalidInputException("Distributed Iceberg DELETE requires exactly one worker child");
+	}
+	children[0] = *distributed_worker_child;
+	distributed_worker_plan_selected = true;
+}
+
+const distributed::DistributedExtensionWritePlan &IcebergDelete::WritePlan() const {
+	if (distributed_write_plan.worker_bind_data.empty() || distributed_artifact_namespace.empty() ||
+	    !distributed_worker_plan_selected || !multi_file_list) {
+		throw InvalidInputException("Iceberg distributed DELETE was not initialized during planning");
+	}
+	if (is_equality_delete) {
+		throw NotImplementedException("Distributed Iceberg equality DELETE is not supported");
+	}
+	if (distributed_iceberg_version != 2) {
+		throw NotImplementedException("Distributed Iceberg DELETE currently supports format-version 2 tables only");
+	}
+	if (children.size() != 1) {
+		throw InvalidInputException("Distributed Iceberg DELETE requires exactly one worker input");
+	}
+	return distributed_write_plan;
+}
+
+IcebergTableEntry &IcebergDelete::ResolveDistributedWriteTable(ClientContext &context) const {
+	WritePlan();
+	auto &table_entry = Catalog::GetEntry<TableCatalogEntry>(context, distributed_catalog_name, distributed_schema_name,
+	                                                         distributed_table_name)
+	                        .Cast<IcebergTableEntry>();
+	table_entry.PrepareIcebergScanFromEntry(context);
+	auto &metadata = table_entry.table_info.table_metadata;
+	if (metadata.table_uuid != distributed_table_uuid) {
+		throw TransactionException("Iceberg table %s.%s.%s was replaced after the distributed DELETE was planned",
+		                           distributed_catalog_name, distributed_schema_name, distributed_table_name);
+	}
+	if (metadata.GetCurrentSchemaId() != distributed_schema_id ||
+	    metadata.default_spec_id != distributed_partition_spec_id || metadata.iceberg_version != 2) {
+		throw TransactionException("Iceberg table %s.%s.%s layout changed after the distributed DELETE was planned",
+		                           distributed_catalog_name, distributed_schema_name, distributed_table_name);
+	}
+	auto snapshot = metadata.GetLatestSnapshot();
+	if ((snapshot != nullptr) != distributed_has_snapshot ||
+	    (snapshot && snapshot->snapshot_id != distributed_snapshot_id)) {
+		throw TransactionException("Iceberg table %s.%s.%s snapshot changed after the distributed DELETE was planned",
+		                           distributed_catalog_name, distributed_schema_name, distributed_table_name);
+	}
+	auto current_data_path = metadata.GetDataPath(FileSystem::GetFileSystem(context));
+	if (current_data_path != distributed_data_path) {
+		throw TransactionException("Iceberg table %s.%s.%s data path changed after the distributed DELETE was planned",
+		                           distributed_catalog_name, distributed_schema_name, distributed_table_name);
+	}
+	if (!metadata.PropertiesAllowPositionalDeletes(IcebergSnapshotOperationType::DELETE)) {
+		throw NotImplementedException(IcebergCatalog::GetOnlyMergeOnReadSupportedErrorMessage(
+		    distributed_table_name, WRITE_DELETE_MODE, metadata.GetTableProperty(WRITE_DELETE_MODE)));
+	}
+	return table_entry;
+}
+
+void IcebergDelete::ValidateDistributedWrite(ClientContext &context) const {
+	auto &table_entry = ResolveDistributedWriteTable(context);
+	ValidateIcebergDistributedTargetPartitionSpec(table_entry.table_info.table_metadata, "DELETE");
+	ValidateIcebergDistributedRowDeltaSourceBaseline(*multi_file_list, table_entry.table_info.table_metadata, "DELETE");
+	ValidateIcebergDistributedRowDeltaSourceSpecs(*multi_file_list,
+	                                              table_entry.table_info.table_metadata.default_spec_id, "DELETE");
+}
+
+static idx_t FindDistributedDeleteDataFile(const IcebergMultiFileList &file_list, const string &path) {
+	file_list.GetTotalFileCount();
+	auto files = file_list.GetAllFiles();
+	for (idx_t index = 0; index < files.size(); index++) {
+		if (files[index].path == path) {
+			return index;
+		}
+	}
+	throw InvalidInputException("Distributed Iceberg DELETE referenced unplanned data file '%s'", path);
+}
+
+idx_t IcebergDelete::FinalizeDistributedWrite(ClientContext &context,
+                                              const vector<DistributedWriteTaskResult> &results) const {
+	auto write_info = distributed::ResolveDistributedExtensionWriteInfo(context, WritePlan());
+	auto decoded =
+	    DecodeIcebergDistributedRowDeltaResults(context, distributed_data_path, distributed_artifact_namespace,
+	                                            write_info, results, IcebergDistributedRowDeltaKind::DELETE);
+	CleanupIcebergDistributedRowDelta(context, distributed_data_path, distributed_artifact_namespace,
+	                                  &decoded.selected_artifact_paths);
+	auto &iceberg_table = ResolveDistributedWriteTable(context);
+	ValidateIcebergDistributedRowDeltaSourceBaseline(*multi_file_list, iceberg_table.table_info.table_metadata,
+	                                                 "DELETE");
+	ValidateIcebergDistributedRowDeltaSourceSpecs(*multi_file_list,
+	                                              iceberg_table.table_info.table_metadata.default_spec_id, "DELETE");
+	IcebergDeleteGlobalState global_state;
+	for (auto &file : decoded.delete_files) {
+		auto file_index = FindDistributedDeleteDataFile(*multi_file_list, file.data_file_path);
+		auto source_entry = multi_file_list->GetManifestEntry(file_index);
+		auto source_record_count = NumericCast<idx_t>(source_entry.entry.data_file.record_count);
+		if (source_record_count == 0 || file.pos_max_value >= source_record_count) {
+			throw InvalidInputException(
+			    "Distributed Iceberg DELETE returned a row position outside data file '%s' (%llu records)",
+			    file.data_file_path, static_cast<unsigned long long>(source_record_count));
+		}
+		IcebergDeleteFileInfo delete_file;
+		delete_file.data_file_path = file.data_file_path;
+		delete_file.file_name = file.delete_file_path;
+		delete_file.file_format = "parquet";
+		delete_file.footer_size = file.footer_size_bytes;
+		delete_file.delete_count = file.delete_count;
+		delete_file.file_size_bytes = file.file_size_bytes;
+		delete_file.pos_min_value = file.pos_min_value;
+		delete_file.pos_max_value = file.pos_max_value;
+		delete_file.partition_info = multi_file_list->GetPartitionInfoForDataFile(file.data_file_path);
+		if (!global_state.written_files.emplace(file.data_file_path, std::move(delete_file)).second) {
+			throw InvalidInputException("Distributed Iceberg DELETE produced multiple delete files for data file '%s'",
+			                            file.data_file_path);
+		}
+	}
+	global_state.total_deleted_count = decoded.affected_rows;
+	if (decoded.affected_rows != 0 && global_state.written_files.empty()) {
+		throw InternalException("Distributed Iceberg DELETE did not produce delete files");
+	}
+	if (decoded.affected_rows != 0) {
+		auto manifest_entries = GenerateDeleteManifestEntries(global_state);
+		auto &transaction = IcebergTransaction::Get(context, iceberg_table.catalog);
+		ApplyTableUpdate(iceberg_table.table_info, transaction, [&](IcebergTableInformation &table_info) {
+			auto &transaction_data = table_info.GetOrCreateTransactionData(transaction);
+			transaction_data.RetainAddedSnapshotFilesOnRollback();
+			transaction_data.AddSnapshot(IcebergSnapshotOperationType::DELETE, std::move(manifest_entries),
+			                             std::move(global_state.altered_manifests));
+		});
+	}
+	return decoded.affected_rows;
+}
+
+void IcebergDelete::AbortDistributedWrite(ClientContext &context, const vector<DistributedWriteTaskResult> &) const {
+	CleanupIcebergDistributedRowDelta(context, distributed_data_path, distributed_artifact_namespace);
+}
+
+void IcebergDelete::BuildPipelines(Pipeline &current, MetaPipeline &meta_pipeline) {
+	if (distributed_worker_plan_selected) {
+		throw InvalidInputException(
+		    "A distributed Iceberg DELETE worker plan cannot be executed as a native coordinator operator");
+	}
+	PhysicalOperator::BuildPipelines(current, meta_pipeline);
+}
+#endif
 
 unique_ptr<GlobalSinkState> IcebergDelete::GetGlobalSinkState(ClientContext &context) const {
 	return make_uniq<IcebergDeleteGlobalState>();
@@ -448,6 +628,12 @@ string IcebergDelete::GetName() const {
 
 InsertionOrderPreservingMap<string> IcebergDelete::ParamsToString() const {
 	InsertionOrderPreservingMap<string> result;
+#ifdef ICEBERG_VANE_DISTRIBUTED
+	if (!distributed_table_name.empty()) {
+		result["Table Name"] = distributed_table_name;
+		return result;
+	}
+#endif
 	result["Table Name"] = table.name;
 	return result;
 }
@@ -489,6 +675,23 @@ PhysicalOperator &IcebergDelete::PlanDelete(ClientContext &context, PhysicalPlan
 		DUCKDB_LOG_DEBUG(context, "Could not find IcebergDelete source. Iceberg Multi File list is empty");
 	}
 
+#ifdef ICEBERG_VANE_DISTRIBUTED
+#ifdef ICEBERG_ENABLE_EQUALITY_DELETE_WRITES
+	vector<IcebergEqualityDeletePredicate> equality_predicates;
+	bool is_equality_delete = TryGetEqualityDeletePredicates(context, table, child_plan, equality_predicates);
+	auto &result = planner
+	                   .Make<IcebergDelete>(table, file_list, child_plan, std::move(row_id_indexes), is_equality_delete,
+	                                        std::move(equality_predicates))
+	                   .Cast<IcebergDelete>();
+#else
+	auto &result =
+	    planner.Make<IcebergDelete>(table, file_list, child_plan, std::move(row_id_indexes)).Cast<IcebergDelete>();
+#endif
+	result.InitializeDistributedWritePlan(context);
+	result.distributed_worker_child =
+	    &PlanIcebergDistributedRowDeltaRepartition(planner, child_plan, result.row_id_indexes[0]);
+	return result;
+#else
 #ifdef ICEBERG_ENABLE_EQUALITY_DELETE_WRITES
 	vector<IcebergEqualityDeletePredicate> equality_predicates;
 	bool is_equality_delete = TryGetEqualityDeletePredicates(context, table, child_plan, equality_predicates);
@@ -496,6 +699,7 @@ PhysicalOperator &IcebergDelete::PlanDelete(ClientContext &context, PhysicalPlan
 	                                   std::move(equality_predicates));
 #else
 	return planner.Make<IcebergDelete>(table, file_list, child_plan, std::move(row_id_indexes));
+#endif
 #endif
 }
 
