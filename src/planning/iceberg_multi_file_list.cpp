@@ -311,9 +311,72 @@ unique_ptr<IcebergMultiFileList> IcebergMultiFileList::PushdownInternal(ClientCo
 	filtered_list->have_bound = true;
 #ifdef ICEBERG_VANE_DISTRIBUTED
 	filtered_list->distributed_scan = distributed_scan;
+	filtered_list->PruneDistributedScanPlan();
 #endif
 	return filtered_list;
 }
+
+#ifdef ICEBERG_VANE_DISTRIBUTED
+void IcebergMultiFileList::PruneDistributedScanPlan() {
+	if (!distributed_scan || !distributed_scan->HasPlannedSplits()) {
+		return;
+	}
+	vector<string> filtered_splits;
+	auto file_count = distributed_scan->GetTotalFileCount();
+	filtered_splits.reserve(file_count);
+	for (idx_t file_index = 0; file_index < file_count; file_index++) {
+		auto manifest_entry = distributed_scan->GetManifestEntry(file_index);
+		auto &manifest_file = distributed_scan->GetManifestFile(manifest_entry);
+		if (table_filters.filters.empty() ||
+		    FileMatchesFilter(manifest_file, manifest_entry.entry, IcebergManifestContentType::DATA)) {
+			filtered_splits.push_back(distributed_scan->GetPlannedSplitPayload(file_index));
+		}
+	}
+	distributed_scan = distributed_scan->CreatePlannedSplitSubset(std::move(filtered_splits));
+}
+
+unique_ptr<IcebergMultiFileList>
+IcebergMultiFileList::PushdownDistributedScanFilters(const vector<ColumnIndex> &column_ids,
+                                                     optional_ptr<const TableFilterSet> filters) const {
+	if (!filters || filters->filters.empty()) {
+		return nullptr;
+	}
+
+	auto filtered_list = unique_ptr<IcebergMultiFileList>(new IcebergMultiFileList(shared_state));
+	TableFilterSet result_filter_set;
+	for (const auto &filter : table_filters.filters) {
+		result_filter_set.PushFilter(ColumnIndex(filter.first), filter.second->Copy());
+	}
+	bool added_filter = false;
+	auto schema_column_count = GetSchema().columns.size();
+	for (const auto &filter : filters->filters) {
+		if (filter.first >= column_ids.size()) {
+			throw InternalException("Distributed Iceberg scan filter index %llu is out of bounds",
+			                        static_cast<unsigned long long>(filter.first));
+		}
+		auto &column_id = column_ids[filter.first];
+		auto previously_pushed_down_filter = table_filters.filters.find(column_id.GetPrimaryIndex());
+		if (previously_pushed_down_filter != table_filters.filters.end() &&
+		    filter.second->Equals(*previously_pushed_down_filter->second)) {
+			continue;
+		}
+		if (column_id.GetPrimaryIndex() < schema_column_count) {
+			result_filter_set.PushFilter(column_id, filter.second->Copy());
+			added_filter = true;
+		}
+	}
+	if (!added_filter) {
+		return nullptr;
+	}
+	filtered_list->table_filters = std::move(result_filter_set);
+	filtered_list->names = names;
+	filtered_list->types = types;
+	filtered_list->have_bound = have_bound;
+	filtered_list->distributed_scan = distributed_scan;
+	filtered_list->PruneDistributedScanPlan();
+	return filtered_list;
+}
+#endif
 
 unique_ptr<MultiFileList>
 IcebergMultiFileList::DynamicFilterPushdown(ClientContext &context, const MultiFileOptions &options,

@@ -954,8 +954,10 @@ IcebergPlanDistributedScanSplits(const TableFunctionDistributedScanPlanningInput
 	if (!file_list.HasDistributedScanPlan()) {
 		throw InvalidInputException("Distributed Iceberg scan planning requires a planned scan split set");
 	}
-	auto file_count = file_list.GetTotalFileCount();
-	auto files = file_list.GetAllFiles();
+	auto filtered_list = file_list.PushdownDistributedScanFilters(input.column_ids, input.table_filters);
+	auto &planned_file_list = filtered_list ? *filtered_list : file_list;
+	auto file_count = planned_file_list.GetTotalFileCount();
+	auto files = planned_file_list.GetAllFiles();
 	if (files.size() != file_count) {
 		throw InternalException("Iceberg distributed scan expanded %llu files but returned %llu",
 		                        static_cast<unsigned long long>(file_count),
@@ -966,10 +968,10 @@ IcebergPlanDistributedScanSplits(const TableFunctionDistributedScanPlanningInput
 	vector<DistributedScanSplit> result;
 	result.reserve(files.size());
 	for (idx_t file_index = 0; file_index < files.size(); file_index++) {
-		auto manifest_entry = file_list.GetManifestEntry(file_index);
+		auto manifest_entry = planned_file_list.GetManifestEntry(file_index);
 		DistributedScanSplit split;
 		split.split_id = std::to_string(file_index);
-		split.payload = file_list.GetDistributedScanSplitPayload(file_index);
+		split.payload = planned_file_list.GetDistributedScanSplitPayload(file_index);
 		auto record_count = manifest_entry.entry.data_file.record_count;
 		auto file_size = manifest_entry.entry.data_file.file_size_in_bytes;
 		if (record_count < 0 || file_size < 0) {
@@ -1212,6 +1214,17 @@ void IcebergDistributedScanState::InitializePlannedScan(vector<string> payloads,
 	planned_snapshot_id = snapshot_id;
 	phase = Phase::PLANNED;
 	worker_scan_info = IcebergDistributedWorkerScanInfo();
+}
+
+shared_ptr<IcebergDistributedScanState>
+IcebergDistributedScanState::CreatePlannedSplitSubset(vector<string> payloads) const {
+	if (!HasPlannedScanInfo()) {
+		throw InternalException("Distributed Iceberg scan pruning requires planned scan state");
+	}
+	auto result = make_shared_ptr<IcebergDistributedScanState>();
+	result->InitializePlannedScan(std::move(payloads), planned_scan_info, planned_scan_split_set_id, planned_table_uuid,
+	                              planned_scan_has_snapshot, planned_snapshot_id);
+	return result;
 }
 
 void IcebergDistributedScanState::InitializeWorkerScan(IcebergDistributedWorkerScanInfo worker_scan_info_p) {

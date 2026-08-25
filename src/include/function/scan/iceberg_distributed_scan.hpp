@@ -21,6 +21,7 @@ namespace duckdb {
 struct IcebergScanInfo;
 struct IcebergSnapshotScanInfo;
 struct IcebergTableMetadata;
+struct IcebergMultiFileList;
 class IcebergTableSchema;
 
 struct IcebergDistributedWorkerScanInfo {
@@ -72,9 +73,12 @@ public:
 	vector<reference<const IcebergEqualityDeleteRow>> GetEqualityDeletes(const BoundIcebergManifestEntry &entry) const;
 
 private:
+	friend struct IcebergMultiFileList;
+
 	enum class Phase : uint8_t { EMPTY, PLANNED, WORKER_TEMPLATE, WORKER_ASSIGNED };
 
 	struct FileState;
+	shared_ptr<IcebergDistributedScanState> CreatePlannedSplitSubset(vector<string> payloads) const;
 	void LoadSplitPayloads(vector<string> payloads, const string &expected_scan_split_set_id,
 	                       optional_ptr<const unordered_map<int32_t, idx_t>> field_id_to_output_index,
 	                       optional_ptr<const unordered_map<int32_t, LogicalType>> field_id_to_type);

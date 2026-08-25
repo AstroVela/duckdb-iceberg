@@ -76,13 +76,26 @@ source.create(
 ```
 
 The worker COPY schema is derived from the requested format version before any
-files are written. The integration lane covers partitioned v2 CTAS and a
-focused v3 CTAS case with nested field IDs and initial row-lineage metadata;
-this does not claim complete v3 mutation support. Distributed writes reject a
-current partition spec containing a `VOID` transform. Format-version 2 tables
-support distributed `UPDATE` and `DELETE` through positional-delete files; a
-distributed row-delta operation fails if any selected source file uses a
-partition spec other than the current default.
+files are written. The two-worker Ray integration lane covers partitioned v2
+CTAS and v3 CTAS, reads a spec-compliant Puffin deletion vector, checks v3
+partition and projection pruning, reads and appends `VARIANT` and
+`TIMESTAMP_NS`, and verifies row-lineage metadata across an append to an
+existing v3 table. Geometry is not qualified because the optional geometry
+dependency is not part of this lane.
+
+| Distributed capability | Iceberg v2 | Iceberg v3 |
+| --- | --- | --- |
+| Data scans | Supported, including positional and equality deletes | Supported, including Puffin deletion vectors |
+| `INSERT` into an existing table | Supported | Supported, with row-ID and sequence-number assignment |
+| `CREATE TABLE AS` | Supported with an explicit worker data path and staged catalog creation | Supported under the same constraints, including initial row lineage |
+| `VARIANT` and `TIMESTAMP_NS` | Not Iceberg v2 types | Supported; legacy Parquet VARIANT decoding remains rejected |
+| `UPDATE` and `DELETE` | Supported through positional-delete files | Rejected; distributed Puffin row-delta writes are tracked separately in [#5](https://github.com/AstroVela/duckdb-iceberg/issues/5) |
+
+Distributed writes reject a current partition spec containing a `VOID`
+transform. A distributed v2 row-delta operation also fails if any selected
+source file uses a partition spec other than the current default. V3 scan and
+append plans fail closed when their target snapshot, schema, or partition spec
+changes before catalog finalization; no local execution fallback is used.
 
 Scan splits materialize the coordinator's selected files and delete state,
 including transaction-local changes visible when the plan is created.
