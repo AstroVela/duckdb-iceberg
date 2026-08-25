@@ -61,10 +61,29 @@ The Vane build supports distributed Iceberg scans and auto-commit `INSERT`.
 `write.data.path` table property and does not support `IF NOT EXISTS` or
 `OR REPLACE`. The catalog must also enable staged table creation
 (`stage_create_tables=true`) so the new table remains transactional until its
-initial snapshot commit. Distributed writes reject a current partition spec
-containing a `VOID` transform. Format-version 2 tables support distributed `UPDATE` and `DELETE`
-through positional-delete files; a distributed row-delta operation fails if
-any selected source file uses a partition spec other than the current default.
+initial snapshot commit. Vane's generic Relation API passes these options and
+partition expressions without adding an Iceberg-specific Python API:
+
+```python
+source.create(
+    "catalog.schema.events",
+    properties={
+        "format-version": 2,
+        "write.data.path": "s3://warehouse/events/data",
+    },
+    partition_by=["bucket(16, id)"],
+)
+```
+
+The worker COPY schema is derived from the requested format version before any
+files are written. The integration lane covers partitioned v2 CTAS and a
+focused v3 CTAS case with nested field IDs and initial row-lineage metadata;
+this does not claim complete v3 mutation support. Distributed writes reject a
+current partition spec containing a `VOID` transform. Format-version 2 tables
+support distributed `UPDATE` and `DELETE` through positional-delete files; a
+distributed row-delta operation fails if any selected source file uses a
+partition spec other than the current default.
+
 Scan splits materialize the coordinator's selected files and delete state,
 including transaction-local changes visible when the plan is created.
 

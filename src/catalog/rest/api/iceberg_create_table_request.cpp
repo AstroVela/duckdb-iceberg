@@ -6,7 +6,14 @@
 #include "duckdb/parser/parsed_data/copy_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/execution/execution_context.hpp"
+#ifdef ICEBERG_VANE_DISTRIBUTED
+#include "duckdb/execution/expression_executor.hpp"
+#endif
 #include "duckdb/parallel/thread_context.hpp"
+#ifdef ICEBERG_VANE_DISTRIBUTED
+#include "duckdb/planner/binder.hpp"
+#include "duckdb/planner/expression_binder/table_function_binder.hpp"
+#endif
 #include "duckdb/storage/buffer_manager.hpp"
 #include "duckdb/storage/caching_file_system.hpp"
 #include "duckdb/common/types/blob.hpp"
@@ -24,6 +31,62 @@ namespace duckdb {
 IcebergCreateTableRequest::IcebergCreateTableRequest(const IcebergTableInformation &table_info)
     : table_info(table_info) {
 }
+
+#ifdef ICEBERG_VANE_DISTRIBUTED
+static Value ParseTableProperty(TableFunctionBinder &binder, ClientContext &context, const ParsedExpression &expr_ref,
+                                const string &property_name, const LogicalType &type) {
+	auto expr = expr_ref.Copy();
+	auto bound_expr = binder.Bind(expr);
+	if (bound_expr->HasParameter()) {
+		throw ParameterNotResolvedException();
+	}
+
+	auto val = ExpressionExecutor::EvaluateScalar(context, *bound_expr, true);
+	if (val.IsNull()) {
+		throw BinderException("NULL is not supported as a valid option for '%s'", property_name);
+	}
+	if (!val.DefaultTryCastAs(type, true)) {
+		throw InvalidInputException("Can't cast '%s' property (%s) to %s", property_name, val.ToString(),
+		                            type.ToString());
+	}
+	return val;
+}
+
+IcebergCreateTableOptions IcebergCreateTableRequest::ParseCreateTableOptions(ClientContext &context,
+                                                                             const CreateTableInfo &info) {
+	auto binder = Binder::CreateBinder(context);
+	TableFunctionBinder property_binder(*binder, context, "format-version");
+
+	IcebergCreateTableOptions result;
+	auto format_version_it = info.options.find("format-version");
+	if (format_version_it != info.options.end()) {
+		result.iceberg_version = ParseTableProperty(property_binder, context, *format_version_it->second,
+		                                            "format-version", LogicalType::INTEGER)
+		                             .GetValue<int32_t>();
+		if (result.iceberg_version < 1) {
+			throw InvalidInputException("The lowest supported iceberg version is 1!");
+		}
+	}
+
+	auto location_it = info.options.find("location");
+	if (location_it != info.options.end()) {
+		result.location =
+		    ParseTableProperty(property_binder, context, *location_it->second, "location", LogicalType::VARCHAR)
+		        .GetValue<string>();
+	}
+
+	for (const auto &option : info.options) {
+		if (StringUtil::CIEquals(option.first, "format-version") || StringUtil::CIEquals(option.first, "location")) {
+			continue;
+		}
+		auto option_val =
+		    ParseTableProperty(property_binder, context, *option.second, option.first, LogicalType::VARCHAR)
+		        .GetValue<string>();
+		result.table_properties.emplace(option.first, std::move(option_val));
+	}
+	return result;
+}
+#endif
 
 static string ConvertBlobDefault(const string_t &str) {
 	string result;
@@ -236,6 +299,30 @@ IcebergCreateTableRequest::CreateIcebergColumn(const ColumnDefinition &column_de
 	return iceberg_column_def;
 }
 
+#ifdef ICEBERG_VANE_DISTRIBUTED
+static void AssignFreshNestedFieldIds(IcebergColumnDefinition &column, int32_t &next_field_id) {
+	// Iceberg assigns every direct field of a struct before descending into nested types.
+	// LIST and MAP children follow the same rule for their element/key/value fields.
+	for (auto &child : column.children) {
+		child->id = next_field_id++;
+	}
+	for (auto &child : column.children) {
+		AssignFreshNestedFieldIds(*child, next_field_id);
+	}
+}
+
+static void AssignFreshSchemaFieldIds(IcebergTableSchema &schema, int32_t &last_column_id) {
+	int32_t next_field_id = 1;
+	for (auto &column : schema.columns) {
+		column->id = next_field_id++;
+	}
+	for (auto &column : schema.columns) {
+		AssignFreshNestedFieldIds(*column, next_field_id);
+	}
+	last_column_id = next_field_id - 1;
+}
+#endif
+
 shared_ptr<IcebergTableSchema> IcebergCreateTableRequest::CreateIcebergSchema(
     ClientContext &context, const IcebergTableMetadata &table_metadata, const ColumnList &columns,
     optional_ptr<const vector<unique_ptr<Constraint>>> constraints_p, int32_t &last_column_id) {
@@ -276,7 +363,11 @@ shared_ptr<IcebergTableSchema> IcebergCreateTableRequest::CreateIcebergSchema(
 		    CreateIcebergColumn(column_def, binder, required, next_field_id, table_metadata.iceberg_version);
 		schema->columns.push_back(std::move(iceberg_column_def));
 	}
+#ifdef ICEBERG_VANE_DISTRIBUTED
+	AssignFreshSchemaFieldIds(*schema, last_column_id);
+#else
 	last_column_id = field_id - 1;
+#endif
 	return schema;
 }
 
