@@ -509,9 +509,16 @@ struct IcebergWorkerEqualityDeleteMapping {
 	idx_t output_column_count = 0;
 };
 
+static const MultiFileBindData &RequireDistributedScanBindData(const TableFunctionDistributedScanInput &input) {
+	if (!input.bind_data) {
+		throw InvalidInputException("Distributed Iceberg scan requires table-function bind data");
+	}
+	return input.bind_data->Cast<MultiFileBindData>();
+}
+
 static IcebergWorkerEqualityDeleteMapping
 BuildWorkerEqualityDeleteMapping(const TableFunctionDistributedScanInput &input) {
-	auto &bind_data = input.bind_data.Cast<MultiFileBindData>();
+	auto &bind_data = RequireDistributedScanBindData(input);
 	auto &file_list = bind_data.file_list->Cast<IcebergMultiFileList>();
 	if (!file_list.HasDistributedScanPlan()) {
 		throw InvalidInputException("Distributed Iceberg worker bind requires a planned scan split set");
@@ -576,7 +583,7 @@ public:
 		}
 	}
 	explicit IcebergDistributedScanBindData(const TableFunctionDistributedScanInput &input)
-	    : IcebergDistributedScanBindData(input.bind_data.Cast<MultiFileBindData>()) {
+	    : IcebergDistributedScanBindData(RequireDistributedScanBindData(input)) {
 		auto mapping = BuildWorkerEqualityDeleteMapping(input);
 		SetWorkerMapping(mapping.output_indexes, mapping.types, mapping.output_column_count);
 	}
@@ -942,7 +949,7 @@ static unique_ptr<FunctionData> IcebergDistributedScanDeserialize(Deserializer &
 
 static vector<DistributedScanSplit>
 IcebergPlanDistributedScanSplits(const TableFunctionDistributedScanPlanningInput &input) {
-	auto &bind_data = input.bind_data.Cast<MultiFileBindData>();
+	auto &bind_data = RequireDistributedScanBindData(input);
 	auto &file_list = bind_data.file_list->Cast<IcebergMultiFileList>();
 	if (!file_list.HasDistributedScanPlan()) {
 		throw InvalidInputException("Distributed Iceberg scan planning requires a planned scan split set");
@@ -980,8 +987,11 @@ static unique_ptr<FunctionData> IcebergCreateDistributedWorkerBind(const TableFu
 	return make_uniq<IcebergDistributedScanBindData>(input);
 }
 
-static void IcebergApplyDistributedScanSplits(FunctionData &worker_bind_data,
+static void IcebergApplyDistributedScanSplits(optional_ptr<FunctionData> worker_bind_data,
                                               const vector<DistributedScanSplit> &splits) {
+	if (!worker_bind_data) {
+		throw InvalidInputException("Distributed Iceberg scan requires worker bind data");
+	}
 	unordered_set<string> split_ids;
 	vector<string> payloads;
 	payloads.reserve(splits.size());
@@ -994,7 +1004,7 @@ static void IcebergApplyDistributedScanSplits(FunctionData &worker_bind_data,
 		}
 		payloads.push_back(split.payload);
 	}
-	auto &bind_data = worker_bind_data.Cast<MultiFileBindData>();
+	auto &bind_data = worker_bind_data->Cast<MultiFileBindData>();
 	bind_data.file_list->Cast<IcebergMultiFileList>().AssignDistributedScanSplits(std::move(payloads));
 }
 
@@ -1463,6 +1473,7 @@ void ConfigureIcebergDistributedScan(TableFunction &function) {
 	TableFunctionDistributedScanCallbacks callbacks;
 	callbacks.protocol_version = 1;
 	callbacks.split_codec = {ICEBERG_DISTRIBUTED_SCAN_SPLIT_CODEC, 1};
+	callbacks.bind_data_mode = TableFunctionDistributedBindDataMode::REQUIRED;
 	callbacks.plan_splits = IcebergPlanDistributedScanSplits;
 	callbacks.create_worker_bind = IcebergCreateDistributedWorkerBind;
 	callbacks.apply_splits = IcebergApplyDistributedScanSplits;
