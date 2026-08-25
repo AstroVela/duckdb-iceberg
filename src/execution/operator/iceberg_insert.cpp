@@ -1509,6 +1509,9 @@ PhysicalOperator &IcebergCatalog::PlanInsert(ClientContext &context, PhysicalPla
 
 static unique_ptr<IcebergTableMetadata> BuildPlaceholderMetadata(ClientContext &context, BoundCreateTableInfo &info) {
 	auto metadata = make_uniq<IcebergTableMetadata>();
+#ifndef ICEBERG_VANE_DISTRIBUTED
+	metadata->iceberg_version = 2;
+#endif
 	metadata->default_spec_id = 0;
 
 	auto &create_info = info.Base().Cast<CreateTableInfo>();
@@ -1543,7 +1546,6 @@ static unique_ptr<IcebergTableMetadata> BuildPlaceholderMetadata(ClientContext &
 	schema->last_column_id = NumericCast<idx_t>(last_column_id);
 	metadata->last_column_id = last_column_id;
 #else
-	metadata->iceberg_version = 2;
 	schema = make_shared_ptr<IcebergTableSchema>();
 	schema->schema_id = 0;
 	int32_t next_field_id = 1;
