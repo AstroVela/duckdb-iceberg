@@ -38,6 +38,8 @@
 #include "catalog/rest/transaction/iceberg_transaction_update.hpp"
 #include "iceberg_logging.hpp"
 #ifdef ICEBERG_VANE_DISTRIBUTED
+#include "catalog/rest/api/table_update.hpp"
+#include "catalog/rest/transaction/iceberg_transaction_data.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/execution/distributed/extension_write_task_provider.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
@@ -58,6 +60,14 @@ static bool WriteSequenceNumber(IcebergInsertVirtualColumns virtual_columns) {
 
 #ifdef ICEBERG_VANE_DISTRIBUTED
 static void StripTrailingSeparator(FileSystem &fs, string &path);
+
+static void AddDistributedInsertCommitRequirements(IcebergTransactionData &transaction_data) {
+	// Validation and coordinator finalization share one DuckDB transaction, so catalog lookups during finalization see
+	// that transaction's target snapshot. Commit requirements close the race with schema/spec changes made while the
+	// workers are running; the ordinary transaction path already asserts the table UUID and snapshot state.
+	transaction_data.requirements.push_back(make_uniq<AssertCurrentSchemaIdRequirement>(transaction_data.table_info));
+	transaction_data.TableAddAssertDefaultSpecId();
+}
 #endif
 
 IcebergInsert::IcebergInsert(PhysicalPlan &physical_plan, LogicalOperator &op, TableCatalogEntry &table,
@@ -426,6 +436,9 @@ idx_t IcebergInsert::FinalizeDistributedWrite(ClientContext &context,
 		auto &transaction = IcebergTransaction::Get(context, iceberg_table->catalog);
 		ApplyTableUpdate(iceberg_table->table_info, transaction, [&](IcebergTableInformation &table_info) {
 			auto &transaction_data = table_info.GetOrCreateTransactionData(transaction);
+			if (distributed_write_plan.operator_name != "ctas") {
+				AddDistributedInsertCommitRequirements(transaction_data);
+			}
 			transaction_data.RetainAddedSnapshotFilesOnRollback();
 			IcebergManifestDeletes empty_deletes;
 			transaction_data.AddSnapshot(IcebergSnapshotOperationType::APPEND, std::move(written_files),

@@ -154,6 +154,8 @@ public:
 	int64_t GetDistributedScanSnapshotId() const;
 	string GetDistributedScanSplitPayload(idx_t file_id) const;
 	vector<int32_t> GetDistributedEqualityDeleteFieldIds() const;
+	unique_ptr<IcebergMultiFileList> PushdownDistributedScanFilters(const vector<ColumnIndex> &column_ids,
+	                                                                optional_ptr<const TableFilterSet> filters) const;
 #endif
 
 public:
@@ -190,6 +192,9 @@ protected:
 
 private:
 	IcebergMultiFileList(shared_ptr<IcebergMultiFileListSharedState> shared_state);
+#ifdef ICEBERG_VANE_DISTRIBUTED
+	void PruneDistributedScanPlan();
+#endif
 	bool TryGetNextBatch(lock_guard<mutex> &guard) const;
 	void FinishScanTasks(lock_guard<mutex> &guard) const;
 	void InitializeSharedState(lock_guard<mutex> &guard) const;

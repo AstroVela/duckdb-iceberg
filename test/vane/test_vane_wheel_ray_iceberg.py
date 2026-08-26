@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -22,6 +23,10 @@ PARTITION_NAME = "vane_wheel_ray_partitioned"
 SCHEMA_EVOLUTION_NAME = "vane_wheel_ray_schema_evolution"
 CONFLICT_NAME = "vane_wheel_ray_conflict"
 V3_CTAS_NAME = "vane_wheel_ray_v3_ctas"
+V3_COMPAT_NAME = "vane_wheel_ray_v3_compat"
+V3_SNAPSHOT_CONFLICT_NAME = "vane_wheel_ray_v3_snapshot_conflict"
+V3_SCHEMA_CONFLICT_NAME = "vane_wheel_ray_v3_schema_conflict"
+V3_SPEC_CONFLICT_NAME = "vane_wheel_ray_v3_spec_conflict"
 FAILED_CTAS_NAME = "vane_wheel_ray_failed_ctas"
 SOURCE_TABLE = f"{CATALOG_NAME}.default.{SOURCE_NAME}"
 TARGET_TABLE = f"{CATALOG_NAME}.default.{TARGET_NAME}"
@@ -30,6 +35,10 @@ PARTITION_TABLE = f"{CATALOG_NAME}.default.{PARTITION_NAME}"
 SCHEMA_EVOLUTION_TABLE = f"{CATALOG_NAME}.default.{SCHEMA_EVOLUTION_NAME}"
 CONFLICT_TABLE = f"{CATALOG_NAME}.default.{CONFLICT_NAME}"
 V3_CTAS_TABLE = f"{CATALOG_NAME}.default.{V3_CTAS_NAME}"
+V3_COMPAT_TABLE = f"{CATALOG_NAME}.default.{V3_COMPAT_NAME}"
+V3_SNAPSHOT_CONFLICT_TABLE = f"{CATALOG_NAME}.default.{V3_SNAPSHOT_CONFLICT_NAME}"
+V3_SCHEMA_CONFLICT_TABLE = f"{CATALOG_NAME}.default.{V3_SCHEMA_CONFLICT_NAME}"
+V3_SPEC_CONFLICT_TABLE = f"{CATALOG_NAME}.default.{V3_SPEC_CONFLICT_NAME}"
 FAILED_CTAS_TABLE = f"{CATALOG_NAME}.default.{FAILED_CTAS_NAME}"
 TABLES = (
     TARGET_TABLE,
@@ -39,6 +48,10 @@ TABLES = (
     SCHEMA_EVOLUTION_TABLE,
     CONFLICT_TABLE,
     V3_CTAS_TABLE,
+    V3_COMPAT_TABLE,
+    V3_SNAPSHOT_CONFLICT_TABLE,
+    V3_SCHEMA_CONFLICT_TABLE,
+    V3_SPEC_CONFLICT_TABLE,
     FAILED_CTAS_TABLE,
 )
 DATA_ROOT = "s3://warehouse/vane-wheel-ray-integration"
@@ -47,6 +60,9 @@ SOURCE_PARTITIONS = 4
 ROWS_PER_PARTITION = 256
 SOURCE_ROW_COUNT = SOURCE_PARTITIONS * ROWS_PER_PARTITION
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+CONFLICT_BARRIER_ID = f"{os.getpid()}-{uuid.uuid4().hex}"
+CONFLICT_STARTED_PATH = Path("/tmp") / f"vane-ray-iceberg-conflict-{CONFLICT_BARRIER_ID}.started"
+CONFLICT_RELEASE_PATH = Path("/tmp") / f"vane-ray-iceberg-conflict-{CONFLICT_BARRIER_ID}.release"
 
 
 def require_equal(actual: object, expected: object, description: str) -> None:
@@ -126,6 +142,26 @@ def configure_worker_session_environment() -> None:
             "AWS_REGION": "us-east-1",
         }
     )
+
+
+def open_catalog_connection(vane: object) -> object:
+    connection = vane.connect(
+        ":memory:",
+        config={
+            "autoinstall_known_extensions": "false",
+            "autoload_known_extensions": "false",
+        },
+    )
+    verify_extension_is_wheel_linked(connection)
+    configure_coordinator_s3(connection)
+    connection.execute("SET unsafe_enable_version_guessing = true")
+    connection.execute("SET TimeZone = 'UTC'")
+    connection.execute(
+        f"ATTACH '' AS {CATALOG_NAME} "
+        "(TYPE ICEBERG, CLIENT_ID 'admin', CLIENT_SECRET 'password', "
+        f"ENDPOINT '{CATALOG_ENDPOINT}', stage_create_tables true)"
+    )
+    return connection
 
 
 def create_two_worker_cluster(ray: object) -> object:
@@ -293,6 +329,77 @@ class AnnotateWorkerNode:
                 "worker_node_id": [node_id] * table.num_rows,
             }
         )
+
+
+class WaitForCoordinatorConflict:
+    """Hold worker output until a second catalog connection changes the target."""
+
+    def __call__(self, table: object) -> object:
+        CONFLICT_STARTED_PATH.touch()
+        deadline = time.monotonic() + 90
+        while not CONFLICT_RELEASE_PATH.exists():
+            if time.monotonic() >= deadline:
+                raise RuntimeError("timed out waiting for the coordinator conflict mutation")
+            time.sleep(0.05)
+        return table
+
+
+def require_concurrent_write_conflict(
+    harness: RayIcebergHarness,
+    relation: object,
+    target_table: str,
+    description: str,
+    mutate_catalog: Callable[[], None],
+    expected_message: str,
+) -> None:
+    CONFLICT_STARTED_PATH.unlink(missing_ok=True)
+    CONFLICT_RELEASE_PATH.unlink(missing_ok=True)
+    errors: list[BaseException] = []
+    previous_count = harness.write_dispatch_count
+
+    def execute_write() -> None:
+        try:
+            relation.insert_into(target_table)
+        except BaseException as error:
+            errors.append(error)
+
+    write_thread = threading.Thread(target=execute_write, name=f"vane-iceberg-{description}", daemon=True)
+    write_thread.start()
+    coordination_error: BaseException | None = None
+    try:
+        # The marker is emitted by a Ray worker after physical planning and
+        # provider validation, so the catalog mutation makes that exact target
+        # baseline stale before its coordinator transaction commits.
+        deadline = time.monotonic() + 90
+        while not CONFLICT_STARTED_PATH.exists():
+            if not write_thread.is_alive():
+                if errors:
+                    raise AssertionError(
+                        f"{description}: write failed before worker execution: {errors[0]!r}"
+                    ) from errors[0]
+                raise AssertionError(f"{description}: write stopped before worker execution")
+            if time.monotonic() >= deadline:
+                raise AssertionError(f"{description}: timed out waiting for worker execution")
+            time.sleep(0.05)
+        mutate_catalog()
+    except BaseException as error:
+        coordination_error = error
+    finally:
+        CONFLICT_RELEASE_PATH.touch()
+
+    write_thread.join(timeout=120)
+    CONFLICT_STARTED_PATH.unlink(missing_ok=True)
+    CONFLICT_RELEASE_PATH.unlink(missing_ok=True)
+    if write_thread.is_alive():
+        raise AssertionError(f"{description}: distributed write did not stop after conflict injection")
+    if coordination_error is not None:
+        raise coordination_error
+    require_equal(harness.write_dispatch_count, previous_count + 1, f"{description} Ray dispatch count")
+    require_equal(len(errors), 1, f"{description} failure count")
+    if expected_message not in str(errors[0]):
+        raise AssertionError(
+            f"{description}: expected error containing {expected_message!r}, got {errors[0]!r}"
+        ) from errors[0]
 
 
 def seed_source_table_with_local_fast(harness: RayIcebergHarness) -> None:
@@ -625,6 +732,217 @@ def exercise_versioned_ctas(harness: RayIcebergHarness) -> None:
     )
 
 
+def exercise_v3_reads_and_append(harness: RayIcebergHarness) -> None:
+    connection = harness.connection
+    timestamp_base = 1704067200000000000
+    append_count = 16
+    setup_write_count = harness.write_dispatch_count
+
+    connection.execute(
+        f"CREATE TABLE {V3_COMPAT_TABLE} ("
+        "id INTEGER, category VARCHAR, event_time TIMESTAMP_NS, payload VARIANT"
+        ") PARTITIONED BY (category) "
+        f"WITH ('format-version' = '3', 'write.data.path' = '{DATA_ROOT}/v3-compat')"
+    )
+    connection.execute(
+        f"INSERT INTO {V3_COMPAT_TABLE} "
+        "SELECT i::INTEGER, "
+        "CASE i % 4 WHEN 0 THEN 'A' WHEN 1 THEN 'B' WHEN 2 THEN 'C' ELSE 'D' END::VARCHAR, "
+        f"make_timestamp_ns({timestamp_base} + i), "
+        "{'origin': 'seed', 'source_id': i}::VARIANT "
+        "FROM range(8) AS seed(i)"
+    )
+    connection.execute(f"DELETE FROM {V3_COMPAT_TABLE} WHERE id IN (1, 6)")
+    require_equal(
+        harness.write_dispatch_count,
+        setup_write_count,
+        "coordinator-side v3 seed and deletion-vector setup Ray dispatch count",
+    )
+
+    puffin_paths = connection.execute(
+        f"SELECT DISTINCT file_path FROM iceberg_metadata({V3_COMPAT_TABLE}) "
+        "WHERE content = 'POSITION_DELETES' ORDER BY file_path"
+    ).fetchall()
+    require_true(bool(puffin_paths), "native Iceberg v3 setup did not create a deletion vector")
+    require_true(
+        all(str(row[0]).endswith(".puffin") for row in puffin_paths),
+        f"Iceberg v3 deletion vectors were not Puffin files: {puffin_paths!r}",
+    )
+    puffin_path = sql_string(puffin_paths[0][0])
+    puffin_container = connection.execute(
+        "WITH file AS ("
+        f"  SELECT content AS bytes, size FROM read_blob({puffin_path})"
+        "), footer_location AS ("
+        "  SELECT bytes, size, "
+        "    CAST((position('7b22626c6f627322' IN lower(hex(bytes))) + 1) / 2 AS BIGINT) AS json_start "
+        "  FROM file"
+        "), footer AS ("
+        "  SELECT bytes, size, json_start, "
+        "    json_extract_string(decode(bytes[json_start : size - 12]), '$.blobs[0].type') AS blob_type, "
+        "    json_extract(decode(bytes[json_start : size - 12]), '$.blobs[0].offset')::BIGINT AS blob_offset "
+        "  FROM footer_location"
+        ") "
+        "SELECT bytes[1:4]::VARCHAR, bytes[json_start - 4:json_start - 1]::VARCHAR, "
+        "bytes[size - 3:size]::VARCHAR, blob_type, blob_offset, "
+        "upper(hex(bytes[blob_offset + 5:blob_offset + 8])) "
+        "FROM footer"
+    ).fetchone()
+    require_equal(
+        puffin_container,
+        ("PFA1", "PFA1", "PFA1", "deletion-vector-v1", 4, "D1D33964"),
+        "Iceberg v3 deletion-vector Puffin container",
+    )
+
+    visible_rows = harness.require_query(
+        f"SELECT id, _row_id, _last_updated_sequence_number, epoch_ns(event_time), "
+        f"payload.origin::VARCHAR, payload.source_id::INTEGER FROM {V3_COMPAT_TABLE} ORDER BY id",
+        "distributed Iceberg v3 Puffin deletion-vector read",
+    )
+    require_equal([row[0] for row in visible_rows], [0, 2, 3, 4, 5, 7], "v3 visible row IDs after deletes")
+    require_equal(len({row[1] for row in visible_rows}), len(visible_rows), "v3 seed row-id uniqueness")
+    require_true(
+        all(0 <= int(row[1]) < 8 and row[2] == 1 for row in visible_rows),
+        f"v3 seed row lineage was not preserved through deletion vectors: {visible_rows!r}",
+    )
+    require_true(
+        all(row[3] == timestamp_base + row[0] for row in visible_rows),
+        f"v3 TIMESTAMP_NS values lost nanosecond precision: {visible_rows!r}",
+    )
+    require_true(
+        all(row[4] == "seed" and row[5] == row[0] for row in visible_rows),
+        f"v3 VARIANT values were not reconstructed correctly: {visible_rows!r}",
+    )
+
+    full_split_count = sum(harness.scan_split_counts(f"SELECT id FROM {V3_COMPAT_TABLE}").values())
+    filtered_query = f"SELECT id FROM {V3_COMPAT_TABLE} WHERE category = 'A' ORDER BY id"
+    filtered_split_count = sum(harness.scan_split_counts(filtered_query).values())
+    require_true(full_split_count >= 4, "partitioned v3 table did not expose independent data-file splits")
+    require_true(
+        1 <= filtered_split_count < full_split_count,
+        "v3 identity-partition predicate did not prune Ray scan splits: "
+        f"full={full_split_count}, filtered={filtered_split_count}",
+    )
+    harness.require_query(filtered_query, "v3 projection and identity-partition pruning", [(0,), (4,)])
+
+    append_source = connection.sql(
+        "SELECT (1000 + id)::INTEGER AS id, "
+        "CASE WHEN id < 8 THEN 'RAY_A' ELSE 'RAY_B' END::VARCHAR AS category, "
+        f"make_timestamp_ns({timestamp_base} + 100 + id) AS event_time, "
+        "{'origin': 'ray', 'source_id': id}::VARIANT AS payload "
+        f"FROM {SOURCE_TABLE} WHERE id < {append_count}"
+    )
+    harness.require_write(
+        "distributed INSERT into an existing Iceberg v3 table",
+        lambda: append_source.insert_into(V3_COMPAT_TABLE),
+    )
+    appended_lineage = harness.require_query(
+        f"SELECT _row_id, _last_updated_sequence_number FROM {V3_COMPAT_TABLE} " "WHERE id >= 1000 ORDER BY _row_id",
+        "distributed Iceberg v3 append row lineage",
+        [(8 + row_id, 3) for row_id in range(append_count)],
+    )
+    require_equal(len(appended_lineage), append_count, "v3 append lineage row count")
+    harness.require_query(
+        f"SELECT id, epoch_ns(event_time), payload.origin::VARCHAR, payload.source_id::INTEGER "
+        f"FROM {V3_COMPAT_TABLE} WHERE id IN (1000, {1000 + append_count - 1}) ORDER BY id",
+        "distributed Iceberg v3 appended logical types",
+        [
+            (1000, timestamp_base + 100, "ray", 0),
+            (1000 + append_count - 1, timestamp_base + 100 + append_count - 1, "ray", append_count - 1),
+        ],
+    )
+    harness.require_query(
+        f"SELECT count(*)::BIGINT FROM {V3_COMPAT_TABLE} WHERE id IN (1, 6)",
+        "v3 deletion vectors remain effective after distributed append",
+        [(0,)],
+    )
+    snapshots = connection.execute(
+        f"SELECT sequence_number, operation FROM iceberg_snapshots({V3_COMPAT_TABLE}) ORDER BY sequence_number"
+    ).fetchall()
+    require_equal(
+        snapshots,
+        [(1, "append"), (2, "delete"), (3, "append")],
+        "Iceberg v3 seed, deletion-vector, and distributed append snapshots",
+    )
+
+
+def exercise_v3_conflicts(harness: RayIcebergHarness) -> None:
+    connection = harness.connection
+    vane = harness.vane
+    conflict_tables = (
+        (V3_SNAPSHOT_CONFLICT_TABLE, "v3-snapshot-conflict"),
+        (V3_SCHEMA_CONFLICT_TABLE, "v3-schema-conflict"),
+        (V3_SPEC_CONFLICT_TABLE, "v3-spec-conflict"),
+    )
+    for table, path_name in conflict_tables:
+        connection.execute(
+            f"CREATE TABLE {table} (id INTEGER, payload VARCHAR) "
+            f"WITH ('format-version' = '3', 'write.data.path' = '{DATA_ROOT}/{path_name}')"
+        )
+        connection.execute(f"INSERT INTO {table} VALUES (1, 'seed')")
+
+    conflict_connection = open_catalog_connection(vane)
+    try:
+
+        def blocked_source(offset: int) -> object:
+            return connection.sql(
+                f"SELECT ({offset} + id)::INTEGER AS id, payload FROM {SOURCE_TABLE} WHERE id < 128"
+            ).map_batches(
+                WaitForCoordinatorConflict,
+                schema={"id": vane.sqltype("INTEGER"), "payload": vane.sqltype("VARCHAR")},
+                batch_size=64,
+                cpus=1.0,
+                execution_backend="ray_actor",
+                actor_number=WORKER_COUNT,
+                target_max_batch_bytes=4096,
+            )
+
+        require_concurrent_write_conflict(
+            harness,
+            blocked_source(10000),
+            V3_SNAPSHOT_CONFLICT_TABLE,
+            "stale v3 INSERT target snapshot",
+            lambda: conflict_connection.execute(f"INSERT INTO {V3_SNAPSHOT_CONFLICT_TABLE} VALUES (2, 'concurrent')"),
+            "Failed to commit Iceberg transaction",
+        )
+        harness.require_query(
+            f"SELECT id, payload FROM {V3_SNAPSHOT_CONFLICT_TABLE} ORDER BY id",
+            "stale v3 snapshot write was not committed",
+            [(1, "seed"), (2, "concurrent")],
+        )
+
+        require_concurrent_write_conflict(
+            harness,
+            blocked_source(20000),
+            V3_SCHEMA_CONFLICT_TABLE,
+            "stale v3 INSERT target schema",
+            lambda: conflict_connection.execute(
+                f"ALTER TABLE {V3_SCHEMA_CONFLICT_TABLE} ADD COLUMN concurrent_column INTEGER"
+            ),
+            "Failed to commit Iceberg transaction",
+        )
+        harness.require_query(
+            f"SELECT id, payload FROM {V3_SCHEMA_CONFLICT_TABLE} ORDER BY id",
+            "stale v3 schema write was not committed",
+            [(1, "seed")],
+        )
+
+        require_concurrent_write_conflict(
+            harness,
+            blocked_source(30000),
+            V3_SPEC_CONFLICT_TABLE,
+            "stale v3 INSERT target partition spec",
+            lambda: conflict_connection.execute(f"ALTER TABLE {V3_SPEC_CONFLICT_TABLE} SET PARTITIONED BY (payload)"),
+            "Failed to commit Iceberg transaction",
+        )
+        harness.require_query(
+            f"SELECT id, payload FROM {V3_SPEC_CONFLICT_TABLE} ORDER BY id",
+            "stale v3 partition-spec write was not committed",
+            [(1, "seed")],
+        )
+    finally:
+        conflict_connection.close()
+
+
 def exercise_ctas_failure_cleanup(harness: RayIcebergHarness) -> None:
     connection = harness.connection
     failing_source = connection.sql(
@@ -944,6 +1262,8 @@ def main() -> None:
             lambda: exercise_source_target_and_topology(harness, ray, expected_nodes),
         )
         run_scenario("version-aware distributed CTAS", lambda: exercise_versioned_ctas(harness))
+        run_scenario("v3 distributed reads and append", lambda: exercise_v3_reads_and_append(harness))
+        run_scenario("v3 fail-closed write conflicts", lambda: exercise_v3_conflicts(harness))
         run_scenario("distributed CTAS failure cleanup", lambda: exercise_ctas_failure_cleanup(harness))
         run_scenario("source positional deletes", lambda: exercise_source_positional_deletes(harness))
         run_scenario("empty and zero-match operations", lambda: exercise_empty_and_zero_match(harness))
@@ -953,8 +1273,8 @@ def main() -> None:
             "conflicts and fail-closed writes",
             lambda: exercise_conflicts_and_fail_closed_writes(harness),
         )
-        require_true(harness.read_dispatch_count >= 15, "comprehensive suite did not exercise enough Ray reads")
-        require_true(harness.write_dispatch_count >= 16, "comprehensive suite did not exercise enough Ray writes")
+        require_true(harness.read_dispatch_count >= 23, "comprehensive suite did not exercise enough Ray reads")
+        require_true(harness.write_dispatch_count >= 20, "comprehensive suite did not exercise enough Ray writes")
 
         drop_test_tables(connection)
     finally:
