@@ -148,6 +148,10 @@ endif()
 
 # Roaring is installed via vcpkg and used here
 find_package(roaring CONFIG REQUIRED)
+if(ICEBERG_VANE_DISTRIBUTED)
+    target_link_libraries(iceberg_distributed_write_objects
+                          PRIVATE roaring::roaring-headers roaring::roaring-headers-cpp)
+endif()
 
 # Reset the TARGET_NAME, the AWS find_package build could bleed into our build -
 # overriding `TARGET_NAME`

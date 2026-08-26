@@ -28,9 +28,13 @@ enum class IcebergDistributedRowDeltaKind : uint8_t { DELETE = 0, UPDATE = 1 };
 struct IcebergDistributedDeleteFileResult {
 	string data_file_path;
 	string delete_file_path;
+	bool is_deletion_vector = false;
+	idx_t new_delete_count = 0;
 	idx_t delete_count = 0;
 	idx_t file_size_bytes = 0;
 	idx_t footer_size_bytes = 0;
+	idx_t content_offset = 0;
+	idx_t content_size_in_bytes = 0;
 	idx_t pos_min_value = 0;
 	idx_t pos_max_value = 0;
 };
@@ -46,7 +50,8 @@ string CreateIcebergDistributedArtifactNamespace();
 PhysicalOperator &PlanIcebergDistributedRowDeltaRepartition(PhysicalPlanGenerator &planner, PhysicalOperator &input,
                                                             idx_t file_path_index);
 string BuildIcebergDistributedDeleteBind(ClientContext &context, const IcebergTableEntry &table,
-                                         const vector<idx_t> &row_id_indexes, const string &artifact_namespace);
+                                         const IcebergMultiFileList &file_list, const vector<idx_t> &row_id_indexes,
+                                         const string &artifact_namespace);
 string BuildIcebergDistributedUpdateBind(ClientContext &context, const IcebergTableEntry &table,
                                          const PhysicalCopyToFile &copy, idx_t copy_column_count, idx_t file_path_index,
                                          idx_t row_position_index, const string &artifact_namespace);
@@ -57,7 +62,7 @@ IcebergDistributedRowDeltaResult
 DecodeIcebergDistributedRowDeltaResults(ClientContext &context, const string &data_path,
                                         const string &artifact_namespace, const DistributedExtensionWriteInfo &info,
                                         const vector<DistributedWriteTaskResult> &results,
-                                        IcebergDistributedRowDeltaKind expected_kind);
+                                        IcebergDistributedRowDeltaKind expected_kind, int32_t expected_iceberg_version);
 void ValidateIcebergDistributedDataFileArtifacts(ClientContext &context, const string &data_path,
                                                  const vector<distributed::DistributedCopyFileInfo> &files);
 void ValidateIcebergDistributedTargetPartitionSpec(const IcebergTableMetadata &metadata, const string &operation_name);

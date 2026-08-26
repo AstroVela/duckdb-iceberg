@@ -2,6 +2,9 @@
 
 #include "duckdb/storage/caching_file_system.hpp"
 #include "duckdb/common/bswap.hpp"
+#ifdef ICEBERG_VANE_DISTRIBUTED
+#include "duckdb/common/limits.hpp"
+#endif
 
 #include "planning/iceberg_multi_file_list.hpp"
 #include "catalog/rest/catalog_entry/table/iceberg_table_information.hpp"
@@ -369,6 +372,48 @@ vector<data_t> IcebergDeletionVectorData::ToBlob(const unordered_map<int32_t, ro
 	Store<uint32_t>(BSwap(checksum), blob_ptr);
 	return blob_output;
 }
+
+#ifdef ICEBERG_VANE_DISTRIBUTED
+vector<data_t> IcebergDeletionVectorData::ToBlob(const map<int32_t, roaring::Roaring> &bitmaps) {
+	//! https://iceberg.apache.org/puffin-spec/#deletion-vector-v1-blob-type
+
+	idx_t total_size = sizeof(uint32_t) + sizeof(uint32_t) + sizeof(uint64_t) + sizeof(uint32_t);
+	for (const auto &entry : bitmaps) {
+		total_size += sizeof(int32_t);
+		total_size += entry.second.getSizeInBytes(true);
+	}
+	if (total_size - 2 * sizeof(uint32_t) > NumericLimits<uint32_t>::Maximum()) {
+		throw InvalidInputException("Distributed Iceberg deletion-vector blob exceeds the 32-bit Puffin length limit");
+	}
+
+	vector<data_t> blob_output(total_size);
+	auto blob_ptr = blob_output.data();
+	auto vector_size = BSwap(NumericCast<uint32_t>(total_size - 2 * sizeof(uint32_t)));
+	Store<uint32_t>(vector_size, blob_ptr);
+	blob_ptr += sizeof(uint32_t);
+
+	auto checksummed_data_start = blob_ptr;
+	constexpr uint8_t DELETION_VECTOR_MAGIC[4] = {0xD1, 0xD3, 0x39, 0x64};
+	memcpy(blob_ptr, DELETION_VECTOR_MAGIC, sizeof(DELETION_VECTOR_MAGIC));
+	blob_ptr += sizeof(DELETION_VECTOR_MAGIC);
+
+	Store<uint64_t>(bitmaps.size(), blob_ptr);
+	blob_ptr += sizeof(uint64_t);
+	for (const auto &entry : bitmaps) {
+		if (entry.first < 0) {
+			throw InternalException("Distributed Iceberg deletion-vector bitmap key must be non-negative");
+		}
+		Store<int32_t>(entry.first, blob_ptr);
+		blob_ptr += sizeof(int32_t);
+		blob_ptr += entry.second.write(reinterpret_cast<char *>(blob_ptr), true);
+	}
+
+	CRC32 crc;
+	crc.Update(checksummed_data_start, blob_ptr - checksummed_data_start);
+	Store<uint32_t>(BSwap(crc.GetValue()), blob_ptr);
+	return blob_output;
+}
+#endif
 
 vector<data_t> IcebergDeletionVectorData::ToPuffinFile(const vector<data_t> &blob, const string &referenced_data_file,
                                                        idx_t cardinality) {

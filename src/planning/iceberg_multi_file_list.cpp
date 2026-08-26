@@ -1621,6 +1621,20 @@ string IcebergMultiFileList::GetDistributedScanSplitPayload(idx_t file_id) const
 	return distributed_scan->GetPlannedSplitPayload(file_id);
 }
 
+string IcebergMultiFileList::GetDistributedWorkerScanSplitPayload(idx_t file_id) const {
+	if (!distributed_scan) {
+		throw InternalException("Distributed Iceberg scan has no planned split set");
+	}
+	return distributed_scan->GetWorkerSplitPayload(file_id);
+}
+
+const string &IcebergMultiFileList::GetDistributedExistingDeletionVectorPath(const string &file_path) const {
+	if (!distributed_scan || !distributed_scan->HasPlannedSplits()) {
+		throw InternalException("Distributed Iceberg deletion-vector lookup requires a planned scan");
+	}
+	return distributed_scan->GetExistingDeletionVectorPath(file_path);
+}
+
 vector<int32_t> IcebergMultiFileList::GetDistributedEqualityDeleteFieldIds() const {
 	if (!distributed_scan) {
 		return {};

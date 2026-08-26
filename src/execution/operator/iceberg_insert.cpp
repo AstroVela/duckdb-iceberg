@@ -343,9 +343,9 @@ idx_t IcebergInsert::FinalizeDistributedWrite(ClientContext &context,
 	ValidateDistributedWriteShape();
 	if (distributed_write_plan.operator_name == "update") {
 		auto write_info = distributed::ResolveDistributedExtensionWriteInfo(context, distributed_write_plan);
-		auto decoded =
-		    DecodeIcebergDistributedRowDeltaResults(context, distributed_data_path, distributed_artifact_namespace,
-		                                            write_info, results, IcebergDistributedRowDeltaKind::UPDATE);
+		auto decoded = DecodeIcebergDistributedRowDeltaResults(
+		    context, distributed_data_path, distributed_artifact_namespace, write_info, results,
+		    IcebergDistributedRowDeltaKind::UPDATE, distributed_iceberg_version);
 		ValidateIcebergDistributedDataFileArtifacts(context, distributed_data_path, decoded.data_files);
 		CleanupIcebergDistributedRowDelta(context, distributed_data_path, distributed_artifact_namespace,
 		                                  &decoded.selected_artifact_paths);

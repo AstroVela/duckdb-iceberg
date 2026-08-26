@@ -59,6 +59,7 @@ public:
 	bool PlannedScanHasSnapshot() const;
 	int64_t GetPlannedSnapshotId() const;
 	string GetPlannedSplitPayload(idx_t file_id) const;
+	string GetWorkerSplitPayload(idx_t file_id) const;
 	vector<int32_t> GetEqualityDeleteFieldIds() const;
 	vector<OpenFileInfo> GetAllFiles() const;
 	FileExpandResult GetExpandResult() const;
@@ -70,6 +71,7 @@ public:
 	vector<IcebergPartitionInfo> GetPartitionInfo(const string &file_path) const;
 	unique_ptr<DeleteFilter> GetPositionalDeletes(const string &file_path) const;
 	shared_ptr<IcebergDeleteData> GetPositionalDeleteData(const string &file_path) const;
+	const string &GetExistingDeletionVectorPath(const string &file_path) const;
 	vector<reference<const IcebergEqualityDeleteRow>> GetEqualityDeletes(const BoundIcebergManifestEntry &entry) const;
 
 private:
@@ -81,7 +83,8 @@ private:
 	shared_ptr<IcebergDistributedScanState> CreatePlannedSplitSubset(vector<string> payloads) const;
 	void LoadSplitPayloads(vector<string> payloads, const string &expected_scan_split_set_id,
 	                       optional_ptr<const unordered_map<int32_t, idx_t>> field_id_to_output_index,
-	                       optional_ptr<const unordered_map<int32_t, LogicalType>> field_id_to_type);
+	                       optional_ptr<const unordered_map<int32_t, LogicalType>> field_id_to_type,
+	                       bool allow_coordinator_only_state);
 	void RequireWorkerSplitsAssigned() const;
 	vector<unique_ptr<FileState>> files;
 	shared_ptr<IcebergScanInfo> planned_scan_info;

@@ -1,6 +1,9 @@
 #pragma once
 
 #include "duckdb/common/multi_file/multi_file_data.hpp"
+#ifdef ICEBERG_VANE_DISTRIBUTED
+#include "duckdb/common/map.hpp"
+#endif
 #include "core/deletes/iceberg_delete_data.hpp"
 #include <roaring/roaring.hh>
 
@@ -18,6 +21,11 @@ public:
 	static shared_ptr<IcebergDeletionVectorData> FromBlob(const BoundIcebergManifestEntry &entry, data_ptr_t blob_start,
 	                                                      idx_t blob_length);
 	static vector<data_t> ToBlob(const unordered_map<int32_t, roaring::Roaring> &bitmaps);
+#ifdef ICEBERG_VANE_DISTRIBUTED
+	//! The distributed writer uses an ordered map because the Puffin deletion-vector
+	//! encoding requires bitmap keys to be serialized in unsigned ascending order.
+	static vector<data_t> ToBlob(const map<int32_t, roaring::Roaring> &bitmaps);
+#endif
 	//! Wrap a `deletion-vector-v1` blob (from ToBlob) in a spec-compliant Puffin file
 	//! container: leading magic + blob + footer. The blob is placed at offset 4 (right
 	//! after the leading magic), so the manifest entry's content_offset must be set to 4.
