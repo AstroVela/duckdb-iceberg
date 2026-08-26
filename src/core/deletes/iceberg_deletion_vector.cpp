@@ -466,6 +466,11 @@ map<int32_t, roaring::Roaring> IcebergDeletionVectorData::DecodeBlob(const strin
 			if (bitmap.isEmpty() || bitmap.getSizeInBytes(true) != bitmap_size) {
 				throw SerializationException("Distributed Iceberg deletion-vector blob has a non-canonical bitmap");
 			}
+			vector<data_t> canonical_bitmap(bitmap_size);
+			if (bitmap.write(reinterpret_cast<char *>(canonical_bitmap.data()), true) != bitmap_size ||
+			    memcmp(cursor, canonical_bitmap.data(), bitmap_size) != 0) {
+				throw SerializationException("Distributed Iceberg deletion-vector blob has a non-canonical bitmap");
+			}
 			result.emplace(key, std::move(bitmap));
 		} catch (const SerializationException &) {
 			throw;

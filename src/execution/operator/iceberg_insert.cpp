@@ -155,9 +155,17 @@ void IcebergInsert::ConfigureDistributedUpdate(ClientContext &context, PhysicalC
 	    worker_input.types[copy_column_count + 1] != LogicalType::BIGINT) {
 		throw InternalException("Iceberg distributed UPDATE worker projection has invalid row-identifier types");
 	}
-	distributed_write_plan.worker_bind_data =
-	    BuildIcebergDistributedUpdateBind(context, table->Cast<IcebergTableEntry>(), copy, copy_column_count,
-	                                      copy_column_count, copy_column_count + 1, distributed_artifact_namespace);
+	auto &delete_sink = delete_op.Cast<IcebergDelete>();
+	auto &metadata = table->Cast<IcebergTableEntry>().table_info.table_metadata;
+	// A Vane-enabled build still executes local-fast and ordinary direct SQL through
+	// the native child. Only a logical plan transported to the Ray coordinator has
+	// the planned scan state required to freeze v3 deletion-vector inputs.
+	if (delete_sink.multi_file_list &&
+	    (metadata.iceberg_version < 3 || delete_sink.multi_file_list->HasDistributedScanPlan())) {
+		distributed_write_plan.worker_bind_data = BuildIcebergDistributedUpdateBind(
+		    context, table->Cast<IcebergTableEntry>(), *delete_sink.multi_file_list, copy, copy_column_count,
+		    copy_column_count, copy_column_count + 1, distributed_artifact_namespace);
+	}
 }
 
 void IcebergInsert::ValidateDistributedWriteShape() const {
@@ -168,8 +176,8 @@ void IcebergInsert::ValidateDistributedWriteShape() const {
 		    children.size() != 1) {
 			throw InvalidInputException("Distributed Iceberg UPDATE worker plan was not initialized");
 		}
-		if (distributed_iceberg_version != 2) {
-			throw NotImplementedException("Distributed Iceberg UPDATE currently supports format-version 2 tables only");
+		if (distributed_iceberg_version != 2 && distributed_iceberg_version != 3) {
+			throw NotImplementedException("Distributed Iceberg UPDATE supports format-version 2 and 3 tables only");
 		}
 		return;
 	}
@@ -327,17 +335,6 @@ static void AddDistributedDataFiles(ClientContext &context, IcebergInsertGlobalS
 	}
 }
 
-static idx_t FindDistributedDataFile(const IcebergMultiFileList &file_list, const string &path) {
-	file_list.GetTotalFileCount();
-	auto files = file_list.GetAllFiles();
-	for (idx_t index = 0; index < files.size(); index++) {
-		if (files[index].path == path) {
-			return index;
-		}
-	}
-	throw InvalidInputException("Distributed Iceberg row-delta referenced unplanned data file '%s'", path);
-}
-
 idx_t IcebergInsert::FinalizeDistributedWrite(ClientContext &context,
                                               const vector<DistributedWriteTaskResult> &results) const {
 	ValidateDistributedWriteShape();
@@ -358,31 +355,8 @@ idx_t IcebergInsert::FinalizeDistributedWrite(ClientContext &context,
 		IcebergInsertGlobalState insert_state(context);
 		AddDistributedDataFiles(context, insert_state, iceberg_table, decoded.data_files);
 		IcebergDeleteGlobalState delete_state;
-		for (auto &file : decoded.delete_files) {
-			auto file_index = FindDistributedDataFile(*delete_op.multi_file_list, file.data_file_path);
-			auto source_entry = delete_op.multi_file_list->GetManifestEntry(file_index);
-			auto source_record_count = NumericCast<idx_t>(source_entry.entry.data_file.record_count);
-			if (source_record_count == 0 || file.pos_max_value >= source_record_count) {
-				throw InvalidInputException(
-				    "Distributed Iceberg UPDATE returned a row position outside data file '%s' (%llu records)",
-				    file.data_file_path, static_cast<unsigned long long>(source_record_count));
-			}
-			IcebergDeleteFileInfo delete_file;
-			delete_file.data_file_path = file.data_file_path;
-			delete_file.file_name = file.delete_file_path;
-			delete_file.file_format = "parquet";
-			delete_file.footer_size = file.footer_size_bytes;
-			delete_file.delete_count = file.delete_count;
-			delete_file.file_size_bytes = file.file_size_bytes;
-			delete_file.pos_min_value = file.pos_min_value;
-			delete_file.pos_max_value = file.pos_max_value;
-			delete_file.partition_info = delete_op.multi_file_list->GetPartitionInfoForDataFile(file.data_file_path);
-			if (!delete_state.written_files.emplace(file.data_file_path, std::move(delete_file)).second) {
-				throw InvalidInputException(
-				    "Distributed Iceberg UPDATE produced multiple delete files for data file '%s'",
-				    file.data_file_path);
-			}
-		}
+		IcebergDelete::AddDistributedDeleteArtifacts(context, *delete_op.multi_file_list, decoded.delete_files,
+		                                             delete_state, "UPDATE");
 		delete_state.total_deleted_count = decoded.affected_rows;
 		auto written_files = GetInsertManifestEntries(insert_state);
 		auto delete_files = IcebergDelete::GenerateDeleteManifestEntries(delete_state);
@@ -393,9 +367,16 @@ idx_t IcebergInsert::FinalizeDistributedWrite(ClientContext &context,
 			auto &transaction = IcebergTransaction::Get(context, iceberg_table.catalog);
 			ApplyTableUpdate(iceberg_table.table_info, transaction, [&](IcebergTableInformation &table_info) {
 				auto &transaction_data = table_info.GetOrCreateTransactionData(transaction);
+				AddDistributedInsertCommitRequirements(transaction_data);
 				transaction_data.RetainAddedSnapshotFilesOnRollback();
 				transaction_data.AddUpdateSnapshot(std::move(delete_files), std::move(written_files),
 				                                   std::move(delete_state.altered_manifests));
+				if (distributed_iceberg_version >= 3) {
+					for (const auto &entry : delete_state.written_files) {
+						transaction_data.transactional_delete_files[entry.second.data_file_path] =
+						    entry.second.file_name;
+					}
+				}
 			});
 		}
 		return decoded.affected_rows;

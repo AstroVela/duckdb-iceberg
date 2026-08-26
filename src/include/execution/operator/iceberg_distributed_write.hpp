@@ -53,8 +53,9 @@ string BuildIcebergDistributedDeleteBind(ClientContext &context, const IcebergTa
                                          const IcebergMultiFileList &file_list, const vector<idx_t> &row_id_indexes,
                                          const string &artifact_namespace);
 string BuildIcebergDistributedUpdateBind(ClientContext &context, const IcebergTableEntry &table,
-                                         const PhysicalCopyToFile &copy, idx_t copy_column_count, idx_t file_path_index,
-                                         idx_t row_position_index, const string &artifact_namespace);
+                                         const IcebergMultiFileList &file_list, const PhysicalCopyToFile &copy,
+                                         idx_t copy_column_count, idx_t file_path_index, idx_t row_position_index,
+                                         const string &artifact_namespace);
 
 DistributedExtensionWriteCallbacks IcebergDistributedRowDeltaCallbacks();
 

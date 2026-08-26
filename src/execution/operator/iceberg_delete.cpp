@@ -2,8 +2,8 @@
 
 #include "iceberg_logging.hpp"
 #ifdef ICEBERG_VANE_DISTRIBUTED
-#include "duckdb/common/bswap.hpp"
 #include "duckdb/catalog/catalog.hpp"
+#include "duckdb/common/limits.hpp"
 #include "duckdb/execution/distributed/extension_write_task_provider.hpp"
 #include "catalog/rest/api/catalog_utils.hpp"
 #include "catalog/rest/api/table_update.hpp"
@@ -155,7 +155,7 @@ void IcebergDelete::ValidateDistributedWrite(ClientContext &context) const {
 	                                              table_entry.table_info.table_metadata.default_spec_id, "DELETE");
 }
 
-static idx_t FindDistributedDeleteDataFile(const IcebergMultiFileList &file_list, const string &path) {
+static idx_t FindDistributedRowDeltaDataFile(const IcebergMultiFileList &file_list, const string &path) {
 	file_list.GetTotalFileCount();
 	auto files = file_list.GetAllFiles();
 	for (idx_t index = 0; index < files.size(); index++) {
@@ -163,74 +163,12 @@ static idx_t FindDistributedDeleteDataFile(const IcebergMultiFileList &file_list
 			return index;
 		}
 	}
-	throw InvalidInputException("Distributed Iceberg DELETE referenced unplanned data file '%s'", path);
+	throw InvalidInputException("Distributed Iceberg row-delta referenced unplanned data file '%s'", path);
 }
 
 static bool HasPuffinMagic(const_data_ptr_t data) {
 	static constexpr data_t PUFFIN_MAGIC[] = {0x50, 0x46, 0x41, 0x31};
 	return memcmp(data, PUFFIN_MAGIC, sizeof(PUFFIN_MAGIC)) == 0;
-}
-
-static void ValidateDistributedDeletionVectorBlob(const vector<data_t> &blob) {
-	static constexpr data_t DELETION_VECTOR_MAGIC[] = {0xD1, 0xD3, 0x39, 0x64};
-	static constexpr idx_t FIXED_PREFIX_SIZE = sizeof(uint32_t) + sizeof(DELETION_VECTOR_MAGIC) + sizeof(uint64_t);
-	static constexpr idx_t CHECKSUM_SIZE = sizeof(uint32_t);
-	if (blob.size() <= FIXED_PREFIX_SIZE + CHECKSUM_SIZE) {
-		throw InvalidInputException("Distributed Iceberg v3 DELETE returned a truncated deletion-vector blob");
-	}
-
-	auto cursor = blob.data();
-	auto end = blob.data() + blob.size();
-	auto vector_size = BSwap(Load<uint32_t>(cursor));
-	if (NumericCast<idx_t>(vector_size) != blob.size() - sizeof(uint32_t) - CHECKSUM_SIZE) {
-		throw InvalidInputException("Distributed Iceberg v3 DELETE returned an invalid deletion-vector length");
-	}
-	cursor += sizeof(uint32_t);
-	if (memcmp(cursor, DELETION_VECTOR_MAGIC, sizeof(DELETION_VECTOR_MAGIC)) != 0) {
-		throw InvalidInputException("Distributed Iceberg v3 DELETE returned invalid deletion-vector magic");
-	}
-	cursor += sizeof(DELETION_VECTOR_MAGIC);
-
-	auto bitmap_count = Load<uint64_t>(cursor);
-	cursor += sizeof(uint64_t);
-	if (bitmap_count == 0 || bitmap_count > NumericCast<uint64_t>((end - CHECKSUM_SIZE - cursor) / sizeof(int32_t))) {
-		throw InvalidInputException("Distributed Iceberg v3 DELETE returned an invalid deletion-vector bitmap count");
-	}
-
-	int32_t previous_key = -1;
-	for (uint64_t bitmap_index = 0; bitmap_index < bitmap_count; bitmap_index++) {
-		if (end - CHECKSUM_SIZE - cursor <= NumericCast<int64_t>(sizeof(int32_t))) {
-			throw InvalidInputException("Distributed Iceberg v3 DELETE returned a truncated deletion-vector bitmap");
-		}
-		auto key = Load<int32_t>(cursor);
-		cursor += sizeof(int32_t);
-		if (key < 0 || key <= previous_key) {
-			throw InvalidInputException("Distributed Iceberg v3 DELETE returned unordered deletion-vector bitmap keys");
-		}
-		previous_key = key;
-
-		auto available = NumericCast<idx_t>(end - CHECKSUM_SIZE - cursor);
-		roaring::Roaring bitmap;
-		try {
-			bitmap = roaring::Roaring::readSafe(reinterpret_cast<const char *>(cursor), available);
-		} catch (const std::exception &ex) {
-			throw InvalidInputException("Distributed Iceberg v3 DELETE returned an invalid Roaring bitmap: %s",
-			                            ex.what());
-		}
-		auto bitmap_size = bitmap.getSizeInBytes(true);
-		if (bitmap_size == 0 || bitmap_size > available) {
-			throw InvalidInputException("Distributed Iceberg v3 DELETE returned an invalid Roaring bitmap size");
-		}
-		vector<data_t> canonical_bitmap(bitmap_size);
-		if (bitmap.write(reinterpret_cast<char *>(canonical_bitmap.data()), true) != bitmap_size ||
-		    memcmp(cursor, canonical_bitmap.data(), bitmap_size) != 0) {
-			throw InvalidInputException("Distributed Iceberg v3 DELETE returned a non-canonical Roaring bitmap");
-		}
-		cursor += bitmap_size;
-	}
-	if (cursor != end - CHECKSUM_SIZE) {
-		throw InvalidInputException("Distributed Iceberg v3 DELETE returned trailing deletion-vector data");
-	}
 }
 
 static set<idx_t> ValidateDistributedDeletionVectorArtifact(ClientContext &context,
@@ -242,13 +180,14 @@ static set<idx_t> ValidateDistributedDeletionVectorArtifact(ClientContext &conte
 	    file.file_size_bytes <= 2 * PUFFIN_MAGIC_SIZE + FOOTER_TRAILER_SIZE ||
 	    file.content_offset > file.file_size_bytes ||
 	    file.content_size_in_bytes > file.file_size_bytes - file.content_offset) {
-		throw InvalidInputException("Distributed Iceberg v3 DELETE returned invalid Puffin artifact metadata");
+		throw InvalidInputException("Distributed Iceberg v3 row-delta returned invalid Puffin artifact metadata");
 	}
 
 	auto &fs = FileSystem::GetFileSystem(context);
 	auto handle = fs.OpenFile(file.delete_file_path, FileOpenFlags::FILE_FLAGS_READ);
 	if (handle->GetFileSize() != file.file_size_bytes) {
-		throw InvalidInputException("Distributed Iceberg v3 DELETE Puffin artifact size changed during finalization");
+		throw InvalidInputException(
+		    "Distributed Iceberg v3 row-delta Puffin artifact size changed during finalization");
 	}
 
 	data_t leading_magic[PUFFIN_MAGIC_SIZE];
@@ -259,23 +198,23 @@ static set<idx_t> ValidateDistributedDeletionVectorArtifact(ClientContext &conte
 	auto footer_flags = Load<uint32_t>(trailer + sizeof(int32_t));
 	if (!HasPuffinMagic(leading_magic) || !HasPuffinMagic(trailer + sizeof(int32_t) + sizeof(uint32_t)) ||
 	    footer_payload_size <= 0 || footer_flags != 0) {
-		throw InvalidInputException("Distributed Iceberg v3 DELETE returned an invalid Puffin container");
+		throw InvalidInputException("Distributed Iceberg v3 row-delta returned an invalid Puffin container");
 	}
 
 	auto footer_payload_bytes = NumericCast<idx_t>(footer_payload_size);
 	if (footer_payload_bytes > file.file_size_bytes - FOOTER_TRAILER_SIZE - PUFFIN_MAGIC_SIZE) {
-		throw InvalidInputException("Distributed Iceberg v3 DELETE returned an invalid Puffin footer size");
+		throw InvalidInputException("Distributed Iceberg v3 row-delta returned an invalid Puffin footer size");
 	}
 	auto footer_magic_offset = file.file_size_bytes - FOOTER_TRAILER_SIZE - footer_payload_bytes - PUFFIN_MAGIC_SIZE;
 	if (file.content_size_in_bytes > file.file_size_bytes - file.content_offset ||
 	    file.content_offset + file.content_size_in_bytes != footer_magic_offset) {
-		throw InvalidInputException("Distributed Iceberg v3 DELETE returned a non-canonical Puffin blob range");
+		throw InvalidInputException("Distributed Iceberg v3 row-delta returned a non-canonical Puffin blob range");
 	}
 
 	data_t footer_magic[PUFFIN_MAGIC_SIZE];
 	handle->Read(footer_magic, sizeof(footer_magic), footer_magic_offset);
 	if (!HasPuffinMagic(footer_magic)) {
-		throw InvalidInputException("Distributed Iceberg v3 DELETE returned invalid Puffin footer magic");
+		throw InvalidInputException("Distributed Iceberg v3 row-delta returned invalid Puffin footer magic");
 	}
 	vector<data_t> footer_payload(footer_payload_bytes);
 	handle->Read(footer_payload.data(), footer_payload.size(), footer_magic_offset + PUFFIN_MAGIC_SIZE);
@@ -283,12 +222,12 @@ static set<idx_t> ValidateDistributedDeletionVectorArtifact(ClientContext &conte
 	    reinterpret_cast<const char *>(footer_payload.data()), static_cast<size_t>(footer_payload.size()), 0));
 	auto root = footer_doc ? yyjson_doc_get_root(footer_doc.get()) : nullptr;
 	if (!root || !yyjson_is_obj(root)) {
-		throw InvalidInputException("Distributed Iceberg v3 DELETE returned invalid Puffin footer JSON");
+		throw InvalidInputException("Distributed Iceberg v3 row-delta returned invalid Puffin footer JSON");
 	}
 	auto blobs = root ? yyjson_obj_get(root, "blobs") : nullptr;
 	auto blob = blobs && yyjson_is_arr(blobs) && yyjson_arr_size(blobs) == 1 ? yyjson_arr_get_first(blobs) : nullptr;
 	if (!blob || !yyjson_is_obj(blob)) {
-		throw InvalidInputException("Distributed Iceberg v3 DELETE returned invalid Puffin blob metadata");
+		throw InvalidInputException("Distributed Iceberg v3 row-delta returned invalid Puffin blob metadata");
 	}
 	auto type = blob ? yyjson_obj_get(blob, "type") : nullptr;
 	auto fields = blob ? yyjson_obj_get(blob, "fields") : nullptr;
@@ -299,7 +238,7 @@ static set<idx_t> ValidateDistributedDeletionVectorArtifact(ClientContext &conte
 	auto compression_codec = blob ? yyjson_obj_get(blob, "compression-codec") : nullptr;
 	auto properties = blob ? yyjson_obj_get(blob, "properties") : nullptr;
 	if (!properties || !yyjson_is_obj(properties) || compression_codec) {
-		throw InvalidInputException("Distributed Iceberg v3 DELETE returned compressed or invalid Puffin metadata");
+		throw InvalidInputException("Distributed Iceberg v3 row-delta returned compressed or invalid Puffin metadata");
 	}
 	auto referenced_data_file = properties ? yyjson_obj_get(properties, "referenced-data-file") : nullptr;
 	auto cardinality = properties ? yyjson_obj_get(properties, "cardinality") : nullptr;
@@ -313,25 +252,88 @@ static set<idx_t> ValidateDistributedDeletionVectorArtifact(ClientContext &conte
 	    !cardinality || !yyjson_is_str(cardinality) ||
 	    string(yyjson_get_str(cardinality)) !=
 	        StringUtil::Format("%llu", static_cast<unsigned long long>(file.delete_count))) {
-		throw InvalidInputException("Distributed Iceberg v3 DELETE returned inconsistent Puffin footer metadata");
+		throw InvalidInputException("Distributed Iceberg v3 row-delta returned inconsistent Puffin footer metadata");
 	}
 
 	vector<data_t> deletion_vector_blob(file.content_size_in_bytes);
 	handle->Read(deletion_vector_blob.data(), deletion_vector_blob.size(), file.content_offset);
-	ValidateDistributedDeletionVectorBlob(deletion_vector_blob);
-	auto deletion_vector =
-	    IcebergDeletionVectorData::FromBlob(source_entry, deletion_vector_blob.data(), deletion_vector_blob.size());
+	auto bitmaps = IcebergDeletionVectorData::DecodeBlob(
+	    string(reinterpret_cast<const char *>(deletion_vector_blob.data()), deletion_vector_blob.size()));
+	IcebergDeletionVectorData deletion_vector(source_entry);
+	for (auto &entry : bitmaps) {
+		deletion_vector.bitmaps.emplace(entry.first, std::move(entry.second));
+	}
 	set<idx_t> deleted_rows;
-	deletion_vector->ToSet(deleted_rows);
+	deletion_vector.ToSet(deleted_rows);
 	if (deleted_rows.empty() || deleted_rows.size() != file.delete_count ||
 	    *deleted_rows.begin() != file.pos_min_value || *deleted_rows.rbegin() != file.pos_max_value) {
-		throw InvalidInputException("Distributed Iceberg v3 DELETE returned inconsistent deletion-vector rows");
+		throw InvalidInputException("Distributed Iceberg v3 row-delta returned inconsistent deletion-vector rows");
 	}
 	auto source_record_count = NumericCast<idx_t>(source_entry.entry.data_file.record_count);
 	if (*deleted_rows.rbegin() >= source_record_count) {
-		throw InvalidInputException("Distributed Iceberg v3 DELETE returned an out-of-range deletion-vector row");
+		throw InvalidInputException("Distributed Iceberg v3 row-delta returned an out-of-range deletion-vector row");
 	}
 	return deleted_rows;
+}
+
+void IcebergDelete::AddDistributedDeleteArtifacts(ClientContext &context, const IcebergMultiFileList &file_list,
+                                                  const vector<IcebergDistributedDeleteFileResult> &files,
+                                                  IcebergDeleteGlobalState &global_state,
+                                                  const string &operation_name) {
+	for (const auto &file : files) {
+		auto file_index = FindDistributedRowDeltaDataFile(file_list, file.data_file_path);
+		auto source_entry = file_list.GetManifestEntry(file_index);
+		auto source_record_count = NumericCast<idx_t>(source_entry.entry.data_file.record_count);
+		if (source_record_count == 0 || file.pos_max_value >= source_record_count) {
+			throw InvalidInputException(
+			    "Distributed Iceberg %s returned a row position outside data file '%s' (%llu records)", operation_name,
+			    file.data_file_path, static_cast<unsigned long long>(source_record_count));
+		}
+
+		IcebergDeleteFileInfo delete_file;
+		delete_file.data_file_path = file.data_file_path;
+		delete_file.file_name = file.delete_file_path;
+		delete_file.file_format = file.is_deletion_vector ? "puffin" : "parquet";
+		if (file.is_deletion_vector) {
+			auto deleted_rows = ValidateDistributedDeletionVectorArtifact(context, file, source_entry);
+			set<idx_t> existing_rows;
+			auto existing_deletes = file_list.GetExistingPositionalDeleteData(file.data_file_path);
+			if (existing_deletes) {
+				existing_deletes->ToSet(existing_rows);
+			}
+			if (file.new_delete_count > NumericLimits<idx_t>::Maximum() - existing_rows.size() ||
+			    deleted_rows.size() != existing_rows.size() + file.new_delete_count) {
+				throw InvalidInputException(
+				    "Distributed Iceberg v3 %s did not preserve exactly the planned existing delete rows",
+				    operation_name);
+			}
+			for (auto row : existing_rows) {
+				if (!deleted_rows.count(row)) {
+					throw InvalidInputException(
+					    "Distributed Iceberg v3 %s omitted a planned existing deletion-vector row", operation_name);
+				}
+			}
+			delete_file.content_offset = optional_idx(file.content_offset);
+			delete_file.content_size_in_bytes = optional_idx(file.content_size_in_bytes);
+			auto &existing_deletion_vector_path =
+			    file_list.GetDistributedExistingDeletionVectorPath(file.data_file_path);
+			if (!existing_deletion_vector_path.empty()) {
+				global_state.altered_manifests.InvalidateFileForReferencedDataFile(existing_deletion_vector_path,
+				                                                                   file.data_file_path);
+			}
+		} else {
+			delete_file.footer_size = file.footer_size_bytes;
+		}
+		delete_file.delete_count = file.delete_count;
+		delete_file.file_size_bytes = file.file_size_bytes;
+		delete_file.pos_min_value = file.pos_min_value;
+		delete_file.pos_max_value = file.pos_max_value;
+		delete_file.partition_info = file_list.GetPartitionInfoForDataFile(file.data_file_path);
+		if (!global_state.written_files.emplace(file.data_file_path, std::move(delete_file)).second) {
+			throw InvalidInputException("Distributed Iceberg %s produced multiple delete files for data file '%s'",
+			                            operation_name, file.data_file_path);
+		}
+	}
 }
 
 idx_t IcebergDelete::FinalizeDistributedWrite(ClientContext &context,
@@ -348,56 +350,7 @@ idx_t IcebergDelete::FinalizeDistributedWrite(ClientContext &context,
 	ValidateIcebergDistributedRowDeltaSourceSpecs(*multi_file_list,
 	                                              iceberg_table.table_info.table_metadata.default_spec_id, "DELETE");
 	IcebergDeleteGlobalState global_state;
-	for (auto &file : decoded.delete_files) {
-		auto file_index = FindDistributedDeleteDataFile(*multi_file_list, file.data_file_path);
-		auto source_entry = multi_file_list->GetManifestEntry(file_index);
-		auto source_record_count = NumericCast<idx_t>(source_entry.entry.data_file.record_count);
-		if (source_record_count == 0 || file.pos_max_value >= source_record_count) {
-			throw InvalidInputException(
-			    "Distributed Iceberg DELETE returned a row position outside data file '%s' (%llu records)",
-			    file.data_file_path, static_cast<unsigned long long>(source_record_count));
-		}
-		IcebergDeleteFileInfo delete_file;
-		delete_file.data_file_path = file.data_file_path;
-		delete_file.file_name = file.delete_file_path;
-		delete_file.file_format = file.is_deletion_vector ? "puffin" : "parquet";
-		if (file.is_deletion_vector) {
-			auto deleted_rows = ValidateDistributedDeletionVectorArtifact(context, file, source_entry);
-			set<idx_t> existing_rows;
-			auto existing_deletes = multi_file_list->GetExistingPositionalDeleteData(file.data_file_path);
-			if (existing_deletes) {
-				existing_deletes->ToSet(existing_rows);
-			}
-			if (deleted_rows.size() != existing_rows.size() + file.new_delete_count) {
-				throw InvalidInputException(
-				    "Distributed Iceberg v3 DELETE did not preserve exactly the planned existing delete rows");
-			}
-			for (auto row : existing_rows) {
-				if (!deleted_rows.count(row)) {
-					throw InvalidInputException(
-					    "Distributed Iceberg v3 DELETE omitted a planned existing deletion-vector row");
-				}
-			}
-			delete_file.content_offset = optional_idx(file.content_offset);
-			delete_file.content_size_in_bytes = optional_idx(file.content_size_in_bytes);
-			auto &existing_deletion_vector_path =
-			    multi_file_list->GetDistributedExistingDeletionVectorPath(file.data_file_path);
-			if (!existing_deletion_vector_path.empty()) {
-				global_state.altered_manifests.InvalidateFile(existing_deletion_vector_path);
-			}
-		} else {
-			delete_file.footer_size = file.footer_size_bytes;
-		}
-		delete_file.delete_count = file.delete_count;
-		delete_file.file_size_bytes = file.file_size_bytes;
-		delete_file.pos_min_value = file.pos_min_value;
-		delete_file.pos_max_value = file.pos_max_value;
-		delete_file.partition_info = multi_file_list->GetPartitionInfoForDataFile(file.data_file_path);
-		if (!global_state.written_files.emplace(file.data_file_path, std::move(delete_file)).second) {
-			throw InvalidInputException("Distributed Iceberg DELETE produced multiple delete files for data file '%s'",
-			                            file.data_file_path);
-		}
-	}
+	AddDistributedDeleteArtifacts(context, *multi_file_list, decoded.delete_files, global_state, "DELETE");
 	global_state.total_deleted_count = decoded.affected_rows;
 	if (decoded.affected_rows != 0 && global_state.written_files.empty()) {
 		throw InternalException("Distributed Iceberg DELETE did not produce delete files");
@@ -879,9 +832,10 @@ optional_ptr<PhysicalTableScan> IcebergDelete::FindDeleteSource(PhysicalOperator
 	return nullptr;
 }
 
-PhysicalOperator &IcebergDelete::PlanDelete(ClientContext &context, PhysicalPlanGenerator &planner,
-                                            IcebergTableEntry &table, PhysicalOperator &child_plan,
-                                            vector<idx_t> row_id_indexes) {
+#ifdef ICEBERG_VANE_DISTRIBUTED
+PhysicalOperator &IcebergDelete::PlanDeleteInternal(ClientContext &context, PhysicalPlanGenerator &planner,
+                                                    IcebergTableEntry &table, PhysicalOperator &child_plan,
+                                                    vector<idx_t> row_id_indexes, bool initialize_distributed_write) {
 	auto table_scan = FindDeleteSource(child_plan);
 	optional_ptr<IcebergMultiFileList> file_list;
 	if (table_scan) {
@@ -890,8 +844,6 @@ PhysicalOperator &IcebergDelete::PlanDelete(ClientContext &context, PhysicalPlan
 	} else {
 		DUCKDB_LOG_DEBUG(context, "Could not find IcebergDelete source. Iceberg Multi File list is empty");
 	}
-
-#ifdef ICEBERG_VANE_DISTRIBUTED
 #ifdef ICEBERG_ENABLE_EQUALITY_DELETE_WRITES
 	vector<IcebergEqualityDeletePredicate> equality_predicates;
 	bool is_equality_delete = TryGetEqualityDeletePredicates(context, table, child_plan, equality_predicates);
@@ -903,11 +855,30 @@ PhysicalOperator &IcebergDelete::PlanDelete(ClientContext &context, PhysicalPlan
 	auto &result =
 	    planner.Make<IcebergDelete>(table, file_list, child_plan, std::move(row_id_indexes)).Cast<IcebergDelete>();
 #endif
-	result.InitializeDistributedWritePlan(context);
-	result.distributed_worker_child =
-	    &PlanIcebergDistributedRowDeltaRepartition(planner, child_plan, result.row_id_indexes[0]);
+	if (initialize_distributed_write) {
+		result.InitializeDistributedWritePlan(context);
+		result.distributed_worker_child =
+		    &PlanIcebergDistributedRowDeltaRepartition(planner, child_plan, result.row_id_indexes[0]);
+	}
 	return result;
+}
+#endif
+
+PhysicalOperator &IcebergDelete::PlanDelete(ClientContext &context, PhysicalPlanGenerator &planner,
+                                            IcebergTableEntry &table, PhysicalOperator &child_plan,
+                                            vector<idx_t> row_id_indexes) {
+#ifdef ICEBERG_VANE_DISTRIBUTED
+	return PlanDeleteInternal(context, planner, table, child_plan, std::move(row_id_indexes), true);
 #else
+	auto table_scan = FindDeleteSource(child_plan);
+	optional_ptr<IcebergMultiFileList> file_list;
+	if (table_scan) {
+		auto &bind_data = table_scan->bind_data->Cast<MultiFileBindData>();
+		file_list = &bind_data.file_list->Cast<IcebergMultiFileList>();
+	} else {
+		DUCKDB_LOG_DEBUG(context, "Could not find IcebergDelete source. Iceberg Multi File list is empty");
+	}
+
 #ifdef ICEBERG_ENABLE_EQUALITY_DELETE_WRITES
 	vector<IcebergEqualityDeletePredicate> equality_predicates;
 	bool is_equality_delete = TryGetEqualityDeletePredicates(context, table, child_plan, equality_predicates);
