@@ -153,6 +153,8 @@ public:
 	bool DistributedScanHasSnapshot() const;
 	int64_t GetDistributedScanSnapshotId() const;
 	string GetDistributedScanSplitPayload(idx_t file_id) const;
+	string GetDistributedWorkerScanSplitPayload(idx_t file_id) const;
+	const string &GetDistributedExistingDeletionVectorPath(const string &file_path) const;
 	vector<int32_t> GetDistributedEqualityDeleteFieldIds() const;
 	unique_ptr<IcebergMultiFileList> PushdownDistributedScanFilters(const vector<ColumnIndex> &column_ids,
 	                                                                optional_ptr<const TableFilterSet> filters) const;

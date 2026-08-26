@@ -77,11 +77,13 @@ source.create(
 
 The worker COPY schema is derived from the requested format version before any
 files are written. The two-worker Ray integration lane covers partitioned v2
-CTAS and v3 CTAS, reads a spec-compliant Puffin deletion vector, checks v3
-partition and projection pruning, reads and appends `VARIANT` and
+CTAS and v3 CTAS, reads and writes spec-compliant Puffin deletion vectors,
+checks v3 partition and projection pruning, reads and appends `VARIANT` and
 `TIMESTAMP_NS`, and verifies row-lineage metadata across an append to an
-existing v3 table. Geometry is not qualified because the optional geometry
-dependency is not part of this lane.
+existing v3 table. A v3 distributed `DELETE` consolidates the source scan's
+frozen delete state with the new row positions and replaces any existing
+deletion vector for the affected data file. Geometry is not qualified because
+the optional geometry dependency is not part of this lane.
 
 | Distributed capability | Iceberg v2 | Iceberg v3 |
 | --- | --- | --- |
@@ -89,12 +91,13 @@ dependency is not part of this lane.
 | `INSERT` into an existing table | Supported | Supported, with row-ID and sequence-number assignment |
 | `CREATE TABLE AS` | Supported with an explicit worker data path and staged catalog creation | Supported under the same constraints, including initial row lineage |
 | `VARIANT` and `TIMESTAMP_NS` | Not Iceberg v2 types | Supported; legacy Parquet VARIANT decoding remains rejected |
-| `UPDATE` and `DELETE` | Supported through positional-delete files | Rejected; distributed Puffin row-delta writes are tracked separately in [#5](https://github.com/AstroVela/duckdb-iceberg/issues/5) |
+| `DELETE` | Supported through positional-delete files | Supported through consolidated Puffin deletion vectors |
+| `UPDATE` | Supported through positional-delete files and replacement data files | Rejected; distributed v3 UPDATE remains tracked in [#5](https://github.com/AstroVela/duckdb-iceberg/issues/5) |
 
 Distributed writes reject a current partition spec containing a `VOID`
-transform. A distributed v2 row-delta operation also fails if any selected
-source file uses a partition spec other than the current default. V3 scan and
-append plans fail closed when their target snapshot, schema, or partition spec
+transform. A distributed row-delta operation also fails if any selected source
+file uses a partition spec other than the current default. V3 scan, append, and
+DELETE plans fail closed when their target snapshot, schema, or partition spec
 changes before catalog finalization; no local execution fallback is used.
 
 Scan splits materialize the coordinator's selected files and delete state,

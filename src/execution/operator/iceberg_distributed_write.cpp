@@ -28,6 +28,8 @@
 #include "catalog/rest/catalog_entry/table/iceberg_table_entry.hpp"
 #include "catalog/rest/catalog_entry/table/iceberg_table_information.hpp"
 #include "common/iceberg_utils.hpp"
+#include "core/deletes/iceberg_deletion_vector.hpp"
+#include "core/deletes/iceberg_positional_delete.hpp"
 #include "planning/iceberg_multi_file_list.hpp"
 
 namespace duckdb {
@@ -81,9 +83,20 @@ void ValidateIcebergDistributedRowDeltaSourceSpecs(const IcebergMultiFileList &f
 
 namespace {
 
+static constexpr uint32_t ICEBERG_ROW_DELTA_PROTOCOL_VERSION = 3;
 static const string ICEBERG_ROW_DELTA_FRAGMENT_CODEC = "iceberg.row-delta-fragment";
 static const DistributedPayloadCodec ICEBERG_DATA_FILE_CODEC {"iceberg.data-file", 1};
 static const DistributedPayloadCodec ICEBERG_POSITION_DELETE_FILE_CODEC {"iceberg.position-delete-file", 1};
+static const DistributedPayloadCodec ICEBERG_DELETION_VECTOR_FILE_CODEC {"iceberg.deletion-vector-puffin", 1};
+
+struct IcebergDistributedDeleteSourceState {
+	string scan_file_path;
+	string data_file_path;
+	idx_t record_count = 0;
+	//! Portable deletion-vector-v1 bytes. Keep historical deletes compressed in
+	//! the shared worker bind and decode only a file that receives new deletes.
+	string existing_delete_blob;
+};
 
 struct IcebergDistributedRowDeltaBind {
 	IcebergDistributedRowDeltaKind kind = IcebergDistributedRowDeltaKind::DELETE;
@@ -93,6 +106,7 @@ struct IcebergDistributedRowDeltaBind {
 	vector<idx_t> row_id_indexes;
 	idx_t copy_column_count = 0;
 	string copy_operator;
+	vector<IcebergDistributedDeleteSourceState> delete_sources;
 };
 
 static idx_t CheckedAdd(idx_t left, idx_t right, const string &description) {
@@ -100,6 +114,72 @@ static idx_t CheckedAdd(idx_t left, idx_t right, const string &description) {
 		throw InvalidInputException("Iceberg distributed row-delta %s overflow", description);
 	}
 	return left + right;
+}
+
+static idx_t ValidateExistingDeleteBitmaps(const map<int32_t, roaring::Roaring> &bitmaps, idx_t record_count) {
+	idx_t delete_count = 0;
+	for (const auto &entry : bitmaps) {
+		if (entry.first < 0 || entry.second.isEmpty()) {
+			throw SerializationException("Iceberg distributed v3 DELETE contains an invalid existing delete bitmap");
+		}
+		auto cardinality = entry.second.cardinality();
+		if (cardinality > NumericLimits<idx_t>::Maximum() - delete_count) {
+			throw SerializationException("Iceberg distributed v3 DELETE existing delete count overflow");
+		}
+		delete_count += NumericCast<idx_t>(cardinality);
+		auto maximum = (static_cast<uint64_t>(entry.first) << 32) | entry.second.maximum();
+		if (maximum >= record_count) {
+			throw SerializationException("Iceberg distributed v3 DELETE contains an out-of-range existing delete row");
+		}
+	}
+	return delete_count;
+}
+
+static map<int32_t, roaring::Roaring> DecodeExistingDeleteBlob(const string &blob, idx_t record_count) {
+	if (blob.empty()) {
+		return {};
+	}
+	auto bitmaps = IcebergDeletionVectorData::DecodeBlob(blob);
+	ValidateExistingDeleteBitmaps(bitmaps, record_count);
+	return bitmaps;
+}
+
+static void AddExistingDeleteRow(map<int32_t, roaring::Roaring> &bitmaps, int64_t row, idx_t record_count) {
+	if (row < 0 || NumericCast<idx_t>(row) >= record_count) {
+		throw InvalidConfigurationException("Distributed Iceberg v3 DELETE source contains an out-of-range delete row");
+	}
+	auto high_bits = NumericCast<int32_t>(static_cast<uint64_t>(row) >> 32);
+	auto low_bits = static_cast<uint32_t>(row & 0xFFFFFFFF);
+	if (!bitmaps[high_bits].addChecked(low_bits)) {
+		throw InvalidConfigurationException("Distributed Iceberg v3 DELETE source contains duplicate delete rows");
+	}
+}
+
+static string EncodeExistingDeleteBlob(const IcebergDeleteData &delete_data, idx_t record_count) {
+	map<int32_t, roaring::Roaring> bitmaps;
+	if (delete_data.type == IcebergDeleteType::DELETION_VECTOR) {
+		auto &deletion_vector = static_cast<const IcebergDeletionVectorData &>(delete_data);
+		for (const auto &entry : deletion_vector.bitmaps) {
+			if (!bitmaps.emplace(entry.first, entry.second).second) {
+				throw InvalidConfigurationException(
+				    "Distributed Iceberg v3 DELETE source contains duplicate deletion-vector bitmap keys");
+			}
+		}
+	} else {
+		auto &positional_deletes = static_cast<const IcebergPositionalDeleteData &>(delete_data);
+		for (auto row : positional_deletes.invalid_rows) {
+			AddExistingDeleteRow(bitmaps, row, record_count);
+		}
+	}
+	if (bitmaps.empty()) {
+		return {};
+	}
+	for (auto &entry : bitmaps) {
+		entry.second.runOptimize();
+	}
+	ValidateExistingDeleteBitmaps(bitmaps, record_count);
+	auto blob = IcebergDeletionVectorData::ToBlob(bitmaps);
+	return string(reinterpret_cast<const char *>(blob.data()), blob.size());
 }
 
 static void ValidateIcebergSignedFileCounts(idx_t row_count, idx_t file_size_bytes, const string &description) {
@@ -221,6 +301,15 @@ static string SerializeBind(const IcebergDistributedRowDeltaBind &bind) {
 	serializer.WriteProperty(5, "copy_column_count", bind.copy_column_count);
 	serializer.WriteProperty(6, "copy_operator", bind.copy_operator);
 	serializer.WriteProperty(7, "iceberg_version", bind.iceberg_version);
+	serializer.WriteList(8, "delete_sources", bind.delete_sources.size(), [&](Serializer::List &list, idx_t index) {
+		auto &source = bind.delete_sources[index];
+		list.WriteObject([&](Serializer &object) {
+			object.WriteProperty(1, "scan_file_path", source.scan_file_path);
+			object.WriteProperty(2, "data_file_path", source.data_file_path);
+			object.WriteProperty(3, "record_count", source.record_count);
+			object.WriteProperty(4, "existing_delete_blob", source.existing_delete_blob);
+		});
+	});
 	serializer.End();
 	return BytesFromStream(stream);
 }
@@ -244,6 +333,16 @@ static IcebergDistributedRowDeltaBind DeserializeBind(const string &bytes) {
 	result.copy_column_count = deserializer.ReadProperty<idx_t>(5, "copy_column_count");
 	result.copy_operator = deserializer.ReadProperty<string>(6, "copy_operator");
 	result.iceberg_version = deserializer.ReadProperty<int32_t>(7, "iceberg_version");
+	deserializer.ReadList(8, "delete_sources", [&](Deserializer::List &list, idx_t) {
+		IcebergDistributedDeleteSourceState source;
+		list.ReadObject([&](Deserializer &object) {
+			source.scan_file_path = object.ReadProperty<string>(1, "scan_file_path");
+			source.data_file_path = object.ReadProperty<string>(2, "data_file_path");
+			source.record_count = object.ReadProperty<idx_t>(3, "record_count");
+			source.existing_delete_blob = object.ReadProperty<string>(4, "existing_delete_blob");
+		});
+		result.delete_sources.push_back(std::move(source));
+	});
 	deserializer.End();
 	if (result.data_path.empty() || result.artifact_namespace.empty() || result.row_id_indexes.size() != 2) {
 		throw SerializationException("Invalid Iceberg distributed row-delta bind data");
@@ -256,9 +355,24 @@ static IcebergDistributedRowDeltaBind DeserializeBind(const string &bytes) {
 	    (!result.copy_operator.empty() || result.copy_column_count != 0)) {
 		throw SerializationException("Iceberg distributed DELETE unexpectedly contains a COPY writer");
 	}
-	if (result.iceberg_version != 2) {
-		throw NotImplementedException(
-		    "Distributed Iceberg row-delta writes currently support format-version 2 tables only");
+	if (result.kind == IcebergDistributedRowDeltaKind::UPDATE && result.iceberg_version != 2) {
+		throw NotImplementedException("Distributed Iceberg UPDATE currently supports format-version 2 tables only");
+	}
+	if (result.kind == IcebergDistributedRowDeltaKind::DELETE && result.iceberg_version != 2 &&
+	    result.iceberg_version != 3) {
+		throw NotImplementedException("Distributed Iceberg DELETE supports format-version 2 and 3 tables only");
+	}
+	if (result.iceberg_version == 2 && !result.delete_sources.empty()) {
+		throw SerializationException("Iceberg distributed v2 row-delta bind unexpectedly contains v3 source state");
+	}
+	unordered_set<string> scan_paths;
+	unordered_set<string> data_paths;
+	for (const auto &source : result.delete_sources) {
+		if (source.scan_file_path.empty() || source.data_file_path.empty() ||
+		    !scan_paths.insert(source.scan_file_path).second || !data_paths.insert(source.data_file_path).second) {
+			throw SerializationException("Iceberg distributed v3 DELETE contains invalid source-file state");
+		}
+		DecodeExistingDeleteBlob(source.existing_delete_blob, source.record_count);
 	}
 	return result;
 }
@@ -306,22 +420,30 @@ static distributed::DistributedCopyFileInfo DeserializeCopyFile(Deserializer &de
 static void SerializeDeleteFile(Serializer &serializer, const IcebergDistributedDeleteFileResult &file) {
 	serializer.WriteProperty(1, "data_file_path", file.data_file_path);
 	serializer.WriteProperty(2, "delete_file_path", file.delete_file_path);
-	serializer.WriteProperty(3, "delete_count", file.delete_count);
-	serializer.WriteProperty(4, "file_size_bytes", file.file_size_bytes);
-	serializer.WriteProperty(5, "footer_size_bytes", file.footer_size_bytes);
-	serializer.WriteProperty(6, "pos_min_value", file.pos_min_value);
-	serializer.WriteProperty(7, "pos_max_value", file.pos_max_value);
+	serializer.WriteProperty(3, "is_deletion_vector", file.is_deletion_vector);
+	serializer.WriteProperty(4, "new_delete_count", file.new_delete_count);
+	serializer.WriteProperty(5, "delete_count", file.delete_count);
+	serializer.WriteProperty(6, "file_size_bytes", file.file_size_bytes);
+	serializer.WriteProperty(7, "footer_size_bytes", file.footer_size_bytes);
+	serializer.WriteProperty(8, "content_offset", file.content_offset);
+	serializer.WriteProperty(9, "content_size_in_bytes", file.content_size_in_bytes);
+	serializer.WriteProperty(10, "pos_min_value", file.pos_min_value);
+	serializer.WriteProperty(11, "pos_max_value", file.pos_max_value);
 }
 
 static IcebergDistributedDeleteFileResult DeserializeDeleteFile(Deserializer &deserializer) {
 	IcebergDistributedDeleteFileResult result;
 	result.data_file_path = deserializer.ReadProperty<string>(1, "data_file_path");
 	result.delete_file_path = deserializer.ReadProperty<string>(2, "delete_file_path");
-	result.delete_count = deserializer.ReadProperty<idx_t>(3, "delete_count");
-	result.file_size_bytes = deserializer.ReadProperty<idx_t>(4, "file_size_bytes");
-	result.footer_size_bytes = deserializer.ReadProperty<idx_t>(5, "footer_size_bytes");
-	result.pos_min_value = deserializer.ReadProperty<idx_t>(6, "pos_min_value");
-	result.pos_max_value = deserializer.ReadProperty<idx_t>(7, "pos_max_value");
+	result.is_deletion_vector = deserializer.ReadProperty<bool>(3, "is_deletion_vector");
+	result.new_delete_count = deserializer.ReadProperty<idx_t>(4, "new_delete_count");
+	result.delete_count = deserializer.ReadProperty<idx_t>(5, "delete_count");
+	result.file_size_bytes = deserializer.ReadProperty<idx_t>(6, "file_size_bytes");
+	result.footer_size_bytes = deserializer.ReadProperty<idx_t>(7, "footer_size_bytes");
+	result.content_offset = deserializer.ReadProperty<idx_t>(8, "content_offset");
+	result.content_size_in_bytes = deserializer.ReadProperty<idx_t>(9, "content_size_in_bytes");
+	result.pos_min_value = deserializer.ReadProperty<idx_t>(10, "pos_min_value");
+	result.pos_max_value = deserializer.ReadProperty<idx_t>(11, "pos_max_value");
 	return result;
 }
 
@@ -390,6 +512,11 @@ public:
 				throw SerializationException("Iceberg distributed UPDATE COPY input width changed during transport");
 			}
 		}
+		for (idx_t index = 0; index < bind.delete_sources.size(); index++) {
+			if (!delete_source_indexes.emplace(bind.delete_sources[index].scan_file_path, index).second) {
+				throw SerializationException("Iceberg distributed v3 DELETE contains duplicate source-file state");
+			}
+		}
 	}
 
 	IcebergDistributedRowDeltaBind bind;
@@ -398,6 +525,7 @@ public:
 	optional_ptr<PhysicalCopyToFile> copy;
 	string operation_root;
 	string attempt_root;
+	unordered_map<string, idx_t> delete_source_indexes;
 	mutex copy_lock;
 	bool copy_sink_initialized = false;
 	mutex lock;
@@ -484,11 +612,20 @@ static void IcebergRowDeltaSink(ExecutionContext &context, const DistributedExte
 		if (file_value.IsNull() || position_value.IsNull()) {
 			throw InvalidInputException("Iceberg distributed row-delta received a NULL row identifier");
 		}
+		auto file_path = file_value.GetValue<string>();
 		auto position = position_value.GetValue<int64_t>();
 		if (position < 0) {
 			throw InvalidInputException("Iceberg distributed row-delta received a negative row position");
 		}
-		local_state.deleted_rows[file_value.GetValue<string>()].push_back(NumericCast<idx_t>(position));
+		if (global_state.bind.iceberg_version >= 3) {
+			auto source = global_state.delete_source_indexes.find(file_path);
+			if (source == global_state.delete_source_indexes.end() ||
+			    NumericCast<idx_t>(position) >= global_state.bind.delete_sources[source->second].record_count) {
+				throw InvalidInputException(
+				    "Iceberg distributed v3 DELETE received a row identifier outside its planned source files");
+			}
+		}
+		local_state.deleted_rows[std::move(file_path)].push_back(NumericCast<idx_t>(position));
 	}
 	local_state.affected_rows = CheckedAdd(local_state.affected_rows, input.size(), "worker affected row count");
 }
@@ -587,11 +724,66 @@ static IcebergDistributedDeleteFileResult WritePositionDeleteFile(ClientContext 
 	IcebergDistributedDeleteFileResult result;
 	result.data_file_path = data_file_path;
 	result.delete_file_path = output_path;
+	result.new_delete_count = statistics.row_count;
 	result.delete_count = statistics.row_count;
 	result.file_size_bytes = statistics.file_size_bytes;
 	result.footer_size_bytes = statistics.footer_size_bytes.GetValue<idx_t>();
 	result.pos_min_value = min_position->second.GetValue<idx_t>();
 	result.pos_max_value = max_position->second.GetValue<idx_t>();
+	return result;
+}
+
+static IcebergDistributedDeleteFileResult WriteDeletionVectorFile(ClientContext &context, const string &output_path,
+                                                                  const IcebergDistributedDeleteSourceState &source,
+                                                                  const vector<idx_t> &new_row_positions) {
+	if (new_row_positions.empty()) {
+		throw NotImplementedException(
+		    "The same Iceberg row was modified multiple times in one distributed write; eliminate duplicate matches");
+	}
+
+	auto bitmaps = DecodeExistingDeleteBlob(source.existing_delete_blob, source.record_count);
+	auto existing_delete_count = ValidateExistingDeleteBitmaps(bitmaps, source.record_count);
+	for (auto row : new_row_positions) {
+		if (row >= source.record_count) {
+			throw InvalidInputException(
+			    "Iceberg distributed v3 DELETE attempted to replace an invalid or already-deleted row");
+		}
+		auto high_bits = NumericCast<int32_t>(static_cast<uint64_t>(row) >> 32);
+		auto low_bits = static_cast<uint32_t>(row & 0xFFFFFFFF);
+		if (!bitmaps[high_bits].addChecked(low_bits)) {
+			throw InvalidInputException(
+			    "Iceberg distributed v3 DELETE attempted to replace an invalid or already-deleted row");
+		}
+	}
+	for (auto &entry : bitmaps) {
+		entry.second.runOptimize();
+	}
+	auto delete_count = CheckedAdd(existing_delete_count, new_row_positions.size(), "deletion-vector row count");
+	auto blob = IcebergDeletionVectorData::ToBlob(bitmaps);
+	auto puffin = IcebergDeletionVectorData::ToPuffinFile(blob, source.data_file_path, delete_count);
+	auto &fs = FileSystem::GetFileSystem(context);
+	try {
+		auto handle = fs.OpenFile(output_path, FileOpenFlags::FILE_FLAGS_WRITE | FileOpenFlags::FILE_FLAGS_FILE_CREATE);
+		handle->Write(puffin.data(), puffin.size());
+		handle->Close();
+	} catch (...) {
+		fs.TryRemoveFile(output_path);
+		throw;
+	}
+
+	IcebergDistributedDeleteFileResult result;
+	result.data_file_path = source.data_file_path;
+	result.delete_file_path = output_path;
+	result.is_deletion_vector = true;
+	result.new_delete_count = new_row_positions.size();
+	result.delete_count = delete_count;
+	result.file_size_bytes = puffin.size();
+	result.content_offset = 4;
+	result.content_size_in_bytes = blob.size();
+	result.pos_min_value =
+	    NumericCast<idx_t>((static_cast<uint64_t>(bitmaps.begin()->first) << 32) | bitmaps.begin()->second.minimum());
+	result.pos_max_value =
+	    NumericCast<idx_t>((static_cast<uint64_t>(bitmaps.rbegin()->first) << 32) | bitmaps.rbegin()->second.maximum());
 	return result;
 }
 
@@ -657,9 +849,21 @@ static vector<DistributedWriteFragment> IcebergRowDeltaFinalize(ClientContext &c
 	vector<IcebergDistributedDeleteFileResult> delete_files;
 	for (auto &entry : deleted_rows) {
 		auto &fs = FileSystem::GetFileSystem(context);
-		auto file_name = UUID::ToString(UUID::GenerateRandomUUID()) + "-deletes.parquet";
-		auto output_path = fs.JoinPath(global_state.attempt_root, file_name);
-		delete_files.push_back(WritePositionDeleteFile(context, output_path, entry.first, entry.second));
+		if (global_state.bind.iceberg_version >= 3) {
+			auto source_index = global_state.delete_source_indexes.find(entry.first);
+			if (source_index == global_state.delete_source_indexes.end()) {
+				throw InvalidInputException(
+				    "Iceberg distributed v3 DELETE produced rows for an unplanned source data file");
+			}
+			auto file_name = UUID::ToString(UUID::GenerateRandomUUID()) + "-deletes.puffin";
+			auto output_path = fs.JoinPath(global_state.attempt_root, file_name);
+			delete_files.push_back(WriteDeletionVectorFile(
+			    context, output_path, global_state.bind.delete_sources[source_index->second], entry.second));
+		} else {
+			auto file_name = UUID::ToString(UUID::GenerateRandomUUID()) + "-deletes.parquet";
+			auto output_path = fs.JoinPath(global_state.attempt_root, file_name);
+			delete_files.push_back(WritePositionDeleteFile(context, output_path, entry.first, entry.second));
+		}
 	}
 
 	idx_t data_rows = 0;
@@ -670,7 +874,7 @@ static vector<DistributedWriteFragment> IcebergRowDeltaFinalize(ClientContext &c
 	}
 	idx_t delete_rows = 0;
 	for (auto &file : delete_files) {
-		delete_rows = CheckedAdd(delete_rows, file.delete_count, "worker delete row count");
+		delete_rows = CheckedAdd(delete_rows, file.new_delete_count, "worker delete row count");
 		byte_count = CheckedAdd(byte_count, file.file_size_bytes, "worker byte count");
 	}
 	if (delete_rows != affected_rows ||
@@ -695,7 +899,8 @@ static vector<DistributedWriteFragment> IcebergRowDeltaFinalize(ClientContext &c
 		DistributedWriteArtifact artifact;
 		artifact.artifact_id = "delete:" + std::to_string(index);
 		artifact.uri = delete_files[index].delete_file_path;
-		artifact.codec = ICEBERG_POSITION_DELETE_FILE_CODEC;
+		artifact.codec = delete_files[index].is_deletion_vector ? ICEBERG_DELETION_VECTOR_FILE_CODEC
+		                                                        : ICEBERG_POSITION_DELETE_FILE_CODEC;
 		fragment.artifacts.push_back(std::move(artifact));
 	}
 	return {std::move(fragment)};
@@ -786,7 +991,8 @@ PhysicalOperator &PlanIcebergDistributedRowDeltaRepartition(PhysicalPlanGenerato
 }
 
 string BuildIcebergDistributedDeleteBind(ClientContext &context, const IcebergTableEntry &table,
-                                         const vector<idx_t> &row_id_indexes, const string &artifact_namespace) {
+                                         const IcebergMultiFileList &file_list, const vector<idx_t> &row_id_indexes,
+                                         const string &artifact_namespace) {
 	auto &metadata = table.table_info.table_metadata;
 	IcebergDistributedRowDeltaBind bind;
 	bind.kind = IcebergDistributedRowDeltaKind::DELETE;
@@ -794,6 +1000,34 @@ string BuildIcebergDistributedDeleteBind(ClientContext &context, const IcebergTa
 	bind.data_path = metadata.GetDataPath(FileSystem::GetFileSystem(context));
 	bind.artifact_namespace = artifact_namespace;
 	bind.row_id_indexes = row_id_indexes;
+	if (metadata.iceberg_version >= 3) {
+		if (!file_list.HasDistributedScanPlan()) {
+			throw InvalidInputException("Distributed Iceberg v3 DELETE requires a planned source scan");
+		}
+		auto file_count = file_list.GetTotalFileCount();
+		auto files = file_list.GetAllFiles();
+		if (files.size() != file_count) {
+			throw InternalException("Distributed Iceberg v3 DELETE source file count changed during planning");
+		}
+		bind.delete_sources.reserve(file_count);
+		for (idx_t file_index = 0; file_index < file_count; file_index++) {
+			auto manifest_entry = file_list.GetManifestEntry(file_index);
+			if (manifest_entry.entry.data_file.record_count < 0) {
+				throw InvalidConfigurationException(
+				    "Distributed Iceberg v3 DELETE source data file '%s' has an invalid record count",
+				    files[file_index].path);
+			}
+			IcebergDistributedDeleteSourceState source;
+			source.scan_file_path = files[file_index].path;
+			source.data_file_path = manifest_entry.entry.data_file.file_path;
+			source.record_count = NumericCast<idx_t>(manifest_entry.entry.data_file.record_count);
+			auto existing_deletes = file_list.GetExistingPositionalDeleteData(source.data_file_path);
+			if (existing_deletes) {
+				source.existing_delete_blob = EncodeExistingDeleteBlob(*existing_deletes, source.record_count);
+			}
+			bind.delete_sources.push_back(std::move(source));
+		}
+	}
 	return SerializeBind(bind);
 }
 
@@ -843,15 +1077,20 @@ void ValidateIcebergDistributedDataFileArtifacts(ClientContext &context, const s
 	}
 }
 
-IcebergDistributedRowDeltaResult
-DecodeIcebergDistributedRowDeltaResults(ClientContext &context, const string &data_path,
-                                        const string &artifact_namespace, const DistributedExtensionWriteInfo &info,
-                                        const vector<DistributedWriteTaskResult> &results,
-                                        IcebergDistributedRowDeltaKind expected_kind) {
+IcebergDistributedRowDeltaResult DecodeIcebergDistributedRowDeltaResults(
+    ClientContext &context, const string &data_path, const string &artifact_namespace,
+    const DistributedExtensionWriteInfo &info, const vector<DistributedWriteTaskResult> &results,
+    IcebergDistributedRowDeltaKind expected_kind, int32_t expected_iceberg_version) {
 	info.Validate();
 	if (info.mode != DistributedWriteMode::CALLBACK ||
-	    info.fragment_codec != DistributedPayloadCodec {ICEBERG_ROW_DELTA_FRAGMENT_CODEC, 1}) {
+	    info.fragment_codec !=
+	        DistributedPayloadCodec {ICEBERG_ROW_DELTA_FRAGMENT_CODEC, ICEBERG_ROW_DELTA_PROTOCOL_VERSION}) {
 		throw InvalidInputException("Iceberg distributed row-delta coordinator resolved the wrong worker protocol");
+	}
+	if ((expected_kind == IcebergDistributedRowDeltaKind::UPDATE && expected_iceberg_version != 2) ||
+	    (expected_kind == IcebergDistributedRowDeltaKind::DELETE && expected_iceberg_version != 2 &&
+	     expected_iceberg_version != 3)) {
+		throw InvalidInputException("Iceberg distributed row-delta coordinator has an unsupported table version");
 	}
 
 	IcebergDistributedRowDeltaResult combined;
@@ -920,12 +1159,28 @@ DecodeIcebergDistributedRowDeltaResults(ClientContext &context, const string &da
 			idx_t delete_row_count = 0;
 			idx_t delete_artifact_index = 0;
 			for (auto &file : decoded.delete_files) {
-				if (file.data_file_path.empty() || file.delete_file_path.empty() || file.delete_count == 0 ||
-				    file.file_size_bytes == 0 || file.footer_size_bytes > file.file_size_bytes ||
+				auto expects_deletion_vector =
+				    expected_kind == IcebergDistributedRowDeltaKind::DELETE && expected_iceberg_version >= 3;
+				if (file.data_file_path.empty() || file.delete_file_path.empty() || file.new_delete_count == 0 ||
+				    file.delete_count == 0 || file.new_delete_count > file.delete_count || file.file_size_bytes == 0 ||
 				    file.pos_min_value > file.pos_max_value ||
 				    file.delete_count - 1 > file.pos_max_value - file.pos_min_value ||
+				    file.is_deletion_vector != expects_deletion_vector ||
 				    !artifact_paths.insert(file.delete_file_path).second) {
 					throw InvalidInputException("Iceberg distributed row-delta returned invalid delete-file metadata");
+				}
+				if (file.is_deletion_vector) {
+					if (file.footer_size_bytes != 0 || file.content_offset != 4 || file.content_size_in_bytes < 12 ||
+					    CheckedAdd(file.content_offset, file.content_size_in_bytes, "deletion-vector content range") >=
+					        file.file_size_bytes) {
+						throw InvalidInputException(
+						    "Iceberg distributed v3 DELETE returned invalid deletion-vector metadata");
+					}
+				} else if (file.new_delete_count != file.delete_count || file.footer_size_bytes == 0 ||
+				           file.footer_size_bytes > file.file_size_bytes || file.content_offset != 0 ||
+				           file.content_size_in_bytes != 0) {
+					throw InvalidInputException(
+					    "Iceberg distributed v2 row-delta returned invalid positional-delete metadata");
 				}
 				ValidateIcebergSignedFileCounts(file.delete_count, file.file_size_bytes, "delete-file");
 				ValidateIcebergDistributedAttemptArtifactPath(context, operation_root, task_result.task_attempt_id,
@@ -935,9 +1190,11 @@ DecodeIcebergDistributedRowDeltaResults(ClientContext &context, const string &da
 					throw NotImplementedException(
 					    "Distributed Iceberg row-delta produced multiple delete files for one data file");
 				}
-				delete_row_count = CheckedAdd(delete_row_count, file.delete_count, "delete row count");
+				delete_row_count = CheckedAdd(delete_row_count, file.new_delete_count, "delete row count");
 				byte_count = CheckedAdd(byte_count, file.file_size_bytes, "byte count");
-				expected_artifacts.emplace_back(file.delete_file_path, ICEBERG_POSITION_DELETE_FILE_CODEC);
+				expected_artifacts.emplace_back(file.delete_file_path, file.is_deletion_vector
+				                                                           ? ICEBERG_DELETION_VECTOR_FILE_CODEC
+				                                                           : ICEBERG_POSITION_DELETE_FILE_CODEC);
 				expected_artifact_ids.push_back("delete:" + std::to_string(delete_artifact_index++));
 				combined.delete_files.push_back(std::move(file));
 			}
@@ -1025,9 +1282,9 @@ void RegisterIcebergDistributedWrites(ExtensionLoader &loader) {
 	auto register_row_delta = [&](const string &name) {
 		DistributedWriteOperatorExtension extension;
 		extension.name = name;
-		extension.protocol_version = 1;
+		extension.protocol_version = ICEBERG_ROW_DELTA_PROTOCOL_VERSION;
 		extension.mode = DistributedWriteMode::CALLBACK;
-		extension.fragment_codec = {ICEBERG_ROW_DELTA_FRAGMENT_CODEC, 1};
+		extension.fragment_codec = {ICEBERG_ROW_DELTA_FRAGMENT_CODEC, ICEBERG_ROW_DELTA_PROTOCOL_VERSION};
 		extension.callbacks = IcebergDistributedRowDeltaCallbacks();
 		DistributedWriteOperatorExtension::Register(loader, std::move(extension));
 	};

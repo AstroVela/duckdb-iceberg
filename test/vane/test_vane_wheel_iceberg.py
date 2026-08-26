@@ -14,6 +14,7 @@ MINIO_READY_ENDPOINT = "http://127.0.0.1:9000/minio/health/ready"
 CATALOG_NAME = "vane_wheel_catalog"
 TABLE_NAME = "vane_wheel_iceberg_integration"
 TABLE = f"{CATALOG_NAME}.default.{TABLE_NAME}"
+V3_TABLE = f"{CATALOG_NAME}.default.vane_wheel_iceberg_v3_local"
 
 
 def require_equal(actual: object, expected: object, description: str) -> None:
@@ -86,6 +87,7 @@ def main() -> None:
         )
         connection.execute(f"CREATE SCHEMA IF NOT EXISTS {CATALOG_NAME}.default")
         connection.execute(f"DROP TABLE IF EXISTS {TABLE}")
+        connection.execute(f"DROP TABLE IF EXISTS {V3_TABLE}")
         connection.execute(f"CREATE TABLE {TABLE} (id INTEGER, payload VARCHAR) " "WITH ('format-version' = '2')")
         connection.execute(f"INSERT INTO {TABLE} VALUES (1, 'one'), (2, 'two'), (3, 'three')")
         require_equal(
@@ -109,7 +111,21 @@ def main() -> None:
             [(1, "one"), (3, "three")],
             "Iceberg scan after DELETE",
         )
+
+        # A Vane-enabled extension build must retain the independent local-fast
+        # backend for v3 mutations. This Relation DELETE deliberately bypasses
+        # the distributed provider and exercises the native Puffin writer.
+        connection.execute(f"CREATE TABLE {V3_TABLE} (id INTEGER, payload VARCHAR) WITH ('format-version' = '3')")
+        connection.execute(f"INSERT INTO {V3_TABLE} VALUES (1, 'one'), (2, 'two'), (3, 'three')")
+        connection.table(V3_TABLE).delete(condition=vane.ColumnExpression("id") == vane.ConstantExpression(2))
+        require_equal(
+            connection.execute(f"SELECT id, payload FROM {V3_TABLE} ORDER BY id").fetchall(),
+            [(1, "one"), (3, "three")],
+            "local-fast Iceberg v3 Relation DELETE",
+        )
+
         connection.execute(f"DROP TABLE {TABLE}")
+        connection.execute(f"DROP TABLE {V3_TABLE}")
     finally:
         connection.close()
 

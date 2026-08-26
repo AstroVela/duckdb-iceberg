@@ -24,6 +24,7 @@ SCHEMA_EVOLUTION_NAME = "vane_wheel_ray_schema_evolution"
 CONFLICT_NAME = "vane_wheel_ray_conflict"
 V3_CTAS_NAME = "vane_wheel_ray_v3_ctas"
 V3_COMPAT_NAME = "vane_wheel_ray_v3_compat"
+V3_DELETE_NAME = "vane_wheel_ray_v3_delete"
 V3_SNAPSHOT_CONFLICT_NAME = "vane_wheel_ray_v3_snapshot_conflict"
 V3_SCHEMA_CONFLICT_NAME = "vane_wheel_ray_v3_schema_conflict"
 V3_SPEC_CONFLICT_NAME = "vane_wheel_ray_v3_spec_conflict"
@@ -36,6 +37,7 @@ SCHEMA_EVOLUTION_TABLE = f"{CATALOG_NAME}.default.{SCHEMA_EVOLUTION_NAME}"
 CONFLICT_TABLE = f"{CATALOG_NAME}.default.{CONFLICT_NAME}"
 V3_CTAS_TABLE = f"{CATALOG_NAME}.default.{V3_CTAS_NAME}"
 V3_COMPAT_TABLE = f"{CATALOG_NAME}.default.{V3_COMPAT_NAME}"
+V3_DELETE_TABLE = f"{CATALOG_NAME}.default.{V3_DELETE_NAME}"
 V3_SNAPSHOT_CONFLICT_TABLE = f"{CATALOG_NAME}.default.{V3_SNAPSHOT_CONFLICT_NAME}"
 V3_SCHEMA_CONFLICT_TABLE = f"{CATALOG_NAME}.default.{V3_SCHEMA_CONFLICT_NAME}"
 V3_SPEC_CONFLICT_TABLE = f"{CATALOG_NAME}.default.{V3_SPEC_CONFLICT_NAME}"
@@ -49,6 +51,7 @@ TABLES = (
     CONFLICT_TABLE,
     V3_CTAS_TABLE,
     V3_COMPAT_TABLE,
+    V3_DELETE_TABLE,
     V3_SNAPSHOT_CONFLICT_TABLE,
     V3_SCHEMA_CONFLICT_TABLE,
     V3_SPEC_CONFLICT_TABLE,
@@ -865,6 +868,122 @@ def exercise_v3_reads_and_append(harness: RayIcebergHarness) -> None:
     )
 
 
+def exercise_v3_distributed_delete(harness: RayIcebergHarness) -> None:
+    connection = harness.connection
+    vane = harness.vane
+
+    # This partitioned table already has two native Puffin deletion vectors and
+    # two distributed append partitions. Delete from both existing-DV files and
+    # one appended file so the workers must replace and create DVs in one run.
+    lineage_before_delete = harness.require_query(
+        f"SELECT id, _row_id, _last_updated_sequence_number FROM {V3_COMPAT_TABLE} ORDER BY id",
+        "Iceberg v3 lineage before distributed DELETE",
+    )
+    harness.require_write(
+        "distributed Iceberg v3 DELETE with existing deletion vectors",
+        lambda: connection.table(V3_COMPAT_TABLE).delete(condition=vane.ColumnExpression("id").isin(2, 5, 1000)),
+    )
+    expected_lineage = [row for row in lineage_before_delete if row[0] not in {2, 5, 1000}]
+    harness.require_query(
+        f"SELECT id, _row_id, _last_updated_sequence_number FROM {V3_COMPAT_TABLE} ORDER BY id",
+        "distributed v3 DELETE result and unchanged row lineage",
+        expected_lineage,
+    )
+    partitioned_deletion_vectors = connection.execute(
+        f"SELECT file_path FROM iceberg_metadata({V3_COMPAT_TABLE}) "
+        "WHERE content = 'POSITION_DELETES' AND status != 'DELETED' ORDER BY file_path"
+    ).fetchall()
+    require_equal(
+        len(partitioned_deletion_vectors),
+        3,
+        "distributed v3 DELETE must replace two existing DVs and add one new DV",
+    )
+    require_true(
+        all(str(row[0]).endswith(".puffin") for row in partitioned_deletion_vectors),
+        f"distributed v3 DELETE produced non-Puffin artifacts: {partitioned_deletion_vectors!r}",
+    )
+    require_equal(
+        connection.execute(
+            f"SELECT sequence_number, operation FROM iceberg_snapshots({V3_COMPAT_TABLE}) ORDER BY sequence_number"
+        ).fetchall(),
+        [(1, "append"), (2, "delete"), (3, "append"), (4, "delete")],
+        "distributed v3 DELETE snapshot history",
+    )
+
+    snapshots_before_zero_match = connection.execute(
+        f"SELECT count(*) FROM iceberg_snapshots({V3_COMPAT_TABLE})"
+    ).fetchone()
+    harness.require_write(
+        "zero-match distributed Iceberg v3 DELETE",
+        lambda: connection.table(V3_COMPAT_TABLE).delete(
+            condition=vane.ColumnExpression("id") == vane.ConstantExpression(-1)
+        ),
+    )
+    require_equal(
+        connection.execute(f"SELECT count(*) FROM iceberg_snapshots({V3_COMPAT_TABLE})").fetchone(),
+        snapshots_before_zero_match,
+        "zero-match distributed v3 DELETE must not create a snapshot",
+    )
+    harness.require_rejected_write(
+        "distributed Iceberg v3 UPDATE remains out of scope",
+        lambda: connection.table(V3_COMPAT_TABLE).update(
+            {"category": vane.ConstantExpression("unsupported")},
+            condition=vane.ColumnExpression("id") == vane.ConstantExpression(0),
+        ),
+        "Distributed Iceberg UPDATE currently supports format-version 2 tables only",
+    )
+
+    # Qualify the same replacement protocol for an unpartitioned single-file
+    # table and then verify a stale source snapshot is rejected fail-closed.
+    connection.execute(
+        f"CREATE TABLE {V3_DELETE_TABLE} (id INTEGER, payload VARCHAR) "
+        f"WITH ('format-version' = '3', 'write.data.path' = '{DATA_ROOT}/v3-delete')"
+    )
+    connection.execute(
+        f"INSERT INTO {V3_DELETE_TABLE} "
+        "SELECT i::INTEGER, ('value-' || i::VARCHAR)::VARCHAR FROM range(16) AS source(i)"
+    )
+    connection.execute(f"DELETE FROM {V3_DELETE_TABLE} WHERE id IN (1, 3)")
+    harness.require_write(
+        "unpartitioned distributed Iceberg v3 DELETE with an existing DV",
+        lambda: connection.table(V3_DELETE_TABLE).delete(condition=vane.ColumnExpression("id").isin(5, 7, 9)),
+    )
+    harness.require_query(
+        f"SELECT id FROM {V3_DELETE_TABLE} ORDER BY id",
+        "unpartitioned distributed v3 DELETE result",
+        [(row_id,) for row_id in range(16) if row_id not in {1, 3, 5, 7, 9}],
+    )
+    unpartitioned_deletion_vectors = connection.execute(
+        f"SELECT file_path FROM iceberg_metadata({V3_DELETE_TABLE}) "
+        "WHERE content = 'POSITION_DELETES' AND status != 'DELETED'"
+    ).fetchall()
+    require_equal(len(unpartitioned_deletion_vectors), 1, "unpartitioned v3 DELETE DV consolidation")
+    require_true(
+        str(unpartitioned_deletion_vectors[0][0]).endswith(".puffin"),
+        f"unpartitioned distributed v3 DELETE did not write Puffin: {unpartitioned_deletion_vectors!r}",
+    )
+
+    stale_delete_plan = harness.capture_write_plan(
+        lambda: connection.table(V3_DELETE_TABLE).delete(
+            condition=vane.ColumnExpression("id") == vane.ConstantExpression(11)
+        )
+    )
+    connection.execute(f"INSERT INTO {V3_DELETE_TABLE} VALUES (100, 'concurrent')")
+    client = harness.runner.query_driver_client
+    if client is None:
+        raise AssertionError("the Ray runner did not create a query driver client")
+    harness.require_error(
+        "stale distributed v3 DELETE source snapshot",
+        lambda: client.run_copy_plan(stale_delete_plan),
+        "snapshot changed between the distributed DELETE source scan and write planning",
+    )
+    harness.require_query(
+        f"SELECT count(*)::BIGINT FROM {V3_DELETE_TABLE} WHERE id = 11",
+        "stale distributed v3 DELETE did not commit",
+        [(1,)],
+    )
+
+
 def exercise_v3_conflicts(harness: RayIcebergHarness) -> None:
     connection = harness.connection
     vane = harness.vane
@@ -1263,6 +1382,7 @@ def main() -> None:
         )
         run_scenario("version-aware distributed CTAS", lambda: exercise_versioned_ctas(harness))
         run_scenario("v3 distributed reads and append", lambda: exercise_v3_reads_and_append(harness))
+        run_scenario("v3 distributed DELETE", lambda: exercise_v3_distributed_delete(harness))
         run_scenario("v3 fail-closed write conflicts", lambda: exercise_v3_conflicts(harness))
         run_scenario("distributed CTAS failure cleanup", lambda: exercise_ctas_failure_cleanup(harness))
         run_scenario("source positional deletes", lambda: exercise_source_positional_deletes(harness))
@@ -1273,8 +1393,8 @@ def main() -> None:
             "conflicts and fail-closed writes",
             lambda: exercise_conflicts_and_fail_closed_writes(harness),
         )
-        require_true(harness.read_dispatch_count >= 23, "comprehensive suite did not exercise enough Ray reads")
-        require_true(harness.write_dispatch_count >= 20, "comprehensive suite did not exercise enough Ray writes")
+        require_true(harness.read_dispatch_count >= 26, "comprehensive suite did not exercise enough Ray reads")
+        require_true(harness.write_dispatch_count >= 24, "comprehensive suite did not exercise enough Ray writes")
 
         drop_test_tables(connection)
     finally:

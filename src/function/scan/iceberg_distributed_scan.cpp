@@ -31,6 +31,7 @@ namespace duckdb {
 
 namespace {
 
+static constexpr uint32_t ICEBERG_DISTRIBUTED_SCAN_PROTOCOL_VERSION = 2;
 static constexpr const char *ICEBERG_DISTRIBUTED_SCAN_SPLIT_CODEC = "iceberg.scan-file";
 
 static string SerializeWorkerMetadata(const IcebergTableMetadata &metadata) {
@@ -293,6 +294,31 @@ static void SerializeEqualityDeletes(Serializer &serializer,
 	});
 }
 
+static void SerializeEqualityDeleteValues(Serializer &serializer,
+                                          const vector<IcebergDistributedEqualityDeleteRow> &delete_rows) {
+	serializer.WriteList(5, "equality_delete_rows", delete_rows.size(), [&](Serializer::List &list, idx_t row_index) {
+		auto &row = delete_rows[row_index];
+		vector<int32_t> field_ids;
+		field_ids.reserve(row.values.size());
+		for (const auto &entry : row.values) {
+			field_ids.push_back(entry.first);
+		}
+		std::sort(field_ids.begin(), field_ids.end());
+		list.WriteObject([&](Serializer &row_serializer) {
+			row_serializer.WriteList(1, "filters", field_ids.size(),
+			                         [&](Serializer::List &filters, idx_t filter_index) {
+				                         auto field_id = field_ids[filter_index];
+				                         auto value = row.values.find(field_id);
+				                         D_ASSERT(value != row.values.end());
+				                         filters.WriteObject([&](Serializer &filter_serializer) {
+					                         filter_serializer.WriteProperty(1, "field_id", field_id);
+					                         filter_serializer.WriteProperty(2, "value", value->second);
+				                         });
+			                         });
+		});
+	});
+}
+
 static vector<IcebergDistributedEqualityDeleteRow> DeserializeEqualityDeletes(Deserializer &deserializer) {
 	vector<IcebergDistributedEqualityDeleteRow> result;
 	deserializer.ReadList(5, "equality_delete_rows", [&](Deserializer::List &list, idx_t) {
@@ -327,13 +353,15 @@ struct IcebergDistributedScanSplitPayload {
 	IcebergManifestEntry manifest_entry;
 	vector<int64_t> positional_delete_rows;
 	vector<IcebergDistributedEqualityDeleteRow> equality_delete_rows;
+	string existing_deletion_vector_path;
 };
 
 static string SerializeScanSplitPayload(const string &scan_split_set_id, const string &resolved_path,
                                         const IcebergManifestFile &manifest_file,
                                         const BoundIcebergManifestEntry &manifest_entry,
                                         const vector<int64_t> &positional_delete_rows,
-                                        const vector<reference<const IcebergEqualityDeleteRow>> &equality_delete_rows) {
+                                        const vector<reference<const IcebergEqualityDeleteRow>> &equality_delete_rows,
+                                        const string &existing_deletion_vector_path) {
 	MemoryStream stream(Allocator::DefaultAllocator());
 	BinarySerializer serializer(stream);
 	serializer.Begin();
@@ -345,6 +373,7 @@ static string SerializeScanSplitPayload(const string &scan_split_set_id, const s
 	serializer.WriteProperty(4, "positional_delete_rows", positional_delete_rows);
 	SerializeEqualityDeletes(serializer, equality_delete_rows);
 	serializer.WriteProperty(6, "scan_split_set_id", scan_split_set_id);
+	serializer.WriteProperty(7, "existing_deletion_vector_path", existing_deletion_vector_path);
 	serializer.End();
 	return string(reinterpret_cast<const char *>(stream.GetData()), stream.GetPosition());
 }
@@ -366,6 +395,7 @@ static IcebergDistributedScanSplitPayload DeserializeScanSplitPayload(const stri
 	result.positional_delete_rows = deserializer.ReadProperty<vector<int64_t>>(4, "positional_delete_rows");
 	result.equality_delete_rows = DeserializeEqualityDeletes(deserializer);
 	result.scan_split_set_id = deserializer.ReadProperty<string>(6, "scan_split_set_id");
+	result.existing_deletion_vector_path = deserializer.ReadProperty<string>(7, "existing_deletion_vector_path");
 	deserializer.End();
 	if (result.scan_split_set_id.empty() || result.resolved_path.empty()) {
 		throw SerializationException(
@@ -486,6 +516,7 @@ static vector<string> PlanDistributedScanSplitPayloads(const MultiFileBindData &
 		auto manifest_entry = file_list.GetManifestEntry(file_index);
 		auto &manifest_file = file_list.GetManifestFileForEntry(manifest_entry, IcebergManifestContentType::DATA);
 		vector<int64_t> positional_delete_rows;
+		string existing_deletion_vector_path;
 		auto positional_delete_data =
 		    file_list.GetExistingPositionalDeleteData(manifest_entry.entry.data_file.file_path);
 		if (positional_delete_data) {
@@ -495,10 +526,26 @@ static vector<string> PlanDistributedScanSplitPayloads(const MultiFileBindData &
 			for (auto row : sorted_rows) {
 				positional_delete_rows.push_back(NumericCast<int64_t>(row));
 			}
+			if (positional_delete_data->type == IcebergDeleteType::DELETION_VECTOR) {
+				if (positional_delete_data->entries.size() != 1) {
+					throw InvalidConfigurationException(
+					    "Distributed Iceberg scan found multiple deletion vectors for data file '%s'",
+					    manifest_entry.entry.data_file.file_path);
+				}
+				auto &delete_file = positional_delete_data->entries[0].entry.data_file;
+				if (delete_file.file_path.empty() || !StringUtil::CIEquals(delete_file.file_format, "puffin") ||
+				    delete_file.referenced_data_file != manifest_entry.entry.data_file.file_path) {
+					throw InvalidConfigurationException(
+					    "Distributed Iceberg scan found an invalid deletion vector for data file '%s'",
+					    manifest_entry.entry.data_file.file_path);
+				}
+				existing_deletion_vector_path = delete_file.file_path;
+			}
 		}
 		auto equality_delete_rows = file_list.GetEqualityDeletesForFile(manifest_entry);
 		payloads.push_back(SerializeScanSplitPayload(scan_split_set_id, files[file_index].path, manifest_file,
-		                                             manifest_entry, positional_delete_rows, equality_delete_rows));
+		                                             manifest_entry, positional_delete_rows, equality_delete_rows,
+		                                             existing_deletion_vector_path));
 	}
 	return payloads;
 }
@@ -971,7 +1018,7 @@ IcebergPlanDistributedScanSplits(const TableFunctionDistributedScanPlanningInput
 		auto manifest_entry = planned_file_list.GetManifestEntry(file_index);
 		DistributedScanSplit split;
 		split.split_id = std::to_string(file_index);
-		split.payload = planned_file_list.GetDistributedScanSplitPayload(file_index);
+		split.payload = planned_file_list.GetDistributedWorkerScanSplitPayload(file_index);
 		auto record_count = manifest_entry.entry.data_file.record_count;
 		auto file_size = manifest_entry.entry.data_file.file_size_in_bytes;
 		if (record_count < 0 || file_size < 0) {
@@ -1112,7 +1159,9 @@ struct IcebergDistributedScanState::FileState {
 	          optional_ptr<const unordered_map<int32_t, idx_t>> field_id_to_output_index,
 	          optional_ptr<const unordered_map<int32_t, LogicalType>> field_id_to_type)
 	    : manifest_list_entry(std::move(split.manifest_file)), resolved_path(std::move(split.resolved_path)),
-	      split_payload(std::move(split_payload_p)), equality_delete_values(std::move(split.equality_delete_rows)) {
+	      split_payload(std::move(split_payload_p)),
+	      existing_deletion_vector_path(std::move(split.existing_deletion_vector_path)),
+	      equality_delete_values(std::move(split.equality_delete_rows)) {
 		if (field_id_to_output_index) {
 			if (!field_id_to_type) {
 				throw InternalException("Distributed Iceberg worker equality-delete types are missing");
@@ -1160,6 +1209,7 @@ struct IcebergDistributedScanState::FileState {
 	unique_ptr<BoundIcebergManifestEntry> bound_entry;
 	string resolved_path;
 	string split_payload;
+	string existing_deletion_vector_path;
 	OpenFileInfo file;
 	shared_ptr<IcebergPositionalDeleteData> positional_deletes;
 	vector<IcebergDistributedEqualityDeleteRow> equality_delete_values;
@@ -1173,7 +1223,7 @@ IcebergDistributedScanState::~IcebergDistributedScanState() = default;
 void IcebergDistributedScanState::LoadSplitPayloads(
     vector<string> payloads, const string &expected_scan_split_set_id,
     optional_ptr<const unordered_map<int32_t, idx_t>> field_id_to_output_index,
-    optional_ptr<const unordered_map<int32_t, LogicalType>> field_id_to_type) {
+    optional_ptr<const unordered_map<int32_t, LogicalType>> field_id_to_type, bool allow_coordinator_only_state) {
 	if (expected_scan_split_set_id.empty()) {
 		throw InternalException("Distributed Iceberg scan split set identity cannot be empty");
 	}
@@ -1182,6 +1232,10 @@ void IcebergDistributedScanState::LoadSplitPayloads(
 	unordered_set<string> paths;
 	for (idx_t index = 0; index < payloads.size(); index++) {
 		auto decoded = DeserializeScanSplitPayload(payloads[index]);
+		if (!allow_coordinator_only_state && !decoded.existing_deletion_vector_path.empty()) {
+			throw InvalidInputException(
+			    "Distributed Iceberg worker split contains coordinator-only deletion-vector state");
+		}
 		if (decoded.scan_split_set_id != expected_scan_split_set_id) {
 			throw InvalidInputException(
 			    "Distributed Iceberg scan received a split from another planned scan split set");
@@ -1206,7 +1260,7 @@ void IcebergDistributedScanState::InitializePlannedScan(vector<string> payloads,
 	    (!has_snapshot && snapshot_id != 0)) {
 		throw InternalException("Distributed Iceberg planned scan has an invalid source identity");
 	}
-	LoadSplitPayloads(std::move(payloads), scan_split_set_id, nullptr, nullptr);
+	LoadSplitPayloads(std::move(payloads), scan_split_set_id, nullptr, nullptr, true);
 	planned_scan_info = std::move(scan_info);
 	planned_scan_split_set_id = std::move(scan_split_set_id);
 	planned_table_uuid = std::move(table_uuid);
@@ -1256,7 +1310,7 @@ void IcebergDistributedScanState::AssignWorkerSplits(vector<string> payloads) {
 		throw InternalException("Distributed Iceberg split assignment requires an unassigned worker scan template");
 	}
 	LoadSplitPayloads(std::move(payloads), worker_scan_info.scan_split_set_id,
-	                  worker_scan_info.field_id_to_output_index, worker_scan_info.field_id_to_type);
+	                  worker_scan_info.field_id_to_output_index, worker_scan_info.field_id_to_type, false);
 	phase = Phase::WORKER_ASSIGNED;
 }
 
@@ -1338,6 +1392,39 @@ string IcebergDistributedScanState::GetPlannedSplitPayload(idx_t file_id) const 
 		                        static_cast<unsigned long long>(file_id));
 	}
 	return files[file_id]->split_payload;
+}
+
+string IcebergDistributedScanState::GetWorkerSplitPayload(idx_t file_id) const {
+	if (phase != Phase::PLANNED || file_id >= files.size()) {
+		throw InternalException("Distributed Iceberg planned split index %llu is unavailable",
+		                        static_cast<unsigned long long>(file_id));
+	}
+	auto &file = *files[file_id];
+	vector<int64_t> positional_delete_rows;
+	if (file.positional_deletes) {
+		set<idx_t> rows;
+		file.positional_deletes->ToSet(rows);
+		positional_delete_rows.reserve(rows.size());
+		for (auto row : rows) {
+			positional_delete_rows.push_back(NumericCast<int64_t>(row));
+		}
+	}
+
+	MemoryStream stream(Allocator::DefaultAllocator());
+	BinarySerializer serializer(stream);
+	serializer.Begin();
+	serializer.WriteProperty(1, "resolved_path", file.resolved_path);
+	serializer.WriteObject(2, "manifest_file",
+	                       [&](Serializer &object) { SerializeManifestFile(object, file.manifest_list_entry.file); });
+	serializer.WriteObject(3, "manifest_entry", [&](Serializer &object) {
+		SerializeManifestEntry(object, *file.bound_entry, file.manifest_list_entry.file);
+	});
+	serializer.WriteProperty(4, "positional_delete_rows", positional_delete_rows);
+	SerializeEqualityDeleteValues(serializer, file.equality_delete_values);
+	serializer.WriteProperty(6, "scan_split_set_id", planned_scan_split_set_id);
+	serializer.WriteProperty(7, "existing_deletion_vector_path", string());
+	serializer.End();
+	return string(reinterpret_cast<const char *>(stream.GetData()), stream.GetPosition());
 }
 
 vector<int32_t> IcebergDistributedScanState::GetEqualityDeleteFieldIds() const {
@@ -1460,6 +1547,18 @@ shared_ptr<IcebergDeleteData> IcebergDistributedScanState::GetPositionalDeleteDa
 	return nullptr;
 }
 
+const string &IcebergDistributedScanState::GetExistingDeletionVectorPath(const string &file_path) const {
+	if (phase != Phase::PLANNED) {
+		throw InternalException("Distributed Iceberg deletion-vector lookup requires planned scan state");
+	}
+	for (const auto &file : files) {
+		if (file->resolved_path == file_path || file->DataFile().file_path == file_path) {
+			return file->existing_deletion_vector_path;
+		}
+	}
+	throw InternalException("Could not find distributed Iceberg data file '%s'", file_path);
+}
+
 vector<reference<const IcebergEqualityDeleteRow>>
 IcebergDistributedScanState::GetEqualityDeletes(const BoundIcebergManifestEntry &entry) const {
 	RequireWorkerSplitsAssigned();
@@ -1484,8 +1583,8 @@ void ConfigureIcebergDistributedScan(TableFunction &function) {
 	function.deserialize = IcebergDistributedScanDeserialize;
 	function.init_global = IcebergDistributedScanInitGlobal;
 	TableFunctionDistributedScanCallbacks callbacks;
-	callbacks.protocol_version = 1;
-	callbacks.split_codec = {ICEBERG_DISTRIBUTED_SCAN_SPLIT_CODEC, 1};
+	callbacks.protocol_version = ICEBERG_DISTRIBUTED_SCAN_PROTOCOL_VERSION;
+	callbacks.split_codec = {ICEBERG_DISTRIBUTED_SCAN_SPLIT_CODEC, ICEBERG_DISTRIBUTED_SCAN_PROTOCOL_VERSION};
 	callbacks.bind_data_mode = TableFunctionDistributedBindDataMode::REQUIRED;
 	callbacks.plan_splits = IcebergPlanDistributedScanSplits;
 	callbacks.create_worker_bind = IcebergCreateDistributedWorkerBind;
