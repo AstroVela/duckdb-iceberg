@@ -413,6 +413,78 @@ vector<data_t> IcebergDeletionVectorData::ToBlob(const map<int32_t, roaring::Roa
 	Store<uint32_t>(BSwap(crc.GetValue()), blob_ptr);
 	return blob_output;
 }
+
+map<int32_t, roaring::Roaring> IcebergDeletionVectorData::DecodeBlob(const string &blob) {
+	static constexpr data_t DELETION_VECTOR_MAGIC[] = {0xD1, 0xD3, 0x39, 0x64};
+	static constexpr idx_t FIXED_SIZE =
+	    sizeof(uint32_t) + sizeof(DELETION_VECTOR_MAGIC) + sizeof(uint64_t) + sizeof(uint32_t);
+	if (blob.size() < FIXED_SIZE) {
+		throw SerializationException("Distributed Iceberg deletion-vector blob is truncated");
+	}
+
+	auto cursor = reinterpret_cast<const_data_ptr_t>(blob.data());
+	auto end = cursor + blob.size();
+	auto checksum_start = end - sizeof(uint32_t);
+	auto vector_size = BSwap(Load<uint32_t>(cursor));
+	if (NumericCast<idx_t>(vector_size) != blob.size() - 2 * sizeof(uint32_t)) {
+		throw SerializationException("Distributed Iceberg deletion-vector blob has an invalid length");
+	}
+	cursor += sizeof(uint32_t);
+	auto checksummed_data_start = cursor;
+	if (memcmp(cursor, DELETION_VECTOR_MAGIC, sizeof(DELETION_VECTOR_MAGIC)) != 0) {
+		throw SerializationException("Distributed Iceberg deletion-vector blob has invalid magic");
+	}
+	cursor += sizeof(DELETION_VECTOR_MAGIC);
+
+	auto bitmap_count = Load<uint64_t>(cursor);
+	cursor += sizeof(uint64_t);
+	if (bitmap_count == 0 || bitmap_count > NumericCast<uint64_t>((checksum_start - cursor) / sizeof(int32_t))) {
+		throw SerializationException("Distributed Iceberg deletion-vector blob has an invalid bitmap count");
+	}
+
+	map<int32_t, roaring::Roaring> result;
+	int32_t previous_key = -1;
+	for (uint64_t index = 0; index < bitmap_count; index++) {
+		if (checksum_start - cursor <= NumericCast<int64_t>(sizeof(int32_t))) {
+			throw SerializationException("Distributed Iceberg deletion-vector blob has a truncated bitmap");
+		}
+		auto key = Load<int32_t>(cursor);
+		cursor += sizeof(int32_t);
+		if (key < 0 || key <= previous_key) {
+			throw SerializationException("Distributed Iceberg deletion-vector bitmap keys are invalid");
+		}
+		previous_key = key;
+
+		auto remaining = NumericCast<idx_t>(checksum_start - cursor);
+		auto bitmap_size =
+		    roaring::api::roaring_bitmap_portable_deserialize_size(reinterpret_cast<const char *>(cursor), remaining);
+		if (bitmap_size == 0 || bitmap_size > remaining) {
+			throw SerializationException("Distributed Iceberg deletion-vector blob has an invalid bitmap");
+		}
+		try {
+			auto bitmap = roaring::Roaring::readSafe(reinterpret_cast<const char *>(cursor), bitmap_size);
+			if (bitmap.isEmpty() || bitmap.getSizeInBytes(true) != bitmap_size) {
+				throw SerializationException("Distributed Iceberg deletion-vector blob has a non-canonical bitmap");
+			}
+			result.emplace(key, std::move(bitmap));
+		} catch (const SerializationException &) {
+			throw;
+		} catch (const std::exception &ex) {
+			throw SerializationException("Distributed Iceberg deletion-vector bitmap is invalid: %s", ex.what());
+		}
+		cursor += bitmap_size;
+	}
+	if (cursor != checksum_start) {
+		throw SerializationException("Distributed Iceberg deletion-vector blob contains trailing bitmap data");
+	}
+
+	CRC32 crc;
+	crc.Update(checksummed_data_start, checksum_start - checksummed_data_start);
+	if (BSwap(Load<uint32_t>(checksum_start)) != crc.GetValue()) {
+		throw SerializationException("Distributed Iceberg deletion-vector blob has an invalid checksum");
+	}
+	return result;
+}
 #endif
 
 vector<data_t> IcebergDeletionVectorData::ToPuffinFile(const vector<data_t> &blob, const string &referenced_data_file,

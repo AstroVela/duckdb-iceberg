@@ -29,6 +29,7 @@
 #include "catalog/rest/catalog_entry/table/iceberg_table_information.hpp"
 #include "common/iceberg_utils.hpp"
 #include "core/deletes/iceberg_deletion_vector.hpp"
+#include "core/deletes/iceberg_positional_delete.hpp"
 #include "planning/iceberg_multi_file_list.hpp"
 
 namespace duckdb {
@@ -82,7 +83,7 @@ void ValidateIcebergDistributedRowDeltaSourceSpecs(const IcebergMultiFileList &f
 
 namespace {
 
-static constexpr uint32_t ICEBERG_ROW_DELTA_PROTOCOL_VERSION = 2;
+static constexpr uint32_t ICEBERG_ROW_DELTA_PROTOCOL_VERSION = 3;
 static const string ICEBERG_ROW_DELTA_FRAGMENT_CODEC = "iceberg.row-delta-fragment";
 static const DistributedPayloadCodec ICEBERG_DATA_FILE_CODEC {"iceberg.data-file", 1};
 static const DistributedPayloadCodec ICEBERG_POSITION_DELETE_FILE_CODEC {"iceberg.position-delete-file", 1};
@@ -92,7 +93,9 @@ struct IcebergDistributedDeleteSourceState {
 	string scan_file_path;
 	string data_file_path;
 	idx_t record_count = 0;
-	vector<int64_t> existing_delete_rows;
+	//! Portable deletion-vector-v1 bytes. Keep historical deletes compressed in
+	//! the shared worker bind and decode only a file that receives new deletes.
+	string existing_delete_blob;
 };
 
 struct IcebergDistributedRowDeltaBind {
@@ -111,6 +114,72 @@ static idx_t CheckedAdd(idx_t left, idx_t right, const string &description) {
 		throw InvalidInputException("Iceberg distributed row-delta %s overflow", description);
 	}
 	return left + right;
+}
+
+static idx_t ValidateExistingDeleteBitmaps(const map<int32_t, roaring::Roaring> &bitmaps, idx_t record_count) {
+	idx_t delete_count = 0;
+	for (const auto &entry : bitmaps) {
+		if (entry.first < 0 || entry.second.isEmpty()) {
+			throw SerializationException("Iceberg distributed v3 DELETE contains an invalid existing delete bitmap");
+		}
+		auto cardinality = entry.second.cardinality();
+		if (cardinality > NumericLimits<idx_t>::Maximum() - delete_count) {
+			throw SerializationException("Iceberg distributed v3 DELETE existing delete count overflow");
+		}
+		delete_count += NumericCast<idx_t>(cardinality);
+		auto maximum = (static_cast<uint64_t>(entry.first) << 32) | entry.second.maximum();
+		if (maximum >= record_count) {
+			throw SerializationException("Iceberg distributed v3 DELETE contains an out-of-range existing delete row");
+		}
+	}
+	return delete_count;
+}
+
+static map<int32_t, roaring::Roaring> DecodeExistingDeleteBlob(const string &blob, idx_t record_count) {
+	if (blob.empty()) {
+		return {};
+	}
+	auto bitmaps = IcebergDeletionVectorData::DecodeBlob(blob);
+	ValidateExistingDeleteBitmaps(bitmaps, record_count);
+	return bitmaps;
+}
+
+static void AddExistingDeleteRow(map<int32_t, roaring::Roaring> &bitmaps, int64_t row, idx_t record_count) {
+	if (row < 0 || NumericCast<idx_t>(row) >= record_count) {
+		throw InvalidConfigurationException("Distributed Iceberg v3 DELETE source contains an out-of-range delete row");
+	}
+	auto high_bits = NumericCast<int32_t>(static_cast<uint64_t>(row) >> 32);
+	auto low_bits = static_cast<uint32_t>(row & 0xFFFFFFFF);
+	if (!bitmaps[high_bits].addChecked(low_bits)) {
+		throw InvalidConfigurationException("Distributed Iceberg v3 DELETE source contains duplicate delete rows");
+	}
+}
+
+static string EncodeExistingDeleteBlob(const IcebergDeleteData &delete_data, idx_t record_count) {
+	map<int32_t, roaring::Roaring> bitmaps;
+	if (delete_data.type == IcebergDeleteType::DELETION_VECTOR) {
+		auto &deletion_vector = static_cast<const IcebergDeletionVectorData &>(delete_data);
+		for (const auto &entry : deletion_vector.bitmaps) {
+			if (!bitmaps.emplace(entry.first, entry.second).second) {
+				throw InvalidConfigurationException(
+				    "Distributed Iceberg v3 DELETE source contains duplicate deletion-vector bitmap keys");
+			}
+		}
+	} else {
+		auto &positional_deletes = static_cast<const IcebergPositionalDeleteData &>(delete_data);
+		for (auto row : positional_deletes.invalid_rows) {
+			AddExistingDeleteRow(bitmaps, row, record_count);
+		}
+	}
+	if (bitmaps.empty()) {
+		return {};
+	}
+	for (auto &entry : bitmaps) {
+		entry.second.runOptimize();
+	}
+	ValidateExistingDeleteBitmaps(bitmaps, record_count);
+	auto blob = IcebergDeletionVectorData::ToBlob(bitmaps);
+	return string(reinterpret_cast<const char *>(blob.data()), blob.size());
 }
 
 static void ValidateIcebergSignedFileCounts(idx_t row_count, idx_t file_size_bytes, const string &description) {
@@ -238,7 +307,7 @@ static string SerializeBind(const IcebergDistributedRowDeltaBind &bind) {
 			object.WriteProperty(1, "scan_file_path", source.scan_file_path);
 			object.WriteProperty(2, "data_file_path", source.data_file_path);
 			object.WriteProperty(3, "record_count", source.record_count);
-			object.WriteProperty(4, "existing_delete_rows", source.existing_delete_rows);
+			object.WriteProperty(4, "existing_delete_blob", source.existing_delete_blob);
 		});
 	});
 	serializer.End();
@@ -270,7 +339,7 @@ static IcebergDistributedRowDeltaBind DeserializeBind(const string &bytes) {
 			source.scan_file_path = object.ReadProperty<string>(1, "scan_file_path");
 			source.data_file_path = object.ReadProperty<string>(2, "data_file_path");
 			source.record_count = object.ReadProperty<idx_t>(3, "record_count");
-			source.existing_delete_rows = object.ReadProperty<vector<int64_t>>(4, "existing_delete_rows");
+			source.existing_delete_blob = object.ReadProperty<string>(4, "existing_delete_blob");
 		});
 		result.delete_sources.push_back(std::move(source));
 	});
@@ -303,13 +372,7 @@ static IcebergDistributedRowDeltaBind DeserializeBind(const string &bytes) {
 		    !scan_paths.insert(source.scan_file_path).second || !data_paths.insert(source.data_file_path).second) {
 			throw SerializationException("Iceberg distributed v3 DELETE contains invalid source-file state");
 		}
-		int64_t previous_row = -1;
-		for (auto row : source.existing_delete_rows) {
-			if (row < 0 || NumericCast<idx_t>(row) >= source.record_count || row <= previous_row) {
-				throw SerializationException("Iceberg distributed v3 DELETE contains invalid existing delete rows");
-			}
-			previous_row = row;
-		}
+		DecodeExistingDeleteBlob(source.existing_delete_blob, source.record_count);
 	}
 	return result;
 }
@@ -673,32 +736,31 @@ static IcebergDistributedDeleteFileResult WritePositionDeleteFile(ClientContext 
 static IcebergDistributedDeleteFileResult WriteDeletionVectorFile(ClientContext &context, const string &output_path,
                                                                   const IcebergDistributedDeleteSourceState &source,
                                                                   const vector<idx_t> &new_row_positions) {
-	set<idx_t> new_deletes(new_row_positions.begin(), new_row_positions.end());
-	if (new_deletes.empty() || new_deletes.size() != new_row_positions.size()) {
+	if (new_row_positions.empty()) {
 		throw NotImplementedException(
 		    "The same Iceberg row was modified multiple times in one distributed write; eliminate duplicate matches");
 	}
 
-	set<idx_t> combined_deletes;
-	for (auto row : source.existing_delete_rows) {
-		combined_deletes.insert(NumericCast<idx_t>(row));
-	}
-	for (auto row : new_deletes) {
-		if (row >= source.record_count || !combined_deletes.insert(row).second) {
+	auto bitmaps = DecodeExistingDeleteBlob(source.existing_delete_blob, source.record_count);
+	auto existing_delete_count = ValidateExistingDeleteBitmaps(bitmaps, source.record_count);
+	for (auto row : new_row_positions) {
+		if (row >= source.record_count) {
+			throw InvalidInputException(
+			    "Iceberg distributed v3 DELETE attempted to replace an invalid or already-deleted row");
+		}
+		auto high_bits = NumericCast<int32_t>(static_cast<uint64_t>(row) >> 32);
+		auto low_bits = static_cast<uint32_t>(row & 0xFFFFFFFF);
+		if (!bitmaps[high_bits].addChecked(low_bits)) {
 			throw InvalidInputException(
 			    "Iceberg distributed v3 DELETE attempted to replace an invalid or already-deleted row");
 		}
 	}
-
-	map<int32_t, roaring::Roaring> bitmaps;
-	for (auto row : combined_deletes) {
-		auto row_id = static_cast<int64_t>(row);
-		auto high_bits = static_cast<int32_t>(row_id >> 32);
-		auto low_bits = static_cast<uint32_t>(row_id & 0xFFFFFFFF);
-		bitmaps[high_bits].add(low_bits);
+	for (auto &entry : bitmaps) {
+		entry.second.runOptimize();
 	}
+	auto delete_count = CheckedAdd(existing_delete_count, new_row_positions.size(), "deletion-vector row count");
 	auto blob = IcebergDeletionVectorData::ToBlob(bitmaps);
-	auto puffin = IcebergDeletionVectorData::ToPuffinFile(blob, source.data_file_path, combined_deletes.size());
+	auto puffin = IcebergDeletionVectorData::ToPuffinFile(blob, source.data_file_path, delete_count);
 	auto &fs = FileSystem::GetFileSystem(context);
 	try {
 		auto handle = fs.OpenFile(output_path, FileOpenFlags::FILE_FLAGS_WRITE | FileOpenFlags::FILE_FLAGS_FILE_CREATE);
@@ -713,13 +775,15 @@ static IcebergDistributedDeleteFileResult WriteDeletionVectorFile(ClientContext 
 	result.data_file_path = source.data_file_path;
 	result.delete_file_path = output_path;
 	result.is_deletion_vector = true;
-	result.new_delete_count = new_deletes.size();
-	result.delete_count = combined_deletes.size();
+	result.new_delete_count = new_row_positions.size();
+	result.delete_count = delete_count;
 	result.file_size_bytes = puffin.size();
 	result.content_offset = 4;
 	result.content_size_in_bytes = blob.size();
-	result.pos_min_value = *combined_deletes.begin();
-	result.pos_max_value = *combined_deletes.rbegin();
+	result.pos_min_value =
+	    NumericCast<idx_t>((static_cast<uint64_t>(bitmaps.begin()->first) << 32) | bitmaps.begin()->second.minimum());
+	result.pos_max_value =
+	    NumericCast<idx_t>((static_cast<uint64_t>(bitmaps.rbegin()->first) << 32) | bitmaps.rbegin()->second.maximum());
 	return result;
 }
 
@@ -959,16 +1023,7 @@ string BuildIcebergDistributedDeleteBind(ClientContext &context, const IcebergTa
 			source.record_count = NumericCast<idx_t>(manifest_entry.entry.data_file.record_count);
 			auto existing_deletes = file_list.GetExistingPositionalDeleteData(source.data_file_path);
 			if (existing_deletes) {
-				set<idx_t> rows;
-				existing_deletes->ToSet(rows);
-				source.existing_delete_rows.reserve(rows.size());
-				for (auto row : rows) {
-					if (row >= source.record_count) {
-						throw InvalidConfigurationException(
-						    "Distributed Iceberg v3 DELETE source contains an out-of-range delete row");
-					}
-					source.existing_delete_rows.push_back(NumericCast<int64_t>(row));
-				}
+				source.existing_delete_blob = EncodeExistingDeleteBlob(*existing_deletes, source.record_count);
 			}
 			bind.delete_sources.push_back(std::move(source));
 		}

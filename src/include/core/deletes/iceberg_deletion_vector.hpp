@@ -25,6 +25,10 @@ public:
 	//! The distributed writer uses an ordered map because the Puffin deletion-vector
 	//! encoding requires bitmap keys to be serialized in unsigned ascending order.
 	static vector<data_t> ToBlob(const map<int32_t, roaring::Roaring> &bitmaps);
+	//! Decode a portable deletion-vector-v1 blob without materializing its row ids.
+	//! Distributed worker binds retain this compact representation until a data file
+	//! actually receives new deletes.
+	static map<int32_t, roaring::Roaring> DecodeBlob(const string &blob);
 #endif
 	//! Wrap a `deletion-vector-v1` blob (from ToBlob) in a spec-compliant Puffin file
 	//! container: leading magic + blob + footer. The blob is placed at offset 4 (right
