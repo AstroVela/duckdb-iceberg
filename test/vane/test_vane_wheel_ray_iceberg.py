@@ -924,14 +924,6 @@ def exercise_v3_distributed_delete(harness: RayIcebergHarness) -> None:
         snapshots_before_zero_match,
         "zero-match distributed v3 DELETE must not create a snapshot",
     )
-    harness.require_rejected_write(
-        "distributed Iceberg v3 UPDATE remains out of scope",
-        lambda: connection.table(V3_COMPAT_TABLE).update(
-            {"category": vane.ConstantExpression("unsupported")},
-            condition=vane.ColumnExpression("id") == vane.ConstantExpression(0),
-        ),
-        "Distributed Iceberg UPDATE currently supports format-version 2 tables only",
-    )
 
     # Qualify the same replacement protocol for an unpartitioned single-file
     # table and then verify a stale source snapshot is rejected fail-closed.
@@ -981,6 +973,232 @@ def exercise_v3_distributed_delete(harness: RayIcebergHarness) -> None:
         f"SELECT count(*)::BIGINT FROM {V3_DELETE_TABLE} WHERE id = 11",
         "stale distributed v3 DELETE did not commit",
         [(1,)],
+    )
+
+
+def exercise_v3_distributed_update(harness: RayIcebergHarness) -> None:
+    connection = harness.connection
+    vane = harness.vane
+
+    variant_snapshot_count = connection.execute(f"SELECT count(*) FROM iceberg_snapshots({V3_COMPAT_TABLE})").fetchone()
+    harness.require_rejected_write(
+        "distributed Iceberg v3 UPDATE rejects raw VARIANT transport",
+        lambda: connection.table(V3_COMPAT_TABLE).update(
+            {"category": vane.ConstantExpression("UNSUPPORTED")},
+            condition=vane.ColumnExpression("id") == vane.ConstantExpression(3),
+        ),
+        "Vane repartition transport cannot preserve raw VARIANT values",
+    )
+    require_equal(
+        connection.execute(f"SELECT count(*) FROM iceberg_snapshots({V3_COMPAT_TABLE})").fetchone(),
+        variant_snapshot_count,
+        "rejected VARIANT UPDATE must not create an Iceberg snapshot",
+    )
+
+    # The partitioned v3 CTAS table has multiple files per identity partition
+    # and nested values that must survive the row rewrite. Seed two native DVs
+    # in the affected partition, then replace them while preserving row lineage.
+    setup_write_count = harness.write_dispatch_count
+    connection.execute(f"DELETE FROM {V3_CTAS_TABLE} WHERE id IN (1, 257)")
+    require_equal(
+        harness.write_dispatch_count,
+        setup_write_count,
+        "coordinator-side v3 UPDATE deletion-vector setup Ray dispatch count",
+    )
+    lineage_before = harness.require_query(
+        f"SELECT id, partition_key, _row_id, _last_updated_sequence_number " f"FROM {V3_CTAS_TABLE} ORDER BY id",
+        "Iceberg v3 lineage before distributed UPDATE",
+    )
+    lineage_by_id = {int(row[0]): row for row in lineage_before}
+    active_dvs_before = connection.execute(
+        f"SELECT file_path FROM iceberg_metadata({V3_CTAS_TABLE}) "
+        "WHERE content = 'POSITION_DELETES' AND status != 'DELETED' ORDER BY file_path"
+    ).fetchall()
+    require_true(bool(active_dvs_before), "partitioned v3 UPDATE setup did not create deletion vectors")
+    updated_ids = {row_id for row_id in range(SOURCE_ROW_COUNT) if row_id % 4 == 1 and row_id not in {1, 257}}
+    harness.require_write(
+        "partitioned distributed Iceberg v3 UPDATE with existing deletion vectors",
+        lambda: connection.table(V3_CTAS_TABLE).update(
+            {"partition_key": vane.ConstantExpression(9)},
+            condition=(vane.ColumnExpression("id") % vane.ConstantExpression(4)) == vane.ConstantExpression(1),
+        ),
+    )
+
+    latest_sequence = connection.execute(
+        f"SELECT max(sequence_number) FROM iceberg_snapshots({V3_CTAS_TABLE})"
+    ).fetchone()[0]
+    lineage_after = harness.require_query(
+        f"SELECT id, partition_key, _row_id, _last_updated_sequence_number " f"FROM {V3_CTAS_TABLE} ORDER BY id",
+        "partitioned distributed v3 UPDATE result and row lineage",
+    )
+    require_equal(
+        [(row[0], row[2]) for row in lineage_after],
+        [(row[0], row[2]) for row in lineage_before],
+        "distributed v3 UPDATE preserved row IDs",
+    )
+    for row in lineage_after:
+        row_id = int(row[0])
+        if row_id in updated_ids:
+            require_equal(row[1], 9, f"distributed v3 UPDATE partition for row {row_id}")
+            require_equal(row[3], latest_sequence, f"distributed v3 UPDATE sequence number for row {row_id}")
+        else:
+            require_equal(
+                row[1],
+                lineage_by_id[row_id][1],
+                f"distributed v3 UPDATE unchanged partition for row {row_id}",
+            )
+            require_equal(
+                row[3],
+                lineage_by_id[row_id][3],
+                f"distributed v3 UPDATE unchanged-row sequence for row {row_id}",
+            )
+    harness.require_query(
+        f"SELECT count(*)::BIGINT FROM {V3_CTAS_TABLE} WHERE partition_key = 9",
+        "distributed v3 UPDATE replacement partition pruning",
+        [(len(updated_ids),)],
+    )
+    harness.require_query(
+        f"SELECT id, details.label, details.ordinal, scores[1], scores[2], attributes['key'] "
+        f"FROM {V3_CTAS_TABLE} WHERE partition_key = 9 AND id IN (5, 261, 1021) ORDER BY id",
+        "distributed v3 UPDATE preserved nested values",
+        [
+            (5, "value-5", 5, 5, 6, "value-5"),
+            (261, "value-261", 261, 261, 262, "value-261"),
+            (1021, "value-1021", 1021, 1021, 1022, "value-1021"),
+        ],
+    )
+
+    active_dvs_after = connection.execute(
+        f"SELECT file_path FROM iceberg_metadata({V3_CTAS_TABLE}) "
+        "WHERE content = 'POSITION_DELETES' AND status != 'DELETED' ORDER BY file_path"
+    ).fetchall()
+    active_dv_paths_before = {str(row[0]) for row in active_dvs_before}
+    active_dv_paths_after = {str(row[0]) for row in active_dvs_after}
+    require_true(
+        active_dv_paths_before.isdisjoint(active_dv_paths_after),
+        "partitioned v3 UPDATE did not replace every affected source file's existing DV",
+    )
+    require_true(
+        len(active_dvs_after) >= len(active_dvs_before),
+        "partitioned v3 UPDATE did not create replacement deletion vectors",
+    )
+    require_true(
+        all(str(row[0]).endswith(".puffin") for row in active_dvs_after),
+        f"partitioned distributed v3 UPDATE produced non-Puffin artifacts: {active_dvs_after!r}",
+    )
+    require_equal(
+        connection.execute(
+            f"SELECT operation FROM iceberg_snapshots({V3_CTAS_TABLE}) " "ORDER BY sequence_number DESC LIMIT 1"
+        ).fetchone(),
+        ("overwrite",),
+        "distributed v3 UPDATE snapshot operation",
+    )
+
+    snapshots_before_zero_match = connection.execute(
+        f"SELECT count(*) FROM iceberg_snapshots({V3_CTAS_TABLE})"
+    ).fetchone()
+    harness.require_write(
+        "zero-match distributed Iceberg v3 UPDATE",
+        lambda: connection.table(V3_CTAS_TABLE).update(
+            {"partition_key": vane.ConstantExpression(10)},
+            condition=vane.ColumnExpression("id") == vane.ConstantExpression(-1),
+        ),
+    )
+    harness.require_write(
+        "optimizer-empty distributed Iceberg v3 UPDATE",
+        lambda: connection.table(V3_CTAS_TABLE).update(
+            {"partition_key": vane.ConstantExpression(11)},
+            condition=vane.ColumnExpression("id") == vane.ConstantExpression(None),
+        ),
+    )
+    require_equal(
+        connection.execute(f"SELECT count(*) FROM iceberg_snapshots({V3_CTAS_TABLE})").fetchone(),
+        snapshots_before_zero_match,
+        "zero-match and optimizer-empty distributed v3 UPDATEs must not create a snapshot",
+    )
+
+    # Reuse the unpartitioned table whose single source file already has a
+    # consolidated DV, then prove that stale UPDATE plans remain fail-closed.
+    unpartitioned_before = harness.require_query(
+        f"SELECT id, payload, _row_id, _last_updated_sequence_number " f"FROM {V3_DELETE_TABLE} ORDER BY id",
+        "unpartitioned Iceberg v3 lineage before distributed UPDATE",
+    )
+    unpartitioned_by_id = {int(row[0]): row for row in unpartitioned_before}
+    unpartitioned_dvs_before = connection.execute(
+        f"SELECT file_path FROM iceberg_metadata({V3_DELETE_TABLE}) "
+        "WHERE content = 'POSITION_DELETES' AND status != 'DELETED'"
+    ).fetchall()
+    harness.require_write(
+        "unpartitioned distributed Iceberg v3 UPDATE with an existing DV",
+        lambda: connection.table(V3_DELETE_TABLE).update(
+            {"payload": vane.ConstantExpression("updated")},
+            condition=vane.ColumnExpression("id").isin(11, 13),
+        ),
+    )
+    unpartitioned_sequence = connection.execute(
+        f"SELECT max(sequence_number) FROM iceberg_snapshots({V3_DELETE_TABLE})"
+    ).fetchone()[0]
+    unpartitioned_after = harness.require_query(
+        f"SELECT id, payload, _row_id, _last_updated_sequence_number " f"FROM {V3_DELETE_TABLE} ORDER BY id",
+        "unpartitioned distributed v3 UPDATE result and row lineage",
+    )
+    require_equal(
+        [(row[0], row[2]) for row in unpartitioned_after],
+        [(row[0], row[2]) for row in unpartitioned_before],
+        "unpartitioned distributed v3 UPDATE preserved row IDs",
+    )
+    for row in unpartitioned_after:
+        row_id = int(row[0])
+        if row_id in {11, 13}:
+            require_equal(row[1], "updated", f"unpartitioned v3 UPDATE payload for row {row_id}")
+            require_equal(row[3], unpartitioned_sequence, f"unpartitioned v3 UPDATE sequence for row {row_id}")
+        else:
+            require_equal(
+                row[3],
+                unpartitioned_by_id[row_id][3],
+                f"unpartitioned v3 UPDATE unchanged-row sequence for row {row_id}",
+            )
+    unpartitioned_dvs = connection.execute(
+        f"SELECT file_path FROM iceberg_metadata({V3_DELETE_TABLE}) "
+        "WHERE content = 'POSITION_DELETES' AND status != 'DELETED'"
+    ).fetchall()
+    require_equal(len(unpartitioned_dvs), 1, "unpartitioned v3 UPDATE DV consolidation")
+    require_true(
+        {str(row[0]) for row in unpartitioned_dvs}.isdisjoint({str(row[0]) for row in unpartitioned_dvs_before}),
+        "unpartitioned v3 UPDATE did not replace the existing DV",
+    )
+    require_true(
+        str(unpartitioned_dvs[0][0]).endswith(".puffin"),
+        f"unpartitioned distributed v3 UPDATE did not write Puffin: {unpartitioned_dvs!r}",
+    )
+
+    stale_update_plan = harness.capture_write_plan(
+        lambda: connection.table(V3_DELETE_TABLE).update(
+            {"payload": vane.ConstantExpression("stale")},
+            condition=vane.ColumnExpression("id") == vane.ConstantExpression(15),
+        )
+    )
+    connection.execute(f"INSERT INTO {V3_DELETE_TABLE} VALUES (101, 'concurrent-update')")
+    snapshots_after_concurrent_commit = connection.execute(
+        f"SELECT count(*) FROM iceberg_snapshots({V3_DELETE_TABLE})"
+    ).fetchone()
+    client = harness.runner.query_driver_client
+    if client is None:
+        raise AssertionError("the Ray runner did not create a query driver client")
+    harness.require_error(
+        "stale distributed v3 UPDATE source snapshot",
+        lambda: client.run_copy_plan(stale_update_plan),
+        "snapshot changed between the distributed UPDATE source scan and write planning",
+    )
+    require_equal(
+        connection.execute(f"SELECT count(*) FROM iceberg_snapshots({V3_DELETE_TABLE})").fetchone(),
+        snapshots_after_concurrent_commit,
+        "stale distributed v3 UPDATE must not create an Iceberg snapshot",
+    )
+    harness.require_query(
+        f"SELECT payload FROM {V3_DELETE_TABLE} WHERE id = 15",
+        "stale distributed v3 UPDATE did not commit",
+        [("value-15",)],
     )
 
 
@@ -1383,6 +1601,7 @@ def main() -> None:
         run_scenario("version-aware distributed CTAS", lambda: exercise_versioned_ctas(harness))
         run_scenario("v3 distributed reads and append", lambda: exercise_v3_reads_and_append(harness))
         run_scenario("v3 distributed DELETE", lambda: exercise_v3_distributed_delete(harness))
+        run_scenario("v3 distributed UPDATE", lambda: exercise_v3_distributed_update(harness))
         run_scenario("v3 fail-closed write conflicts", lambda: exercise_v3_conflicts(harness))
         run_scenario("distributed CTAS failure cleanup", lambda: exercise_ctas_failure_cleanup(harness))
         run_scenario("source positional deletes", lambda: exercise_source_positional_deletes(harness))

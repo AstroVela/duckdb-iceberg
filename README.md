@@ -80,10 +80,15 @@ files are written. The two-worker Ray integration lane covers partitioned v2
 CTAS and v3 CTAS, reads and writes spec-compliant Puffin deletion vectors,
 checks v3 partition and projection pruning, reads and appends `VARIANT` and
 `TIMESTAMP_NS`, and verifies row-lineage metadata across an append to an
-existing v3 table. A v3 distributed `DELETE` consolidates the source scan's
-frozen delete state with the new row positions and replaces any existing
-deletion vector for the affected data file. Geometry is not qualified because
-the optional geometry dependency is not part of this lane.
+existing v3 table. V3 distributed `DELETE` and `UPDATE` consolidate the source
+scan's frozen delete state with the newly affected row positions and replace
+any existing deletion vector for the affected data file. UPDATE replacement
+data files preserve `_row_id`; their new data sequence supplies
+`_last_updated_sequence_number`. Distributed UPDATE rejects schemas containing
+`VARIANT` before worker execution because the current Vane repartition transport
+cannot preserve raw VARIANT vectors; distributed reads and appends remain
+supported. Geometry is not qualified because the optional geometry dependency
+is not part of this lane.
 
 | Distributed capability | Iceberg v2 | Iceberg v3 |
 | --- | --- | --- |
@@ -92,13 +97,14 @@ the optional geometry dependency is not part of this lane.
 | `CREATE TABLE AS` | Supported with an explicit worker data path and staged catalog creation | Supported under the same constraints, including initial row lineage |
 | `VARIANT` and `TIMESTAMP_NS` | Not Iceberg v2 types | Supported; legacy Parquet VARIANT decoding remains rejected |
 | `DELETE` | Supported through positional-delete files | Supported through consolidated Puffin deletion vectors |
-| `UPDATE` | Supported through positional-delete files and replacement data files | Rejected; distributed v3 UPDATE remains tracked in [#5](https://github.com/AstroVela/duckdb-iceberg/issues/5) |
+| `UPDATE` | Supported through positional-delete files and replacement data files | Supported through consolidated Puffin deletion vectors and row-lineage-preserving replacement data files |
 
 Distributed writes reject a current partition spec containing a `VOID`
 transform. A distributed row-delta operation also fails if any selected source
-file uses a partition spec other than the current default. V3 scan, append, and
-DELETE plans fail closed when their target snapshot, schema, or partition spec
-changes before catalog finalization; no local execution fallback is used.
+file uses a partition spec other than the current default. V3 scan, append,
+DELETE, and UPDATE plans fail closed when their target snapshot, schema, or
+partition spec changes before catalog finalization; no local execution fallback
+is used.
 
 Scan splits materialize the coordinator's selected files and delete state,
 including transaction-local changes visible when the plan is created.

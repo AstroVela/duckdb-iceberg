@@ -96,7 +96,12 @@ static bool ManifestFileNeedsToBeRewritten(IcebergCommitState &commit_state, Ice
 			manifest_file.deleted_files_count++;
 			continue;
 		}
+#ifdef ICEBERG_VANE_DISTRIBUTED
+		auto is_deleted =
+		    deletes.IsInvalidated(manifest_entry.data_file.file_path, manifest_entry.data_file.referenced_data_file);
+#else
 		auto is_deleted = deletes.IsInvalidated(manifest_entry.data_file.file_path);
+#endif
 		if (!is_deleted) {
 			manifest_file.existing_rows_count += manifest_entry.data_file.record_count;
 			manifest_file.existing_files_count++;

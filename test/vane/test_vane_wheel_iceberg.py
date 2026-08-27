@@ -8,7 +8,6 @@ import time
 import urllib.error
 import urllib.request
 
-
 CATALOG_ENDPOINT = "http://127.0.0.1:8181"
 MINIO_READY_ENDPOINT = "http://127.0.0.1:9000/minio/health/ready"
 CATALOG_NAME = "vane_wheel_catalog"
@@ -113,8 +112,8 @@ def main() -> None:
         )
 
         # A Vane-enabled extension build must retain the independent local-fast
-        # backend for v3 mutations. This Relation DELETE deliberately bypasses
-        # the distributed provider and exercises the native Puffin writer.
+        # backend for v3 mutations. These Relation mutations deliberately bypass
+        # the distributed provider and exercise the native Puffin/update path.
         connection.execute(f"CREATE TABLE {V3_TABLE} (id INTEGER, payload VARCHAR) WITH ('format-version' = '3')")
         connection.execute(f"INSERT INTO {V3_TABLE} VALUES (1, 'one'), (2, 'two'), (3, 'three')")
         connection.table(V3_TABLE).delete(condition=vane.ColumnExpression("id") == vane.ConstantExpression(2))
@@ -123,6 +122,33 @@ def main() -> None:
             [(1, "one"), (3, "three")],
             "local-fast Iceberg v3 Relation DELETE",
         )
+        lineage_before_update = connection.execute(
+            f"SELECT id, _row_id, _last_updated_sequence_number FROM {V3_TABLE} ORDER BY id"
+        ).fetchall()
+        connection.table(V3_TABLE).update(
+            {"payload": vane.ConstantExpression("updated-three")},
+            condition=vane.ColumnExpression("id") == vane.ConstantExpression(3),
+        )
+        lineage_after_update = connection.execute(
+            f"SELECT id, payload, _row_id, _last_updated_sequence_number FROM {V3_TABLE} ORDER BY id"
+        ).fetchall()
+        require_equal(
+            [(row[0], row[2]) for row in lineage_after_update],
+            [(row[0], row[1]) for row in lineage_before_update],
+            "local-fast Iceberg v3 UPDATE preserved row IDs",
+        )
+        require_equal(
+            [(row[0], row[1]) for row in lineage_after_update],
+            [(1, "one"), (3, "updated-three")],
+            "local-fast Iceberg v3 Relation UPDATE",
+        )
+        require_equal(
+            lineage_after_update[0][3],
+            lineage_before_update[0][2],
+            "local-fast Iceberg v3 UPDATE unchanged-row lineage",
+        )
+        if lineage_after_update[1][3] <= lineage_before_update[1][2]:
+            raise AssertionError("local-fast Iceberg v3 UPDATE did not advance the replacement row sequence number")
 
         connection.execute(f"DROP TABLE {TABLE}")
         connection.execute(f"DROP TABLE {V3_TABLE}")

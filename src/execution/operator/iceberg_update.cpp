@@ -68,7 +68,14 @@ IcebergUpdate &IcebergUpdate::PlanUpdateOperator(ClientContext &context, Physica
 	}
 
 	vector<idx_t> row_id_indexes = {0, 1};
+#ifdef ICEBERG_VANE_DISTRIBUTED
+	// The enclosing IcebergInsert owns the distributed UPDATE provider. Do not
+	// also materialize a standalone DELETE worker bind for this native child.
+	auto &delete_op =
+	    IcebergDelete::PlanDeleteInternal(context, planner, table, child_plan, std::move(row_id_indexes), false);
+#else
 	auto &delete_op = IcebergDelete::PlanDelete(context, planner, table, child_plan, std::move(row_id_indexes));
+#endif
 
 	// build update expressions (physical columns only, no partition cols, no casts)
 	vector<unique_ptr<Expression>> expressions;

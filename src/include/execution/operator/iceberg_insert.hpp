@@ -139,6 +139,7 @@ public:
 	int64_t distributed_snapshot_id = 0;
 	bool has_distributed_target = false;
 	bool distributed_ctas_has_void_partition_transform = false;
+	bool distributed_update_source_is_statically_empty = false;
 	optional_ptr<PhysicalOperator> distributed_worker_child;
 	bool distributed_worker_plan_selected = false;
 	optional_ptr<PhysicalIcebergCreateTable> distributed_ctas_create;

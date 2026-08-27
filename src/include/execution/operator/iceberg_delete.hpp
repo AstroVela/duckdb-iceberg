@@ -23,6 +23,11 @@ namespace duckdb {
 
 class PhysicalTableScan;
 struct IcebergMultiFileList;
+#ifdef ICEBERG_VANE_DISTRIBUTED
+class IcebergInsert;
+class IcebergUpdate;
+struct IcebergDistributedDeleteFileResult;
+#endif
 
 struct WrittenColumnInfo {
 	WrittenColumnInfo() = default;
@@ -175,6 +180,14 @@ public:
 
 private:
 #ifdef ICEBERG_VANE_DISTRIBUTED
+	friend class IcebergInsert;
+	friend class IcebergUpdate;
+	static void AddDistributedDeleteArtifacts(ClientContext &context, const IcebergMultiFileList &file_list,
+	                                          const vector<IcebergDistributedDeleteFileResult> &files,
+	                                          IcebergDeleteGlobalState &global_state, const string &operation_name);
+	static PhysicalOperator &PlanDeleteInternal(ClientContext &context, PhysicalPlanGenerator &planner,
+	                                            IcebergTableEntry &table, PhysicalOperator &child_plan,
+	                                            vector<idx_t> row_id_indexes, bool initialize_distributed_write);
 	void InitializeDistributedWritePlan(ClientContext &context);
 	void SelectDistributedWorkerPlan();
 	IcebergTableEntry &ResolveDistributedWriteTable(ClientContext &context) const;
