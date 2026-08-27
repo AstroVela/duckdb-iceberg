@@ -102,6 +102,7 @@ struct IcebergDistributedRowDeltaSourceState {
 struct IcebergDistributedRowDeltaBind {
 	IcebergDistributedRowDeltaKind kind = IcebergDistributedRowDeltaKind::DELETE;
 	int32_t iceberg_version = 0;
+	bool source_is_statically_empty = false;
 	string data_path;
 	string artifact_namespace;
 	vector<idx_t> row_id_indexes;
@@ -384,6 +385,7 @@ static string SerializeBind(const IcebergDistributedRowDeltaBind &bind) {
 	serializer.WriteProperty(9, "has_copy_row_id_index", bind.copy_row_id_index.IsValid());
 	serializer.WriteProperty(10, "copy_row_id_index",
 	                         bind.copy_row_id_index.IsValid() ? bind.copy_row_id_index.GetIndex() : 0);
+	serializer.WriteProperty(11, "source_is_statically_empty", bind.source_is_statically_empty);
 	serializer.End();
 	return BytesFromStream(stream);
 }
@@ -424,6 +426,7 @@ static IcebergDistributedRowDeltaBind DeserializeBind(const string &bytes) {
 	} else if (copy_row_id_index != 0) {
 		throw SerializationException("Iceberg distributed row-delta bind has a non-canonical row-id index");
 	}
+	result.source_is_statically_empty = deserializer.ReadProperty<bool>(11, "source_is_statically_empty");
 	deserializer.End();
 	if (result.data_path.empty() || result.artifact_namespace.empty() || result.row_id_indexes.size() != 2) {
 		throw SerializationException("Invalid Iceberg distributed row-delta bind data");
@@ -435,6 +438,10 @@ static IcebergDistributedRowDeltaBind DeserializeBind(const string &bytes) {
 	if (result.kind == IcebergDistributedRowDeltaKind::DELETE &&
 	    (!result.copy_operator.empty() || result.copy_column_count != 0)) {
 		throw SerializationException("Iceberg distributed DELETE unexpectedly contains a COPY writer");
+	}
+	if (result.source_is_statically_empty &&
+	    (result.kind != IcebergDistributedRowDeltaKind::UPDATE || !result.delete_sources.empty())) {
+		throw SerializationException("Iceberg distributed row-delta bind has invalid statically-empty source state");
 	}
 	if (result.kind == IcebergDistributedRowDeltaKind::UPDATE && result.iceberg_version != 2 &&
 	    result.iceberg_version != 3) {
@@ -655,6 +662,12 @@ static void IcebergRowDeltaSink(ExecutionContext &context, const DistributedExte
                                 DistributedWriteLocalState &local_state_p, DataChunk &input) {
 	auto &global_state = global_state_p.Cast<IcebergDistributedRowDeltaGlobalState>();
 	auto &local_state = local_state_p.Cast<IcebergDistributedRowDeltaLocalState>();
+	if (global_state.bind.source_is_statically_empty) {
+		if (input.size() != 0) {
+			throw InvalidInputException("Iceberg distributed UPDATE received rows from a statically empty source");
+		}
+		return;
+	}
 	for (auto index : global_state.bind.row_id_indexes) {
 		if (index >= input.ColumnCount()) {
 			throw InvalidInputException("Iceberg distributed row-delta row identifier index is out of bounds");
@@ -1107,24 +1120,46 @@ string BuildIcebergDistributedDeleteBind(ClientContext &context, const IcebergTa
 	return SerializeBind(bind);
 }
 
-string BuildIcebergDistributedUpdateBind(ClientContext &context, const IcebergTableEntry &table,
-                                         const IcebergMultiFileList &file_list, const PhysicalCopyToFile &copy,
-                                         idx_t copy_column_count, idx_t file_path_index, idx_t row_position_index,
-                                         const string &artifact_namespace) {
+static string BuildIcebergDistributedUpdateBindInternal(ClientContext &context, const IcebergTableEntry &table,
+                                                        optional_ptr<const IcebergMultiFileList> file_list,
+                                                        const PhysicalCopyToFile &copy, idx_t copy_column_count,
+                                                        idx_t file_path_index, idx_t row_position_index,
+                                                        const string &artifact_namespace,
+                                                        bool source_is_statically_empty) {
+	if ((source_is_statically_empty && file_list) || (!source_is_statically_empty && !file_list)) {
+		throw InternalException("Iceberg distributed UPDATE source state is inconsistent");
+	}
 	auto &metadata = table.table_info.table_metadata;
 	IcebergDistributedRowDeltaBind bind;
 	bind.kind = IcebergDistributedRowDeltaKind::UPDATE;
 	bind.iceberg_version = metadata.iceberg_version;
+	bind.source_is_statically_empty = source_is_statically_empty;
 	bind.data_path = metadata.GetDataPath(FileSystem::GetFileSystem(context));
 	bind.artifact_namespace = artifact_namespace;
 	bind.row_id_indexes = {file_path_index, row_position_index};
 	bind.copy_column_count = copy_column_count;
 	bind.copy_row_id_index = GetDistributedUpdateRowIdIndex(copy, metadata.iceberg_version);
 	bind.copy_operator = SerializeShallowCopy(copy);
-	if (metadata.iceberg_version >= 3) {
-		PopulateDistributedRowDeltaSources(bind, file_list, "UPDATE");
+	if (metadata.iceberg_version >= 3 && file_list) {
+		PopulateDistributedRowDeltaSources(bind, *file_list, "UPDATE");
 	}
 	return SerializeBind(bind);
+}
+
+string BuildIcebergDistributedUpdateBind(ClientContext &context, const IcebergTableEntry &table,
+                                         const IcebergMultiFileList &file_list, const PhysicalCopyToFile &copy,
+                                         idx_t copy_column_count, idx_t file_path_index, idx_t row_position_index,
+                                         const string &artifact_namespace) {
+	return BuildIcebergDistributedUpdateBindInternal(context, table, &file_list, copy, copy_column_count,
+	                                                 file_path_index, row_position_index, artifact_namespace, false);
+}
+
+string BuildIcebergDistributedEmptyUpdateBind(ClientContext &context, const IcebergTableEntry &table,
+                                              const PhysicalCopyToFile &copy, idx_t copy_column_count,
+                                              idx_t file_path_index, idx_t row_position_index,
+                                              const string &artifact_namespace) {
+	return BuildIcebergDistributedUpdateBindInternal(context, table, nullptr, copy, copy_column_count, file_path_index,
+	                                                 row_position_index, artifact_namespace, true);
 }
 
 DistributedExtensionWriteCallbacks IcebergDistributedRowDeltaCallbacks() {

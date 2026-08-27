@@ -1104,10 +1104,17 @@ def exercise_v3_distributed_update(harness: RayIcebergHarness) -> None:
             condition=vane.ColumnExpression("id") == vane.ConstantExpression(-1),
         ),
     )
+    harness.require_write(
+        "optimizer-empty distributed Iceberg v3 UPDATE",
+        lambda: connection.table(V3_CTAS_TABLE).update(
+            {"partition_key": vane.ConstantExpression(11)},
+            condition=vane.ColumnExpression("id") == vane.ConstantExpression(None),
+        ),
+    )
     require_equal(
         connection.execute(f"SELECT count(*) FROM iceberg_snapshots({V3_CTAS_TABLE})").fetchone(),
         snapshots_before_zero_match,
-        "zero-match distributed v3 UPDATE must not create a snapshot",
+        "zero-match and optimizer-empty distributed v3 UPDATEs must not create a snapshot",
     )
 
     # Reuse the unpartitioned table whose single source file already has a

@@ -165,16 +165,30 @@ void IcebergInsert::ConfigureDistributedUpdate(ClientContext &context, PhysicalC
 		distributed_write_plan.worker_bind_data = BuildIcebergDistributedUpdateBind(
 		    context, table->Cast<IcebergTableEntry>(), *delete_sink.multi_file_list, copy, copy_column_count,
 		    copy_column_count, copy_column_count + 1, distributed_artifact_namespace);
+	} else if (!delete_sink.multi_file_list && delete_sink.children.size() == 1 &&
+	           delete_sink.children[0].get().type == PhysicalOperatorType::EMPTY_RESULT) {
+		distributed_update_source_is_statically_empty = true;
+		distributed_write_plan.worker_bind_data = BuildIcebergDistributedEmptyUpdateBind(
+		    context, table->Cast<IcebergTableEntry>(), copy, copy_column_count, copy_column_count,
+		    copy_column_count + 1, distributed_artifact_namespace);
 	}
 }
 
 void IcebergInsert::ValidateDistributedWriteShape() const {
 	if (distributed_write_plan.operator_name == "update") {
-		if (!update_delete_op || !update_delete_op->Cast<IcebergDelete>().multi_file_list ||
-		    !distributed_worker_child || !distributed_worker_plan_selected ||
+		if (!update_delete_op || !distributed_worker_child || !distributed_worker_plan_selected ||
 		    distributed_write_plan.worker_bind_data.empty() || distributed_artifact_namespace.empty() ||
 		    children.size() != 1) {
 			throw InvalidInputException("Distributed Iceberg UPDATE worker plan was not initialized");
+		}
+		auto &delete_op = update_delete_op->Cast<IcebergDelete>();
+		if (distributed_update_source_is_statically_empty) {
+			if (delete_op.multi_file_list || delete_op.children.size() != 1 ||
+			    delete_op.children[0].get().type != PhysicalOperatorType::EMPTY_RESULT) {
+				throw InvalidInputException("Distributed Iceberg UPDATE has invalid statically-empty source state");
+			}
+		} else if (!delete_op.multi_file_list) {
+			throw InvalidInputException("Distributed Iceberg UPDATE source scan was not initialized");
 		}
 		if (distributed_iceberg_version != 2 && distributed_iceberg_version != 3) {
 			throw NotImplementedException("Distributed Iceberg UPDATE supports format-version 2 and 3 tables only");
@@ -306,10 +320,12 @@ void IcebergInsert::ValidateDistributedWrite(ClientContext &context) const {
 	                                              distributed_write_plan.operator_name);
 	if (distributed_write_plan.operator_name == "update") {
 		auto &delete_op = update_delete_op->Cast<IcebergDelete>();
-		ValidateIcebergDistributedRowDeltaSourceBaseline(*delete_op.multi_file_list,
-		                                                 table_entry.table_info.table_metadata, "UPDATE");
-		ValidateIcebergDistributedRowDeltaSourceSpecs(*delete_op.multi_file_list,
-		                                              table_entry.table_info.table_metadata.default_spec_id, "UPDATE");
+		if (!distributed_update_source_is_statically_empty) {
+			ValidateIcebergDistributedRowDeltaSourceBaseline(*delete_op.multi_file_list,
+			                                                 table_entry.table_info.table_metadata, "UPDATE");
+			ValidateIcebergDistributedRowDeltaSourceSpecs(
+			    *delete_op.multi_file_list, table_entry.table_info.table_metadata.default_spec_id, "UPDATE");
+		}
 	}
 }
 
@@ -343,6 +359,16 @@ idx_t IcebergInsert::FinalizeDistributedWrite(ClientContext &context,
 		auto decoded = DecodeIcebergDistributedRowDeltaResults(
 		    context, distributed_data_path, distributed_artifact_namespace, write_info, results,
 		    IcebergDistributedRowDeltaKind::UPDATE, distributed_iceberg_version);
+		if (distributed_update_source_is_statically_empty) {
+			auto has_unexpected_output = decoded.affected_rows != 0 || !decoded.data_files.empty() ||
+			                             !decoded.delete_files.empty() || !decoded.selected_artifact_paths.empty();
+			CleanupIcebergDistributedRowDelta(context, distributed_data_path, distributed_artifact_namespace);
+			if (has_unexpected_output) {
+				throw InvalidInputException("Statically empty distributed Iceberg UPDATE returned worker output");
+			}
+			ResolveDistributedWriteTable(context);
+			return 0;
+		}
 		ValidateIcebergDistributedDataFileArtifacts(context, distributed_data_path, decoded.data_files);
 		CleanupIcebergDistributedRowDelta(context, distributed_data_path, distributed_artifact_namespace,
 		                                  &decoded.selected_artifact_paths);
