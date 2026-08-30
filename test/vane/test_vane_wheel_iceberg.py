@@ -1,12 +1,21 @@
 #!/usr/bin/env python3
-"""Exercise a statically linked Iceberg extension from a packaged Vane wheel."""
+"""Exercise provider-backed Iceberg from separately packaged Vane wheels."""
 
 from __future__ import annotations
 
 import os
+import sys
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
+
+TEST_DIRECTORY = Path(__file__).resolve().parent
+sys.path.insert(0, str(TEST_DIRECTORY))
+try:
+    from packaged_dynamic_extensions import load_packaged_dynamic_iceberg
+finally:
+    sys.path.pop(0)
 
 CATALOG_ENDPOINT = "http://127.0.0.1:8181"
 MINIO_READY_ENDPOINT = "http://127.0.0.1:9000/minio/health/ready"
@@ -36,22 +45,6 @@ def wait_for_http_endpoint(endpoint: str) -> None:
     raise RuntimeError(f"fixture endpoint did not become ready: {endpoint}: {last_error}")
 
 
-def verify_extension_is_wheel_linked(connection: object) -> None:
-    extension = connection.execute(
-        "SELECT loaded, install_mode FROM duckdb_extensions() " "WHERE extension_name = 'iceberg'"
-    ).fetchone()
-    if extension is None:
-        raise AssertionError("the packaged Vane wheel does not contain iceberg")
-    require_equal(extension[1], "STATICALLY_LINKED", "iceberg install mode before LOAD")
-
-    connection.execute("LOAD iceberg")
-    loaded = connection.execute(
-        "SELECT loaded, install_mode FROM duckdb_extensions() " "WHERE extension_name = 'iceberg'"
-    ).fetchone()
-    require_equal(loaded, (True, "STATICALLY_LINKED"), "iceberg after LOAD")
-    connection.execute("LOAD httpfs")
-
-
 def main() -> None:
     if os.environ.get("VANE_RUNNER") != "local-fast":
         raise RuntimeError("the wheel integration test requires VANE_RUNNER=local-fast")
@@ -73,7 +66,8 @@ def main() -> None:
             value = connection.execute(f"SELECT current_setting('{setting}')").fetchone()
             require_equal(str(value[0]).lower(), "false", f"{setting} setting")
 
-        verify_extension_is_wheel_linked(connection)
+        load_packaged_dynamic_iceberg(connection)
+        connection.execute("LOAD httpfs")
         connection.execute(
             "CREATE SECRET vane_wheel_iceberg_s3 "
             "(TYPE S3, KEY_ID 'admin', SECRET 'password', ENDPOINT '127.0.0.1:9000', "

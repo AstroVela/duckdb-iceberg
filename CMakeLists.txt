@@ -140,6 +140,17 @@ endif()
 
 build_loadable_extension(${TARGET_NAME} ${PARAMETERS} ${EXTENSION_SOURCES} ${ALL_OBJECT_FILES})
 
+# Vane's distributed scan path calls Parquet's C++ interface directly. A
+# self-contained loadable extension cannot resolve those symbols from Vane's
+# separately linked, hidden Parquet implementation, so embed the required
+# Parquet objects when DuckDB is statically linked into the extension.
+if(ICEBERG_VANE_DISTRIBUTED AND EXTENSION_STATIC_BUILD)
+	if(NOT TARGET parquet_extension)
+		message(FATAL_ERROR "The distributed static Iceberg extension requires the parquet_extension target")
+	endif()
+	target_link_libraries(${TARGET_NAME}_loadable_extension parquet_extension)
+endif()
+
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
     find_package(CURL REQUIRED)
     find_package(AWSSDK REQUIRED COMPONENTS core sso sts)

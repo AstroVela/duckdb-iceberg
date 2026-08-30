@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Exercise Iceberg reads and writes through a packaged two-worker Vane Ray runtime."""
+"""Exercise provider-backed Iceberg through a packaged two-worker Vane Ray runtime."""
 
 from __future__ import annotations
 
 import os
+import sys
 import threading
 import time
 import urllib.error
@@ -11,6 +12,13 @@ import urllib.request
 import uuid
 from collections.abc import Callable
 from pathlib import Path
+
+TEST_DIRECTORY = Path(__file__).resolve().parent
+sys.path.insert(0, str(TEST_DIRECTORY))
+try:
+    from packaged_dynamic_extensions import load_packaged_dynamic_iceberg
+finally:
+    sys.path.pop(0)
 
 CATALOG_ENDPOINT = "http://127.0.0.1:8181"
 MINIO_ENDPOINT = "http://127.0.0.1:9000"
@@ -109,22 +117,6 @@ def wait_for_http_endpoint(endpoint: str) -> None:
     raise RuntimeError(f"fixture endpoint did not become ready: {endpoint}: {last_error}")
 
 
-def verify_extension_is_wheel_linked(connection: object) -> None:
-    extension = connection.execute(
-        "SELECT loaded, install_mode FROM duckdb_extensions() WHERE extension_name = 'iceberg'"
-    ).fetchone()
-    if extension is None:
-        raise AssertionError("the packaged Vane wheel does not contain iceberg")
-    require_equal(extension[1], "STATICALLY_LINKED", "iceberg install mode before LOAD")
-
-    connection.execute("LOAD iceberg")
-    loaded = connection.execute(
-        "SELECT loaded, install_mode FROM duckdb_extensions() WHERE extension_name = 'iceberg'"
-    ).fetchone()
-    require_equal(loaded, (True, "STATICALLY_LINKED"), "iceberg after LOAD")
-    connection.execute("LOAD httpfs")
-
-
 def configure_coordinator_s3(connection: object) -> None:
     connection.execute("SET s3_endpoint = '127.0.0.1:9000'")
     connection.execute("SET s3_use_ssl = false")
@@ -155,7 +147,8 @@ def open_catalog_connection(vane: object) -> object:
             "autoload_known_extensions": "false",
         },
     )
-    verify_extension_is_wheel_linked(connection)
+    load_packaged_dynamic_iceberg(connection)
+    connection.execute("LOAD httpfs")
     configure_coordinator_s3(connection)
     connection.execute("SET unsafe_enable_version_guessing = true")
     connection.execute("SET TimeZone = 'UTC'")
@@ -1580,7 +1573,8 @@ def main() -> None:
             value = connection.execute(f"SELECT current_setting('{setting}')").fetchone()
             require_equal(str(value[0]).lower(), "false", f"{setting} setting")
 
-        verify_extension_is_wheel_linked(connection)
+        load_packaged_dynamic_iceberg(connection)
+        connection.execute("LOAD httpfs")
         configure_coordinator_s3(connection)
         connection.execute("SET unsafe_enable_version_guessing = true")
         connection.execute("SET TimeZone = 'UTC'")
