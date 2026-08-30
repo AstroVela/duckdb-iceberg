@@ -22,9 +22,192 @@ jobs:
       build_jobs: 12
       run_native_tests: true
 
+  vane-dynamic-wheels:
+    name: Build signed Vane dynamic Iceberg wheels
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    env:
+      VANE_EXTENSION_ROOT: ${{ github.workspace }}/extension
+      VANE_MANIFEST: ${{ github.workspace }}/extension/vane-extension.toml
+      VANE_SOURCE_DIR: ${{ github.workspace }}/vane
+      VANE_DYNAMIC_BUILD_DIR: ${{ github.workspace }}/build/vane-dynamic-wheel
+      VANE_DYNAMIC_DIST_DIR: ${{ github.workspace }}/build/vane-dynamic-wheel-dist
+      VANE_VCPKG_ROOT: ${{ github.workspace }}/vane-vcpkg
+      VANE_VCPKG_INSTALLED_DIR: ${{ github.workspace }}/vane/vcpkg_installed
+      VANE_BUILD_JOBS: 12
+      VANE_CMAKE_COMPILER_LAUNCHER: ccache
+      VCPKG_TARGET_TRIPLET: x64-linux
+      CCACHE_DIR: ${{ github.workspace }}/.cache/vane-dynamic-wheel-ccache
+      CCACHE_MAXSIZE: 750M
+      CCACHE_COMPILERCHECK: content
+
+    steps:
+      - name: Checkout extension and submodules
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          path: extension
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Checkout exact Avro dependency
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: duckdb/duckdb-avro
+          ref: 7f423d69709045e38f8431b3470e0395fce1a595
+          path: avro
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Read integration manifest
+        id: manifest
+        run: |
+          python extension/vane-extension-ci-tools/scripts/vane_extension.py \
+            --manifest "$VANE_MANIFEST" \
+            --extension-root "$VANE_EXTENSION_ROOT" \
+            manifest \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Checkout exact Vane source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: ${{ steps.manifest.outputs.vane_repository }}
+          ref: ${{ steps.manifest.outputs.vane_revision }}
+          path: vane
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate exact Vane and CI-tools identities
+        shell: bash
+        env:
+          VANE_CI_TOOLS_VERSION: 28c253d71645b627e90307a8c0f42bf74bda0046
+        run: |
+          set -euo pipefail
+          actual_ci_tools="$(git -C extension/vane-extension-ci-tools rev-parse HEAD)"
+          test "$actual_ci_tools" = "$VANE_CI_TOOLS_VERSION"
+          python extension/vane-extension-ci-tools/scripts/vane_extension.py \
+            --manifest "$VANE_MANIFEST" \
+            --extension-root "$VANE_EXTENSION_ROOT" \
+            verify-ci-tools \
+            --ci-tools-source extension/vane-extension-ci-tools \
+            --expected-sha "$VANE_CI_TOOLS_VERSION"
+          python extension/vane-extension-ci-tools/scripts/vane_extension.py \
+            --manifest "$VANE_MANIFEST" \
+            --extension-root "$VANE_EXTENSION_ROOT" \
+            identity \
+            --vane-source "$VANE_SOURCE_DIR"
+
+      - name: Install native and wheel tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            autoconf \
+            automake \
+            bison \
+            build-essential \
+            ccache \
+            curl \
+            flex \
+            libtool \
+            ninja-build \
+            openssl \
+            pkg-config \
+            tar \
+            unzip \
+            zip
+          python -m pip install \
+            "auditwheel>=6.4" \
+            build \
+            "cmake>=3.29" \
+            "ninja>=1.10" \
+            packaging \
+            "patchelf>=0.17.2" \
+            "pybind11[global]>=3.0.0" \
+            "scikit-build-core>=0.11.4" \
+            "setuptools-scm>=9.2.0"
+
+      - name: Restore dynamic-wheel compiler cache
+        id: dynamic_wheel_ccache
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: vane-dynamic-wheel-ccache-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.manifest.outputs.vane_revision }}-${{ hashFiles('extension/vcpkg.json') }}
+
+      - name: Reset dynamic-wheel compiler cache statistics
+        run: ccache --zero-stats
+
+      - name: Read extension vcpkg baseline
+        id: vcpkg
+        shell: bash
+        run: |
+          set -euo pipefail
+          baseline="$(python -c 'import json; print(json.load(open("extension/vcpkg.json"))["builtin-baseline"])')"
+          [[ "$baseline" =~ ^[0-9a-f]{40}$ ]]
+          echo "baseline=$baseline" >> "$GITHUB_OUTPUT"
+
+      - name: Set up extension vcpkg
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11.6
+        with:
+          vcpkgGitCommitId: ${{ steps.vcpkg.outputs.baseline }}
+          vcpkgDirectory: ${{ github.workspace }}/vcpkg
+
+      - name: Bootstrap exact Vane dependencies
+        env:
+          VCPKG_TOOLCHAIN_PATH: ${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake
+        run: |
+          make -f extension/vane-extension-ci-tools/makefiles/vane_extension.Makefile \
+            vane_wheel_dependencies \
+            VANE_EXTENSION_ROOT="$VANE_EXTENSION_ROOT" \
+            VANE_MANIFEST="$VANE_MANIFEST" \
+            VANE_SOURCE_DIR="$VANE_SOURCE_DIR" \
+            VANE_VCPKG_ROOT="$VANE_VCPKG_ROOT" \
+            VANE_VCPKG_INSTALLED_DIR="$VANE_VCPKG_INSTALLED_DIR" \
+            VANE_BUILD_JOBS="$VANE_BUILD_JOBS"
+
+      - name: Build and verify dynamic provider wheels
+        env:
+          VCPKG_TOOLCHAIN_PATH: ${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake
+          VCPKG_MAX_CONCURRENCY: ${{ env.VANE_BUILD_JOBS }}
+        run: |
+          python -I extension/scripts/build_vane_dynamic_wheels.py \
+            --extension-root "$VANE_EXTENSION_ROOT" \
+            --avro-source "${{ github.workspace }}/avro" \
+            --vane-source "$VANE_SOURCE_DIR" \
+            --vane-revision "${{ steps.manifest.outputs.vane_revision }}" \
+            --vane-vcpkg-installed "$VANE_VCPKG_INSTALLED_DIR" \
+            --vcpkg-toolchain "$VCPKG_TOOLCHAIN_PATH" \
+            --build-directory "$VANE_DYNAMIC_BUILD_DIR" \
+            --output-directory "$VANE_DYNAMIC_DIST_DIR" \
+            --jobs "$VANE_BUILD_JOBS"
+
+      - name: Report dynamic-wheel compiler cache
+        if: always()
+        shell: bash
+        env:
+          VANE_CCACHE_ACTION_HIT: ${{ steps.dynamic_wheel_ccache.outputs.cache-hit }}
+        run: |
+          set -euo pipefail
+          printf 'GitHub Actions ccache restore hit: %s\n' "${VANE_CCACHE_ACTION_HIT:-false}"
+          ccache --show-stats
+
+      - name: Upload CI-only dynamic wheels
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vane-iceberg-dynamic-wheels
+          path: ${{ env.VANE_DYNAMIC_DIST_DIR }}/*.whl
+          if-no-files-found: error
+          retention-days: 1
+
   vane-wheel-iceberg-integration:
-    name: Vane wheel local Iceberg integration
-    needs: vane-native
+    name: Vane dynamic wheel local Iceberg integration
+    needs: vane-dynamic-wheels
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -39,11 +222,11 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
-      - name: Download verified Vane wheel
+      - name: Download verified dynamic wheels
         uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
         with:
-          name: vane-iceberg-wheel
-          path: vane-wheel
+          name: vane-iceberg-dynamic-wheels
+          path: vane-wheels
 
       - name: Set up Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
@@ -72,18 +255,20 @@ jobs:
           docker compose -f scripts/docker-compose.yml logs
           exit 1
 
-      - name: Exercise Iceberg through the packaged Vane wheel
+      - name: Exercise Iceberg through the packaged provider wheels
         shell: bash
         run: |
           set -euo pipefail
           python -m venv .venv-vane-wheel-integration
           . .venv-vane-wheel-integration/bin/activate
-          mapfile -t wheels < <(find vane-wheel -maxdepth 1 -type f -name '*.whl' -print | sort)
-          if [ "${#wheels[@]}" -ne 1 ]; then
-            printf 'expected exactly one Vane wheel, found %s\n' "${#wheels[@]}" >&2
-            exit 1
-          fi
-          python -m pip install --disable-pip-version-check "${wheels[0]}"
+          mapfile -t base_wheels < <(find vane-wheels -maxdepth 1 -type f -name 'vane_ai-*.whl' -print | sort)
+          mapfile -t avro_wheels < <(find vane-wheels -maxdepth 1 -type f -name 'vane_extension_avro-*.whl' -print | sort)
+          mapfile -t iceberg_wheels < <(find vane-wheels -maxdepth 1 -type f -name 'vane_extension_iceberg-*.whl' -print | sort)
+          test "${#base_wheels[@]}" -eq 1
+          test "${#avro_wheels[@]}" -eq 1
+          test "${#iceberg_wheels[@]}" -eq 1
+          python -m pip install --disable-pip-version-check \
+            "${base_wheels[0]}" "${avro_wheels[0]}" "${iceberg_wheels[0]}"
           python -I test/vane/test_vane_wheel_iceberg.py
 
       - name: Stop local Iceberg fixture
@@ -91,8 +276,8 @@ jobs:
         run: docker compose -f scripts/docker-compose.yml down -v
 
   vane-wheel-ray-iceberg-integration:
-    name: Vane wheel two-worker Ray Iceberg integration
-    needs: vane-native
+    name: Vane dynamic wheel two-worker Ray Iceberg integration
+    needs: vane-dynamic-wheels
     runs-on: ubuntu-24.04
     timeout-minutes: 50
     permissions:
@@ -109,11 +294,11 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
-      - name: Download verified Vane wheel
+      - name: Download verified dynamic wheels
         uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
         with:
-          name: vane-iceberg-wheel
-          path: vane-wheel
+          name: vane-iceberg-dynamic-wheels
+          path: vane-wheels
 
       - name: Set up Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
@@ -148,12 +333,14 @@ jobs:
           set -euo pipefail
           python -m venv .venv-vane-wheel-ray-integration
           . .venv-vane-wheel-ray-integration/bin/activate
-          mapfile -t wheels < <(find vane-wheel -maxdepth 1 -type f -name '*.whl' -print | sort)
-          if [ "${#wheels[@]}" -ne 1 ]; then
-            printf 'expected exactly one Vane wheel, found %s\n' "${#wheels[@]}" >&2
-            exit 1
-          fi
-          python -m pip install --disable-pip-version-check "${wheels[0]}"
+          mapfile -t base_wheels < <(find vane-wheels -maxdepth 1 -type f -name 'vane_ai-*.whl' -print | sort)
+          mapfile -t avro_wheels < <(find vane-wheels -maxdepth 1 -type f -name 'vane_extension_avro-*.whl' -print | sort)
+          mapfile -t iceberg_wheels < <(find vane-wheels -maxdepth 1 -type f -name 'vane_extension_iceberg-*.whl' -print | sort)
+          test "${#base_wheels[@]}" -eq 1
+          test "${#avro_wheels[@]}" -eq 1
+          test "${#iceberg_wheels[@]}" -eq 1
+          python -m pip install --disable-pip-version-check \
+            "${base_wheels[0]}" "${avro_wheels[0]}" "${iceberg_wheels[0]}"
           python -I test/vane/test_vane_wheel_ray_iceberg.py
 
       - name: Stop local Iceberg fixture
