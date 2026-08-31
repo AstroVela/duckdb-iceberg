@@ -48,12 +48,14 @@ def load_packaged_dynamic_iceberg(connection: object) -> None:
     if tuple(dependency.identity for dependency in iceberg.dependencies) != (avro.identity,):
         raise AssertionError("the Iceberg wheel must declare the exact Avro wheel as its sole dynamic dependency")
 
-    security = connection.execute("""
+    security = connection.execute(
+        """
         SELECT
             CAST(current_setting('allow_unsigned_extensions') AS BOOLEAN),
             CAST(current_setting('autoinstall_known_extensions') AS BOOLEAN),
             CAST(current_setting('autoload_known_extensions') AS BOOLEAN)
-        """).fetchone()
+        """
+    ).fetchone()
     if security != (False, False, False):
         raise AssertionError(f"dynamic extension security settings are not fail-closed: {security!r}")
 
