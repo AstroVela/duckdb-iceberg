@@ -4,16 +4,26 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+    inputs:
+      operation:
+        description: Run CI only or publish the pinned Vane provider candidate to TestPyPI
+        type: choice
+        options:
+          - build-only
+          - testpypi-dev
+        default: build-only
+        required: true
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{ github.base_ref || '' }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{ github.base_ref || '' }}-${{ inputs.operation || 'ci' }}
+  cancel-in-progress: ${{ inputs.operation != 'testpypi-dev' }}
 
 permissions:
   contents: read
 
 jobs:
   vane-native:
+    if: inputs.operation != 'testpypi-dev'
     # The called workflow verifies its exact SHA from GitHub job metadata.
     uses: AstroVela/vane-extension-ci-tools/.github/workflows/_vane_extension_ci.yml@28c253d71645b627e90307a8c0f42bf74bda0046
     with:
@@ -23,6 +33,7 @@ jobs:
       run_native_tests: true
 
   vane-dynamic-wheels:
+    if: inputs.operation != 'testpypi-dev'
     name: Build signed Vane dynamic Iceberg wheels
     runs-on: ubuntu-24.04
     timeout-minutes: 180
@@ -185,7 +196,10 @@ jobs:
             --vcpkg-toolchain "$VCPKG_TOOLCHAIN_PATH" \
             --build-directory "$VANE_DYNAMIC_BUILD_DIR" \
             --output-directory "$VANE_DYNAMIC_DIST_DIR" \
-            --jobs "$VANE_BUILD_JOBS"
+            --jobs "$VANE_BUILD_JOBS" \
+            --signing-profile ci-test \
+            --signing-private-key "$VANE_SOURCE_DIR/external/duckdb/test/mbedtls/private.pem" \
+            --package-local-runtime
 
       - name: Report dynamic-wheel compiler cache
         if: always()
@@ -206,6 +220,7 @@ jobs:
           retention-days: 1
 
   vane-wheel-iceberg-integration:
+    if: inputs.operation != 'testpypi-dev'
     name: Vane dynamic wheel local Iceberg integration
     needs: vane-dynamic-wheels
     runs-on: ubuntu-24.04
@@ -214,6 +229,7 @@ jobs:
       contents: read
     env:
       VANE_RUNNER: local-fast
+      VANE_EXPECTED_EXTENSION_TRUST_IDENTITY: vane-ci-test-key
 
     steps:
       - name: Checkout extension
@@ -275,7 +291,713 @@ jobs:
         if: always()
         run: docker compose -f scripts/docker-compose.yml down -v
 
+  vane-testpypi-wheels:
+    if: inputs.operation == 'testpypi-dev'
+    name: Build signed TestPyPI provider wheels
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/vane-extension-iceberg
+    container:
+      image: quay.io/pypa/manylinux_2_28_x86_64@sha256:012f4a50472412f18bb2b450c1cce7158434cfae4ae878591c2748a13a30c2be
+    permissions:
+      contents: read
+    outputs:
+      vane_version: ${{ steps.release.outputs.vane_version }}
+      avro_version: ${{ steps.release.outputs.avro_version }}
+      iceberg_version: ${{ steps.release.outputs.iceberg_version }}
+    env:
+      VANE_EXTENSION_ROOT: ${{ github.workspace }}/extension
+      VANE_MANIFEST: ${{ github.workspace }}/extension/vane-extension.toml
+      VANE_SOURCE_DIR: ${{ github.workspace }}/vane
+      VANE_DYNAMIC_BUILD_DIR: ${{ github.workspace }}/build/vane-testpypi-wheel
+      VANE_DYNAMIC_DIST_DIR: ${{ github.workspace }}/build/vane-testpypi-wheel-dist
+      VANE_RUNTIME_WHEEL_DIR: ${{ github.workspace }}/build/vane-testpypi-runtime-wheels
+      VANE_VCPKG_ROOT: ${{ github.workspace }}/vane-vcpkg
+      VANE_VCPKG_INSTALLED_DIR: ${{ github.workspace }}/vane/vcpkg_installed
+      VANE_PYTHON: /opt/python/cp312-cp312/bin/python
+      VANE_BUILD_JOBS: 16
+      VANE_CMAKE_COMPILER_LAUNCHER: ccache
+      VCPKG_TARGET_TRIPLET: x64-linux
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/.cache/vcpkg-archives
+      CCACHE_DIR: ${{ github.workspace }}/.cache/vane-testpypi-wheel-ccache
+      CCACHE_MAXSIZE: 1G
+      CCACHE_COMPILERCHECK: content
+
+    steps:
+      - name: Require the protected release branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = refs/heads/v1.5-variegata_vane
+
+      - name: Checkout extension and submodules
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          path: extension
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Checkout exact Avro dependency
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: duckdb/duckdb-avro
+          ref: 7f423d69709045e38f8431b3470e0395fce1a595
+          path: avro
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Read integration manifest
+        id: manifest
+        shell: bash
+        run: |
+          "$VANE_PYTHON" extension/vane-extension-ci-tools/scripts/vane_extension.py \
+            --manifest "$VANE_MANIFEST" \
+            --extension-root "$VANE_EXTENSION_ROOT" \
+            manifest \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Checkout exact Vane source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: ${{ steps.manifest.outputs.vane_repository }}
+          ref: ${{ steps.manifest.outputs.vane_revision }}
+          path: vane
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install manylinux build tooling
+        shell: bash
+        run: |
+          set -euo pipefail
+          yum install -y \
+            autoconf \
+            automake \
+            bison \
+            ccache \
+            curl \
+            flex \
+            git \
+            libtool \
+            make \
+            openssl \
+            perl \
+            pkgconfig \
+            tar \
+            unzip \
+            which \
+            zip
+          "$VANE_PYTHON" -m pip install \
+            "auditwheel>=6.4" \
+            build \
+            "cmake>=3.29" \
+            "ninja>=1.10" \
+            packaging \
+            "patchelf>=0.17.2" \
+            "pybind11[global]>=3.0.0" \
+            "scikit-build-core>=0.11.4" \
+            "setuptools-scm>=9.2.0"
+          bash "$VANE_SOURCE_DIR/scripts/bootstrap_manylinux_bison.sh"
+          echo "$(dirname "$VANE_PYTHON")" >> "$GITHUB_PATH"
+
+      - name: Validate exact Vane and CI-tools identities
+        shell: bash
+        env:
+          VANE_CI_TOOLS_VERSION: 28c253d71645b627e90307a8c0f42bf74bda0046
+        run: |
+          set -euo pipefail
+          actual_ci_tools="$(git -C extension/vane-extension-ci-tools rev-parse HEAD)"
+          test "$actual_ci_tools" = "$VANE_CI_TOOLS_VERSION"
+          "$VANE_PYTHON" extension/vane-extension-ci-tools/scripts/vane_extension.py \
+            --manifest "$VANE_MANIFEST" \
+            --extension-root "$VANE_EXTENSION_ROOT" \
+            verify-ci-tools \
+            --ci-tools-source extension/vane-extension-ci-tools \
+            --expected-sha "$VANE_CI_TOOLS_VERSION"
+          "$VANE_PYTHON" extension/vane-extension-ci-tools/scripts/vane_extension.py \
+            --manifest "$VANE_MANIFEST" \
+            --extension-root "$VANE_EXTENSION_ROOT" \
+            identity \
+            --vane-source "$VANE_SOURCE_DIR"
+
+      - name: Restore compiler and package caches
+        id: testpypi_cache
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ${{ env.CCACHE_DIR }}
+            ${{ env.VCPKG_DEFAULT_BINARY_CACHE }}
+          key: vane-testpypi-wheel-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.manifest.outputs.vane_revision }}-${{ hashFiles('extension/vcpkg.json') }}
+
+      - name: Reset compiler cache statistics
+        run: ccache --zero-stats
+
+      - name: Read extension vcpkg baseline
+        id: vcpkg
+        shell: bash
+        run: |
+          set -euo pipefail
+          baseline="$("$VANE_PYTHON" -c 'import json; print(json.load(open("extension/vcpkg.json"))["builtin-baseline"])')"
+          [[ "$baseline" =~ ^[0-9a-f]{40}$ ]]
+          echo "baseline=$baseline" >> "$GITHUB_OUTPUT"
+
+      - name: Set up extension vcpkg
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11.6
+        with:
+          vcpkgGitCommitId: ${{ steps.vcpkg.outputs.baseline }}
+          vcpkgDirectory: ${{ github.workspace }}/vcpkg
+
+      - name: Bootstrap exact Vane dependencies
+        env:
+          VCPKG_TOOLCHAIN_PATH: ${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake
+          VANE_BOOTSTRAP_PYTHON: ${{ env.VANE_PYTHON }}
+        run: |
+          mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
+          make -f extension/vane-extension-ci-tools/makefiles/vane_extension.Makefile \
+            vane_wheel_dependencies \
+            VANE_EXTENSION_ROOT="$VANE_EXTENSION_ROOT" \
+            VANE_MANIFEST="$VANE_MANIFEST" \
+            VANE_SOURCE_DIR="$VANE_SOURCE_DIR" \
+            VANE_VCPKG_ROOT="$VANE_VCPKG_ROOT" \
+            VANE_VCPKG_INSTALLED_DIR="$VANE_VCPKG_INSTALLED_DIR" \
+            VANE_BUILD_JOBS="$VANE_BUILD_JOBS" \
+            VANE_PYTHON="$VANE_PYTHON"
+
+      - name: Download every exact indexed Vane runtime wheel
+        id: vane_candidate
+        shell: bash
+        env:
+          INDEX_URL: https://test.pypi.org/simple/
+        run: |
+          set -euo pipefail
+          version="$(cd "$VANE_SOURCE_DIR" && "$VANE_PYTHON" -m setuptools_scm)"
+          "$VANE_PYTHON" - "$version" <<'PY'
+          import sys
+          from packaging.version import Version
+
+          raw = sys.argv[1]
+          version = Version(raw)
+          if str(version) != raw or not version.is_devrelease or version.local is not None:
+              raise SystemExit(f"Vane source did not resolve to a canonical public development version: {raw!r}")
+          PY
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          mkdir -p "$VANE_RUNTIME_WHEEL_DIR"
+          for runtime in cp310-cp310 cp311-cp311 cp312-cp312 cp313-cp313 cp314-cp314; do
+            interpreter="/opt/python/$runtime/bin/python"
+            destination="$VANE_RUNTIME_WHEEL_DIR/$runtime"
+            mkdir -p "$destination"
+            "$interpreter" -m pip download \
+              --disable-pip-version-check \
+              --no-cache-dir \
+              --no-deps \
+              --only-binary=:all: \
+              --index-url "$INDEX_URL" \
+              --dest "$destination" \
+              "vane-ai==$version"
+            test "$(find "$destination" -maxdepth 1 -type f -name 'vane_ai-*.whl' | wc -l)" -eq 1
+          done
+
+      - name: Build, sign and verify the provider wheel matrix
+        shell: bash
+        env:
+          VANE_TESTPYPI_EXTENSION_SIGNING_PRIVATE_KEY: ${{ secrets.VANE_TESTPYPI_EXTENSION_SIGNING_PRIVATE_KEY }}
+          VCPKG_TOOLCHAIN_PATH: ${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake
+          VCPKG_MAX_CONCURRENCY: ${{ env.VANE_BUILD_JOBS }}
+        run: |
+          set -euo pipefail
+          test -n "$VANE_TESTPYPI_EXTENSION_SIGNING_PRIVATE_KEY"
+          signing_key="$RUNNER_TEMP/vane-testpypi-extension-signing.pem"
+          cleanup() {
+            shred --force --remove "$signing_key" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+          umask 077
+          printf '%s' "$VANE_TESTPYPI_EXTENSION_SIGNING_PRIVATE_KEY" > "$signing_key"
+          unset VANE_TESTPYPI_EXTENSION_SIGNING_PRIVATE_KEY
+
+          runtime_arguments=()
+          for runtime in cp310-cp310 cp311-cp311 cp312-cp312 cp313-cp313 cp314-cp314; do
+            interpreter="/opt/python/$runtime/bin/python"
+            mapfile -t wheels < <(find "$VANE_RUNTIME_WHEEL_DIR/$runtime" -maxdepth 1 -type f -name 'vane_ai-*.whl' -print)
+            test "${#wheels[@]}" -eq 1
+            runtime_arguments+=(--runtime-python "$interpreter" --runtime-wheel "${wheels[0]}")
+          done
+
+          "$VANE_PYTHON" -I extension/scripts/build_vane_dynamic_wheels.py \
+            --extension-root "$VANE_EXTENSION_ROOT" \
+            --avro-source "${{ github.workspace }}/avro" \
+            --vane-source "$VANE_SOURCE_DIR" \
+            --vane-revision "${{ steps.manifest.outputs.vane_revision }}" \
+            --vane-vcpkg-installed "$VANE_VCPKG_INSTALLED_DIR" \
+            --vcpkg-toolchain "$VCPKG_TOOLCHAIN_PATH" \
+            --build-directory "$VANE_DYNAMIC_BUILD_DIR" \
+            --output-directory "$VANE_DYNAMIC_DIST_DIR" \
+            --jobs "$VANE_BUILD_JOBS" \
+            --signing-profile testpypi \
+            --signing-private-key "$signing_key" \
+            --consume-signing-private-key \
+            "${runtime_arguments[@]}"
+
+      - name: Validate the immutable unpublished release set
+        id: release
+        shell: bash
+        run: |
+          "$VANE_PYTHON" extension/scripts/validate_vane_provider_release.py validate \
+            --directory "$VANE_DYNAMIC_DIST_DIR" \
+            --vane-version "${{ steps.vane_candidate.outputs.version }}" \
+            --require-testpypi-absent \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Report compiler cache
+        if: always()
+        shell: bash
+        env:
+          VANE_CACHE_ACTION_HIT: ${{ steps.testpypi_cache.outputs.cache-hit }}
+        run: |
+          printf 'GitHub Actions cache restore hit: %s\n' "${VANE_CACHE_ACTION_HIT:-false}"
+          ccache --show-stats
+
+      - name: Upload verified provider wheels
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vane-testpypi-provider-wheels
+          path: ${{ env.VANE_DYNAMIC_DIST_DIR }}/*.whl
+          if-no-files-found: error
+          retention-days: 30
+
+  assemble-testpypi-providers:
+    name: Validate, attest and sign TestPyPI providers
+    needs: vane-testpypi-wheels
+    runs-on: ubuntu-24.04
+    permissions:
+      attestations: write
+      contents: read
+      id-token: write
+    outputs:
+      vane_version: ${{ needs.vane-testpypi-wheels.outputs.vane_version }}
+      avro_version: ${{ needs.vane-testpypi-wheels.outputs.avro_version }}
+      iceberg_version: ${{ needs.vane-testpypi-wheels.outputs.iceberg_version }}
+
+    steps:
+      - name: Checkout release tooling
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Install release validation tooling
+        run: python -m pip install --disable-pip-version-check packaging
+
+      - name: Download provider wheels
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: vane-testpypi-provider-wheels
+          path: packages
+
+      - name: Revalidate the complete release set
+        run: |
+          python scripts/validate_vane_provider_release.py validate \
+            --directory packages \
+            --vane-version "${{ needs.vane-testpypi-wheels.outputs.vane_version }}" \
+            --require-testpypi-absent
+
+      - name: Separate distributions and generate checksums
+        run: |
+          mkdir -p distributions/avro distributions/iceberg release-assets
+          cp packages/vane_extension_avro-*.whl distributions/avro/
+          cp packages/vane_extension_iceberg-*.whl distributions/iceberg/
+          (cd packages && sha256sum *.whl) > release-assets/SHA256SUMS
+
+      - name: Generate a CycloneDX SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          path: packages
+          format: cyclonedx-json
+          output-file: release-assets/vane-extension-providers-sbom.cdx.json
+          upload-artifact: false
+
+      - name: Attest provider provenance
+        id: provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: ${{ github.workspace }}/packages/*
+
+      - name: Preserve the provenance bundle
+        run: |
+          cp "${{ steps.provenance.outputs.bundle-path }}" \
+            release-assets/vane-extension-providers-build-provenance.sigstore.json
+
+      - name: Sign provider distributions with Sigstore
+        uses: sigstore/gh-action-sigstore-python@f7ad0af51a5648d09a20d00370f0a91c3bdf8f84 # v3.0.1
+        with:
+          inputs: packages/*.whl
+
+      - name: Upload Avro distributions
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vane-testpypi-avro-distributions
+          path: distributions/avro/*.whl
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload Iceberg distributions
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vane-testpypi-iceberg-distributions
+          path: distributions/iceberg/*.whl
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload release evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vane-testpypi-provider-supplemental
+          path: |
+            release-assets/*
+            packages/*.sigstore.json
+          if-no-files-found: error
+          retention-days: 30
+
+  publish-testpypi-avro:
+    name: Publish Avro provider to TestPyPI
+    needs: assemble-testpypi-providers
+    runs-on: ubuntu-24.04
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/vane-extension-avro
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Download Avro distributions
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: vane-testpypi-avro-distributions
+          path: dist
+
+      - name: Publish through trusted publishing
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+        with:
+          packages-dir: dist
+          repository-url: https://test.pypi.org/legacy/
+          skip-existing: true
+
+  verify-testpypi-avro:
+    name: Verify indexed Avro provider
+    needs: [assemble-testpypi-providers, publish-testpypi-avro]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout release tooling
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Install release validation tooling
+        run: python -m pip install --disable-pip-version-check packaging
+
+      - name: Download Avro distributions
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: vane-testpypi-avro-distributions
+          path: dist
+
+      - name: Compare the immutable indexed release
+        run: |
+          python scripts/validate_vane_provider_release.py verify-index \
+            --directory dist \
+            --distribution-name vane-extension-avro \
+            --version "${{ needs.assemble-testpypi-providers.outputs.avro_version }}"
+
+  publish-testpypi-iceberg:
+    name: Publish Iceberg provider to TestPyPI
+    needs: [assemble-testpypi-providers, verify-testpypi-avro]
+    runs-on: ubuntu-24.04
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/vane-extension-iceberg
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Download Iceberg distributions
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: vane-testpypi-iceberg-distributions
+          path: dist
+
+      - name: Publish through trusted publishing
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+        with:
+          packages-dir: dist
+          repository-url: https://test.pypi.org/legacy/
+          skip-existing: true
+
+  verify-testpypi-iceberg:
+    name: Verify indexed Iceberg provider
+    needs: [assemble-testpypi-providers, publish-testpypi-iceberg]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout release tooling
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Install release validation tooling
+        run: python -m pip install --disable-pip-version-check packaging
+
+      - name: Download Iceberg distributions
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: vane-testpypi-iceberg-distributions
+          path: dist
+
+      - name: Compare the immutable indexed release
+        run: |
+          python scripts/validate_vane_provider_release.py verify-index \
+            --directory dist \
+            --distribution-name vane-extension-iceberg \
+            --version "${{ needs.assemble-testpypi-providers.outputs.iceberg_version }}"
+
+  testpypi-local-iceberg-integration:
+    name: TestPyPI local Iceberg integration
+    needs: [assemble-testpypi-providers, verify-testpypi-iceberg]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      VANE_RUNNER: local-fast
+      VANE_EXPECTED_EXTENSION_TRUST_IDENTITY: astrovela/vane-testpypi-v1
+      INDEX_URL: https://test.pypi.org/simple/
+
+    steps:
+      - name: Checkout extension tests
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Download expected Avro distributions
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: vane-testpypi-avro-distributions
+          path: expected/avro
+
+      - name: Download expected Iceberg distributions
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: vane-testpypi-iceberg-distributions
+          path: expected/iceberg
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Install the exact indexed package graph
+        shell: bash
+        env:
+          VANE_VERSION: ${{ needs.assemble-testpypi-providers.outputs.vane_version }}
+          AVRO_VERSION: ${{ needs.assemble-testpypi-providers.outputs.avro_version }}
+          ICEBERG_VERSION: ${{ needs.assemble-testpypi-providers.outputs.iceberg_version }}
+        run: |
+          set -euo pipefail
+          python -m venv .venv-vane-testpypi-local
+          . .venv-vane-testpypi-local/bin/activate
+          python -m pip install --upgrade pip
+          mkdir -p indexed
+          download_exact() {
+            local requirement="$1"
+            local destination="$2"
+            for attempt in 1 2 3 4 5; do
+              if python -m pip download \
+                --disable-pip-version-check \
+                --no-cache-dir \
+                --no-deps \
+                --only-binary=:all: \
+                --index-url "$INDEX_URL" \
+                --dest "$destination" \
+                "$requirement"; then
+                return
+              fi
+              sleep 15
+            done
+            return 1
+          }
+          download_exact "vane-ai==$VANE_VERSION" indexed
+          download_exact "vane-extension-avro==$AVRO_VERSION" indexed
+          download_exact "vane-extension-iceberg==$ICEBERG_VERSION" indexed
+
+          mapfile -t base_wheels < <(find indexed -maxdepth 1 -type f -name 'vane_ai-*.whl' -print)
+          mapfile -t avro_wheels < <(find indexed -maxdepth 1 -type f -name 'vane_extension_avro-*.whl' -print)
+          mapfile -t iceberg_wheels < <(find indexed -maxdepth 1 -type f -name 'vane_extension_iceberg-*.whl' -print)
+          mapfile -t expected_avro < <(find expected/avro -maxdepth 1 -type f -name '*-cp312-none-manylinux_2_28_x86_64.whl' -print)
+          mapfile -t expected_iceberg < <(find expected/iceberg -maxdepth 1 -type f -name '*-cp312-none-manylinux_2_28_x86_64.whl' -print)
+          test "${#base_wheels[@]}" -eq 1
+          test "${#avro_wheels[@]}" -eq 1
+          test "${#iceberg_wheels[@]}" -eq 1
+          test "${#expected_avro[@]}" -eq 1
+          test "${#expected_iceberg[@]}" -eq 1
+          cmp "${expected_avro[0]}" "${avro_wheels[0]}"
+          cmp "${expected_iceberg[0]}" "${iceberg_wheels[0]}"
+          python -m pip install "${base_wheels[0]}" "${avro_wheels[0]}" "${iceberg_wheels[0]}"
+          python -m pip check
+
+      - name: Start local Iceberg fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p data/generated/iceberg/spark-rest data/generated/intermediates
+          docker compose -f scripts/docker-compose.yml down -v
+          docker compose -f scripts/docker-compose.yml up -d
+
+      - name: Wait for fixture initialization
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 90); do
+            if docker compose -f scripts/docker-compose.yml logs mc 2>&1 | grep -Fq \
+              'MinIO warehouse and default namespace initialized.'; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker compose -f scripts/docker-compose.yml logs
+          exit 1
+
+      - name: Exercise the indexed providers locally
+        run: .venv-vane-testpypi-local/bin/python -I test/vane/test_vane_wheel_iceberg.py
+
+      - name: Stop local Iceberg fixture
+        if: always()
+        run: docker compose -f scripts/docker-compose.yml down -v
+
+  testpypi-ray-iceberg-integration:
+    name: TestPyPI two-worker Ray Iceberg integration
+    needs: [assemble-testpypi-providers, verify-testpypi-iceberg]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    permissions:
+      contents: read
+    env:
+      VANE_RUNNER: ray
+      VANE_EXPECTED_EXTENSION_TRUST_IDENTITY: astrovela/vane-testpypi-v1
+      VANE_UDF_TARGET_MAX_BATCH_BYTES: "4096"
+      RAY_DEDUP_LOGS: "0"
+      INDEX_URL: https://test.pypi.org/simple/
+
+    steps:
+      - name: Checkout extension tests
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Install the exact indexed package graph
+        shell: bash
+        env:
+          VANE_VERSION: ${{ needs.assemble-testpypi-providers.outputs.vane_version }}
+          AVRO_VERSION: ${{ needs.assemble-testpypi-providers.outputs.avro_version }}
+          ICEBERG_VERSION: ${{ needs.assemble-testpypi-providers.outputs.iceberg_version }}
+        run: |
+          set -euo pipefail
+          python -m venv .venv-vane-testpypi-ray
+          . .venv-vane-testpypi-ray/bin/activate
+          python -m pip install --upgrade pip
+          mkdir -p indexed
+          download_exact() {
+            local requirement="$1"
+            for attempt in 1 2 3 4 5; do
+              if python -m pip download \
+                --disable-pip-version-check \
+                --no-cache-dir \
+                --no-deps \
+                --only-binary=:all: \
+                --index-url "$INDEX_URL" \
+                --dest indexed \
+                "$requirement"; then
+                return
+              fi
+              sleep 15
+            done
+            return 1
+          }
+          download_exact "vane-ai==$VANE_VERSION"
+          download_exact "vane-extension-avro==$AVRO_VERSION"
+          download_exact "vane-extension-iceberg==$ICEBERG_VERSION"
+
+          mapfile -t base_wheels < <(find indexed -maxdepth 1 -type f -name 'vane_ai-*.whl' -print)
+          mapfile -t avro_wheels < <(find indexed -maxdepth 1 -type f -name 'vane_extension_avro-*.whl' -print)
+          mapfile -t iceberg_wheels < <(find indexed -maxdepth 1 -type f -name 'vane_extension_iceberg-*.whl' -print)
+          test "${#base_wheels[@]}" -eq 1
+          test "${#avro_wheels[@]}" -eq 1
+          test "${#iceberg_wheels[@]}" -eq 1
+          python -m pip install "${base_wheels[0]}" "${avro_wheels[0]}" "${iceberg_wheels[0]}"
+          python -m pip check
+
+      - name: Start local Iceberg fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p data/generated/iceberg/spark-rest data/generated/intermediates
+          docker compose -f scripts/docker-compose.yml down -v
+          docker compose -f scripts/docker-compose.yml up -d
+
+      - name: Wait for fixture initialization
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 90); do
+            if docker compose -f scripts/docker-compose.yml logs mc 2>&1 | grep -Fq \
+              'MinIO warehouse and default namespace initialized.'; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker compose -f scripts/docker-compose.yml logs
+          exit 1
+
+      - name: Exercise the indexed providers through two Ray workers
+        run: .venv-vane-testpypi-ray/bin/python -I test/vane/test_vane_wheel_ray_iceberg.py
+
+      - name: Stop local Iceberg fixture
+        if: always()
+        run: docker compose -f scripts/docker-compose.yml down -v
+
   vane-wheel-ray-iceberg-integration:
+    if: inputs.operation != 'testpypi-dev'
     name: Vane dynamic wheel two-worker Ray Iceberg integration
     needs: vane-dynamic-wheels
     runs-on: ubuntu-24.04
@@ -284,6 +1006,7 @@ jobs:
       contents: read
     env:
       VANE_RUNNER: ray
+      VANE_EXPECTED_EXTENSION_TRUST_IDENTITY: vane-ci-test-key
       RAY_DEDUP_LOGS: "0"
       VANE_UDF_TARGET_MAX_BATCH_BYTES: "4096"
 

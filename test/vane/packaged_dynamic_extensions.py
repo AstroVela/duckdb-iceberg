@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import os
 from importlib import import_module
 from importlib.metadata import entry_points
-
-_TRUST_IDENTITY = "vane-ci-test-key"
 
 
 def load_packaged_dynamic_iceberg(connection: object) -> None:
     """Load the exact installed Avro -> Iceberg descriptor graph."""
     from vane.extensions import DynamicExtensionDescriptor, DynamicExtensionResolver, LocalExtensionProvider
+
+    trust_identity = os.environ.get("VANE_EXPECTED_EXTENSION_TRUST_IDENTITY")
+    if not trust_identity:
+        raise AssertionError("VANE_EXPECTED_EXTENSION_TRUST_IDENTITY must name the explicit test trust root")
 
     installed = tuple(entry_points(group="vane.dynamic_extension_providers"))
     descriptors: dict[str, DynamicExtensionDescriptor] = {}
@@ -28,7 +31,7 @@ def load_packaged_dynamic_iceberg(connection: object) -> None:
         descriptor = import_module(entry_point.module).descriptor()
         if descriptor.name != extension_name:
             raise AssertionError(f"{extension_name!r} provider returned descriptor for {descriptor.name!r}")
-        if descriptor.trust_identity != _TRUST_IDENTITY:
+        if descriptor.trust_identity != trust_identity:
             raise AssertionError(
                 f"{extension_name!r} descriptor uses unexpected trust identity {descriptor.trust_identity!r}"
             )
@@ -45,14 +48,12 @@ def load_packaged_dynamic_iceberg(connection: object) -> None:
     if tuple(dependency.identity for dependency in iceberg.dependencies) != (avro.identity,):
         raise AssertionError("the Iceberg wheel must declare the exact Avro wheel as its sole dynamic dependency")
 
-    security = connection.execute(
-        """
+    security = connection.execute("""
         SELECT
             CAST(current_setting('allow_unsigned_extensions') AS BOOLEAN),
             CAST(current_setting('autoinstall_known_extensions') AS BOOLEAN),
             CAST(current_setting('autoload_known_extensions') AS BOOLEAN)
-        """
-    ).fetchone()
+        """).fetchone()
     if security != (False, False, False):
         raise AssertionError(f"dynamic extension security settings are not fail-closed: {security!r}")
 
@@ -69,7 +70,7 @@ def load_packaged_dynamic_iceberg(connection: object) -> None:
             )
 
     resolved = DynamicExtensionResolver(
-        trusted_identities={_TRUST_IDENTITY},
+        trusted_identities={trust_identity},
         providers=providers,
     ).load(connection, iceberg)
     if resolved.descriptor != iceberg:

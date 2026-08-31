@@ -10,6 +10,7 @@ import platform
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -21,7 +22,10 @@ from packaging.tags import sys_tags
 
 AVRO_REVISION = "7f423d69709045e38f8431b3470e0395fce1a595"
 EXTENSION_NAMES = ("avro", "iceberg")
-TRUST_IDENTITY = "vane-ci-test-key"
+SIGNING_PROFILES = {
+    "ci-test": ("vane-ci-test-key", "VANE_ENABLE_TEST_EXTENSION_SIGNING_KEY"),
+    "testpypi": ("astrovela/vane-testpypi-v1", "VANE_ENABLE_TESTPYPI_EXTENSION_SIGNING_KEY"),
+}
 LICENSE_EXPRESSION = (
     "0BSD AND Apache-2.0 AND BSD-2-Clause AND BSD-3-Clause AND BSL-1.0 AND ISC AND MIT AND "
     "Unicode-DFS-2015 AND Zlib AND curl"
@@ -63,6 +67,7 @@ EXPECTED_VCPKG_LICENSE_COMPONENTS = frozenset(
 )
 _REVISION_RE = re.compile(r"^[0-9a-f]{40}$")
 _PLATFORM_TAG_RE = re.compile(r"^manylinux_[0-9]+_[0-9]+_x86_64$")
+_MAX_SIGNING_PRIVATE_KEY_BYTES = 64 * 1024
 
 
 class QualificationError(RuntimeError):
@@ -102,6 +107,36 @@ def _require_file(path: Path, description: str) -> Path:
     if not resolved.is_file():
         raise QualificationError(f"{description} is not a file: {resolved}")
     return resolved
+
+
+def _destroy_file(path: Path) -> None:
+    size = path.stat().st_size
+    with path.open("r+b", buffering=0) as destination:
+        destination.write(b"\0" * size)
+        os.fsync(destination.fileno())
+    path.unlink()
+
+
+def _read_signing_private_key(path: Path, *, consume: bool) -> bytearray:
+    unresolved = path.expanduser().absolute()
+    if consume and unresolved.is_symlink():
+        raise QualificationError("consumed extension signing private key must not be a symbolic link")
+    resolved = _require_file(path, "extension signing private key")
+    metadata = resolved.stat()
+    size = metadata.st_size
+    if size <= 0 or size > _MAX_SIGNING_PRIVATE_KEY_BYTES:
+        raise QualificationError("extension signing private key has an invalid size")
+    if consume and (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(metadata.st_mode) & 0o077
+    ):
+        raise QualificationError("consumed extension signing private key must be a private, owned regular file")
+    contents = bytearray(resolved.read_bytes())
+    if consume:
+        _destroy_file(resolved)
+    return contents
 
 
 def _require_git_revision(source: Path, expected: str, description: str) -> None:
@@ -196,6 +231,7 @@ def _build_environment(
     vane_vcpkg_installed: Path,
     vcpkg_toolchain: Path,
     jobs: int,
+    signing_cmake_option: str,
 ) -> dict[str, str]:
     target_triplet = "x64-linux"
     dependency_prefix = vane_vcpkg_installed / target_triplet
@@ -216,7 +252,7 @@ def _build_environment(
         "-DENABLE_EXTENSION_AUTOINSTALL=OFF",
         "-DEXTENSION_STATIC_BUILD=ON",
         "-DICEBERG_VANE_DISTRIBUTED=ON",
-        "-DVANE_ENABLE_TEST_EXTENSION_SIGNING_KEY=ON",
+        f"-D{signing_cmake_option}=ON",
         "-DVANE_LOADABLE_EXTENSIONS=avro;iceberg",
         f"-DVANE_LOADABLE_EXTENSION_OUTPUT_DIRECTORY={staged_extensions}",
         "-DVCPKG_BUILD=ON",
@@ -397,12 +433,26 @@ def _stage_license_files(
     return avro_licenses, iceberg_licenses
 
 
-def _builder_python(base_wheel: Path, parent: Path) -> tuple[tempfile.TemporaryDirectory[str], Path]:
+def _builder_python(
+    interpreter: Path,
+    base_wheel: Path,
+    parent: Path,
+) -> tuple[tempfile.TemporaryDirectory[str], Path]:
     temporary = tempfile.TemporaryDirectory(prefix="vane-dynamic-wheel-builder-", dir=parent)
     environment_root = Path(temporary.name)
-    _run((sys.executable, "-I", "-m", "venv", "--copies", str(environment_root)))
+    _run((str(interpreter), "-I", "-m", "venv", "--copies", str(environment_root)))
     python = environment_root / "bin/python"
-    _run((str(python), "-m", "pip", "install", "--disable-pip-version-check", str(base_wheel)))
+    _run(
+        (
+            str(python),
+            "-m",
+            "pip",
+            "install",
+            "--disable-pip-version-check",
+            "packaging>=24.2",
+            str(base_wheel),
+        )
+    )
     return temporary, python
 
 
@@ -414,6 +464,7 @@ def _build_provider_wheel(
     extension_name: str,
     output_directory: Path,
     platform_tag: str,
+    trust_identity: str,
     license_files: Iterable[Path],
     dependency_wheel: Path | None = None,
 ) -> Path:
@@ -430,7 +481,7 @@ def _build_provider_wheel(
         "--platform-tag",
         platform_tag,
         "--trust-identity",
-        TRUST_IDENTITY,
+        trust_identity,
         "--license-expression",
         LICENSE_EXPRESSION,
     ]
@@ -442,7 +493,7 @@ def _build_provider_wheel(
                 "--dependency-wheel",
                 str(dependency_wheel),
                 "--dependency-trust-identity",
-                TRUST_IDENTITY,
+                trust_identity,
             )
         )
     _run(command)
@@ -464,6 +515,33 @@ def _parse_arguments() -> argparse.Namespace:
     parser.add_argument("--build-directory", required=True, type=Path)
     parser.add_argument("--output-directory", required=True, type=Path)
     parser.add_argument("--jobs", default=8, type=int)
+    parser.add_argument("--signing-profile", required=True, choices=tuple(SIGNING_PROFILES))
+    parser.add_argument("--signing-private-key", required=True, type=Path)
+    parser.add_argument(
+        "--consume-signing-private-key",
+        action="store_true",
+        help="Securely remove the ephemeral key input before starting any build subprocess",
+    )
+    runtime_group = parser.add_mutually_exclusive_group(required=True)
+    runtime_group.add_argument(
+        "--package-local-runtime",
+        action="store_true",
+        help="Package and emit the locally built Vane wheel for CI-only qualification",
+    )
+    runtime_group.add_argument(
+        "--runtime-python",
+        action="append",
+        default=[],
+        type=Path,
+        help="Interpreter matching one indexed runtime wheel; repeat with --runtime-wheel",
+    )
+    parser.add_argument(
+        "--runtime-wheel",
+        action="append",
+        default=[],
+        type=Path,
+        help="Exact indexed Vane wheel for the matching --runtime-python",
+    )
     return parser.parse_args()
 
 
@@ -471,11 +549,34 @@ def main() -> int:
     arguments = _parse_arguments()
     if arguments.jobs <= 0:
         raise QualificationError("--jobs must be a positive integer")
+    if arguments.package_local_runtime and arguments.runtime_wheel:
+        raise QualificationError("--runtime-wheel cannot be combined with --package-local-runtime")
+    if len(arguments.runtime_python) != len(arguments.runtime_wheel):
+        raise QualificationError("--runtime-python and --runtime-wheel must be supplied the same number of times")
+    if not arguments.package_local_runtime and not arguments.runtime_python:
+        raise QualificationError("at least one indexed runtime pair is required")
 
     extension_root = _require_directory(arguments.extension_root, "extension root")
     avro_source = _require_directory(arguments.avro_source, "Avro source")
     vane_source = _require_directory(arguments.vane_source, "Vane source")
     vane_vcpkg_installed = _require_directory(arguments.vane_vcpkg_installed, "Vane vcpkg installation")
+    trust_identity, signing_cmake_option = SIGNING_PROFILES[arguments.signing_profile]
+    if arguments.signing_profile == "testpypi" and not arguments.consume_signing_private_key:
+        raise QualificationError("the TestPyPI signing profile requires --consume-signing-private-key")
+    signing_private_key_contents = _read_signing_private_key(
+        arguments.signing_private_key,
+        consume=arguments.consume_signing_private_key,
+    )
+    indexed_runtimes: tuple[tuple[Path, Path], ...] = tuple(
+        (
+            _require_file(interpreter, "runtime Python interpreter"),
+            _require_file(wheel, "indexed Vane runtime wheel"),
+        )
+        for interpreter, wheel in zip(arguments.runtime_python, arguments.runtime_wheel, strict=True)
+    )
+    for interpreter, _wheel in indexed_runtimes:
+        if not os.access(interpreter, os.X_OK):
+            raise QualificationError(f"runtime Python interpreter is not executable: {interpreter}")
     vcpkg_toolchain = _require_vcpkg_toolchain(
         arguments.vcpkg_toolchain,
         _vcpkg_baseline(extension_root),
@@ -499,6 +600,7 @@ def main() -> int:
         vane_vcpkg_installed=vane_vcpkg_installed,
         vcpkg_toolchain=vcpkg_toolchain,
         jobs=arguments.jobs,
+        signing_cmake_option=signing_cmake_option,
     )
 
     with tempfile.TemporaryDirectory(prefix="vane-base-wheel-", dir=build_directory.parent) as base_output_value:
@@ -536,24 +638,41 @@ def main() -> int:
         signed_directory = build_directory / "signed-vane-extensions"
         signed_directory.mkdir(parents=True, exist_ok=True)
         signed_artifacts: dict[str, Path] = {}
-        for extension_name in EXTENSION_NAMES:
-            unsigned = _require_file(
-                unsigned_directory / f"{extension_name}.duckdb_extension",
-                f"unsigned {extension_name} artifact",
-            )
-            _require_no_undefined_duckdb_symbols(unsigned)
-            signed = signed_directory / unsigned.name
-            _run(
-                (
-                    sys.executable,
-                    str(vane_source / "scripts/sign_test_dynamic_extension.py"),
-                    "--private-key",
-                    str(vane_source / "external/duckdb/test/mbedtls/private.pem"),
-                    str(unsigned),
-                    str(signed),
+        key_handle, ephemeral_key_name = tempfile.mkstemp(
+            prefix=".vane-extension-signing-",
+            suffix=".pem",
+            dir=signed_directory,
+        )
+        ephemeral_key = Path(ephemeral_key_name)
+        try:
+            with os.fdopen(key_handle, "wb") as key_output:
+                os.fchmod(key_output.fileno(), 0o600)
+                key_output.write(signing_private_key_contents)
+                key_output.flush()
+                os.fsync(key_output.fileno())
+            for extension_name in EXTENSION_NAMES:
+                unsigned = _require_file(
+                    unsigned_directory / f"{extension_name}.duckdb_extension",
+                    f"unsigned {extension_name} artifact",
                 )
-            )
-            signed_artifacts[extension_name] = signed
+                _require_no_undefined_duckdb_symbols(unsigned)
+                signed = signed_directory / unsigned.name
+                _run(
+                    (
+                        sys.executable,
+                        str(vane_source / "scripts/sign_test_dynamic_extension.py"),
+                        "--private-key",
+                        str(ephemeral_key),
+                        str(unsigned),
+                        str(signed),
+                    )
+                )
+                signed_artifacts[extension_name] = signed
+        finally:
+            signing_private_key_contents[:] = b"\0" * len(signing_private_key_contents)
+            signing_private_key_contents.clear()
+            if ephemeral_key.exists():
+                _destroy_file(ephemeral_key)
 
         avro_licenses, iceberg_licenses = _stage_license_files(
             extension_root=extension_root,
@@ -563,70 +682,94 @@ def main() -> int:
         )
         with tempfile.TemporaryDirectory(prefix="vane-qualified-wheels-", dir=output_directory.parent) as staging_value:
             staging = Path(staging_value)
-            repaired_base_directory = staging / "base"
-            provider_directory = staging / "extensions"
-            repaired_base_directory.mkdir()
-            provider_directory.mkdir()
-            _run(
-                (
-                    sys.executable,
-                    "-m",
-                    "auditwheel",
-                    "repair",
-                    "--plat",
-                    platform_tag,
-                    "--wheel-dir",
-                    str(repaired_base_directory),
-                    str(base_wheel),
-                )
-            )
-            repaired_base = _one_wheel(repaired_base_directory, "vane_ai-*.whl", "repaired base Vane wheel")
-
-            builder_environment, builder_python = _builder_python(base_wheel, build_directory.parent)
-            try:
-                avro_wheel = _build_provider_wheel(
-                    python=builder_python,
-                    vane_source=vane_source,
-                    artifact=signed_artifacts["avro"],
-                    extension_name="avro",
-                    output_directory=provider_directory,
-                    platform_tag=platform_tag,
-                    license_files=avro_licenses,
-                )
-                iceberg_wheel = _build_provider_wheel(
-                    python=builder_python,
-                    vane_source=vane_source,
-                    artifact=signed_artifacts["iceberg"],
-                    extension_name="iceberg",
-                    output_directory=provider_directory,
-                    platform_tag=platform_tag,
-                    license_files=iceberg_licenses,
-                    dependency_wheel=avro_wheel,
-                )
+            emitted_base_wheel: Path | None = None
+            if arguments.package_local_runtime:
+                repaired_base_directory = staging / "base"
+                repaired_base_directory.mkdir()
                 _run(
                     (
-                        str(builder_python),
-                        "-I",
-                        str(vane_source / "scripts/verify_extension_wheel.py"),
-                        "--base-wheel",
-                        str(repaired_base),
-                        "--dependency-wheel",
-                        str(avro_wheel),
-                        "--extension-wheel",
-                        str(iceberg_wheel),
-                        "--extension-name",
-                        "iceberg",
-                        "--trust-identity",
-                        TRUST_IDENTITY,
-                        "--dependency-trust-identity",
-                        TRUST_IDENTITY,
+                        sys.executable,
+                        "-m",
+                        "auditwheel",
+                        "repair",
+                        "--plat",
+                        platform_tag,
+                        "--wheel-dir",
+                        str(repaired_base_directory),
+                        str(base_wheel),
                     )
                 )
-            finally:
-                builder_environment.cleanup()
+                emitted_base_wheel = _one_wheel(
+                    repaired_base_directory,
+                    "vane_ai-*.whl",
+                    "repaired base Vane wheel",
+                )
+                runtimes = ((Path(sys.executable).resolve(), emitted_base_wheel),)
+            else:
+                runtimes = indexed_runtimes
 
-            for wheel in (repaired_base, avro_wheel, iceberg_wheel):
+            built_provider_wheels: list[Path] = []
+            for runtime_index, (runtime_python, runtime_wheel) in enumerate(runtimes):
+                provider_directory = staging / f"extensions-{runtime_index}"
+                provider_directory.mkdir()
+                builder_environment, builder_python = _builder_python(
+                    runtime_python,
+                    runtime_wheel,
+                    build_directory.parent,
+                )
+                try:
+                    avro_wheel = _build_provider_wheel(
+                        python=builder_python,
+                        vane_source=vane_source,
+                        artifact=signed_artifacts["avro"],
+                        extension_name="avro",
+                        output_directory=provider_directory,
+                        platform_tag=platform_tag,
+                        trust_identity=trust_identity,
+                        license_files=avro_licenses,
+                    )
+                    iceberg_wheel = _build_provider_wheel(
+                        python=builder_python,
+                        vane_source=vane_source,
+                        artifact=signed_artifacts["iceberg"],
+                        extension_name="iceberg",
+                        output_directory=provider_directory,
+                        platform_tag=platform_tag,
+                        trust_identity=trust_identity,
+                        license_files=iceberg_licenses,
+                        dependency_wheel=avro_wheel,
+                    )
+                    _run(
+                        (
+                            str(builder_python),
+                            "-I",
+                            str(vane_source / "scripts/verify_extension_wheel.py"),
+                            "--base-wheel",
+                            str(runtime_wheel),
+                            "--dependency-wheel",
+                            str(avro_wheel),
+                            "--extension-wheel",
+                            str(iceberg_wheel),
+                            "--extension-name",
+                            "iceberg",
+                            "--trust-identity",
+                            trust_identity,
+                            "--dependency-trust-identity",
+                            trust_identity,
+                        )
+                    )
+                finally:
+                    builder_environment.cleanup()
+                built_provider_wheels.extend((avro_wheel, iceberg_wheel))
+
+            wheels_to_emit = (
+                *((emitted_base_wheel,) if emitted_base_wheel is not None else ()),
+                *built_provider_wheels,
+            )
+            for wheel in wheels_to_emit:
                 destination = output_directory / wheel.name
+                if destination.exists():
+                    raise QualificationError(f"multiple runtime targets produced the same wheel: {destination.name}")
                 shutil.copyfile(wheel, destination)
                 print(destination)
     return 0
