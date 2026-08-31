@@ -527,7 +527,7 @@ jobs:
 
           "$VANE_PYTHON" -I extension/scripts/build_vane_dynamic_wheels.py \
             --extension-root "$VANE_EXTENSION_ROOT" \
-            --avro-source "${{ github.workspace }}/avro" \
+            --avro-source "$GITHUB_WORKSPACE/avro" \
             --vane-source "$VANE_SOURCE_DIR" \
             --vane-revision "${{ steps.manifest.outputs.vane_revision }}" \
             --vane-vcpkg-installed "$VANE_VCPKG_INSTALLED_DIR" \
