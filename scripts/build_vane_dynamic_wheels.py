@@ -450,6 +450,7 @@ def _builder_python(
             "install",
             "--disable-pip-version-check",
             "packaging>=24.2",
+            "tomli>=1.1; python_version < '3.11'",
             str(base_wheel),
         )
     )
