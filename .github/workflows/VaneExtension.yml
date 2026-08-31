@@ -540,14 +540,14 @@ jobs:
             --consume-signing-private-key \
             "${runtime_arguments[@]}"
 
-      - name: Validate the immutable unpublished release set
+      - name: Validate the immutable publishable release set
         id: release
         shell: bash
         run: |
           "$VANE_PYTHON" extension/scripts/validate_vane_provider_release.py validate \
             --directory "$VANE_DYNAMIC_DIST_DIR" \
             --vane-version "${{ steps.vane_candidate.outputs.version }}" \
-            --require-testpypi-absent \
+            --require-testpypi-publishable \
             --github-output "$GITHUB_OUTPUT"
 
       - name: Report compiler cache
@@ -606,7 +606,7 @@ jobs:
           python scripts/validate_vane_provider_release.py validate \
             --directory packages \
             --vane-version "${{ needs.vane-testpypi-wheels.outputs.vane_version }}" \
-            --require-testpypi-absent
+            --require-testpypi-publishable
 
       - name: Separate distributions and generate checksums
         run: |

@@ -175,19 +175,6 @@ def _request_json(url: str) -> tuple[int, object | None]:
         raise ReleaseValidationError(f"TestPyPI query failed for {url}: {error}") from error
 
 
-def require_versions_absent(versions: dict[str, str]) -> None:
-    """Require both immutable provider versions to be unused on TestPyPI."""
-    for extension_name, version in versions.items():
-        distribution_name = PROVIDER_DISTRIBUTIONS[extension_name]
-        encoded_name = urllib.parse.quote(distribution_name, safe="")
-        encoded_version = urllib.parse.quote(version, safe="")
-        status, _document = _request_json(f"{TESTPYPI_JSON_BASE}/{encoded_name}/{encoded_version}/json")
-        if status != 404:
-            raise ReleaseValidationError(
-                f"expected unused TestPyPI version {distribution_name}=={version}, received HTTP {status}"
-            )
-
-
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as source:
@@ -196,15 +183,7 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def require_index_match(
-    directory: Path,
-    distribution_name: str,
-    version: str,
-    *,
-    attempts: int,
-    delay_seconds: int,
-) -> None:
-    """Wait for TestPyPI to expose exactly the locally assembled wheels."""
+def _expected_wheel_hashes(directory: Path, distribution_name: str, version: str) -> dict[str, str]:
     normalized_name = canonicalize_name(distribution_name)
     canonical_version = _canonical_version(version, "provider version")
     expected = {
@@ -217,6 +196,68 @@ def require_index_match(
         raise ReleaseValidationError(
             f"expected five local {distribution_name}=={canonical_version} wheels, found {len(expected)}"
         )
+    return expected
+
+
+def _indexed_wheel_hashes(document: object, distribution_name: str, version: str) -> dict[str, str]:
+    if not isinstance(document, dict) or not isinstance(document.get("urls"), list):
+        raise ReleaseValidationError(f"TestPyPI returned malformed metadata for {distribution_name}=={version}")
+
+    actual: dict[str, str] = {}
+    for item in document["urls"]:
+        if not isinstance(item, dict):
+            raise ReleaseValidationError(f"TestPyPI returned malformed files for {distribution_name}=={version}")
+        filename = item.get("filename")
+        digest = item.get("digests", {}).get("sha256") if isinstance(item.get("digests"), dict) else None
+        if item.get("packagetype") != "bdist_wheel" or not isinstance(filename, str) or not isinstance(digest, str):
+            raise ReleaseValidationError(
+                f"TestPyPI returned a non-wheel or malformed file for {distribution_name}=={version}"
+            )
+        if filename in actual:
+            raise ReleaseValidationError(
+                f"TestPyPI returned duplicate file {filename} for {distribution_name}=={version}"
+            )
+        actual[filename] = digest
+    if not actual:
+        raise ReleaseValidationError(
+            f"TestPyPI returned an existing version without wheels: {distribution_name}=={version}"
+        )
+    return actual
+
+
+def require_indexes_publishable(directory: Path, versions: dict[str, str]) -> None:
+    """Allow a first publish or an exact, potentially partial, immutable rerun."""
+    for extension_name, version in versions.items():
+        distribution_name = PROVIDER_DISTRIBUTIONS[extension_name]
+        expected = _expected_wheel_hashes(directory, distribution_name, version)
+        encoded_name = urllib.parse.quote(distribution_name, safe="")
+        encoded_version = urllib.parse.quote(version, safe="")
+        status, document = _request_json(f"{TESTPYPI_JSON_BASE}/{encoded_name}/{encoded_version}/json")
+        if status == 404:
+            continue
+        if status != 200:
+            raise ReleaseValidationError(
+                f"expected absent or reusable TestPyPI version {distribution_name}=={version}, received HTTP {status}"
+            )
+        actual = _indexed_wheel_hashes(document, distribution_name, version)
+        conflicts = {filename: digest for filename, digest in actual.items() if expected.get(filename) != digest}
+        if conflicts:
+            raise ReleaseValidationError(
+                f"indexed wheel identities conflict for {distribution_name}=={version}: {conflicts}"
+            )
+
+
+def require_index_match(
+    directory: Path,
+    distribution_name: str,
+    version: str,
+    *,
+    attempts: int,
+    delay_seconds: int,
+) -> None:
+    """Wait for TestPyPI to expose exactly the locally assembled wheels."""
+    canonical_version = _canonical_version(version, "provider version")
+    expected = _expected_wheel_hashes(directory, distribution_name, canonical_version)
 
     encoded_name = urllib.parse.quote(distribution_name, safe="")
     encoded_version = urllib.parse.quote(canonical_version, safe="")
@@ -225,12 +266,8 @@ def require_index_match(
     for attempt in range(1, attempts + 1):
         try:
             status, document = _request_json(url)
-            if status == 200 and isinstance(document, dict):
-                actual = {
-                    item.get("filename"): item.get("digests", {}).get("sha256")
-                    for item in document.get("urls", [])
-                    if isinstance(item, dict) and item.get("packagetype") == "bdist_wheel"
-                }
+            if status == 200:
+                actual = _indexed_wheel_hashes(document, distribution_name, canonical_version)
                 if actual == expected:
                     return
                 last_problem = f"indexed wheel identities differ: expected={expected}, actual={actual}"
@@ -254,11 +291,11 @@ def _parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    validate = subparsers.add_parser("validate", help="validate a complete unpublished release set")
+    validate = subparsers.add_parser("validate", help="validate a complete immutable release set")
     validate.add_argument("--directory", required=True, type=Path)
     validate.add_argument("--vane-version", required=True)
     validate.add_argument("--github-output", type=Path)
-    validate.add_argument("--require-testpypi-absent", action="store_true")
+    validate.add_argument("--require-testpypi-publishable", action="store_true")
 
     verify = subparsers.add_parser("verify-index", help="compare one indexed release with local wheels")
     verify.add_argument("--directory", required=True, type=Path)
@@ -274,8 +311,8 @@ def main() -> int:
     try:
         if arguments.command == "validate":
             versions = validate_release(arguments.directory, arguments.vane_version)
-            if arguments.require_testpypi_absent:
-                require_versions_absent(versions)
+            if arguments.require_testpypi_publishable:
+                require_indexes_publishable(arguments.directory, versions)
             if arguments.github_output is not None:
                 _write_github_output(arguments.github_output, arguments.vane_version, versions)
             print(json.dumps({"vane_version": arguments.vane_version, **versions}, sort_keys=True))
