@@ -794,7 +794,7 @@ jobs:
       contents: read
     env:
       VANE_RUNNER: local-fast
-      VANE_EXPECTED_EXTENSION_TRUST_IDENTITY: astrovela/vane-testpypi-v1
+      VANE_EXPECTED_EXTENSION_TRUST_IDENTITY: astrovela/vane-testpypi
       INDEX_URL: https://test.pypi.org/simple/
 
     steps:
@@ -908,7 +908,7 @@ jobs:
       contents: read
     env:
       VANE_RUNNER: ray
-      VANE_EXPECTED_EXTENSION_TRUST_IDENTITY: astrovela/vane-testpypi-v1
+      VANE_EXPECTED_EXTENSION_TRUST_IDENTITY: astrovela/vane-testpypi
       VANE_UDF_TARGET_MAX_BATCH_BYTES: "4096"
       RAY_DEDUP_LOGS: "0"
       INDEX_URL: https://test.pypi.org/simple/
