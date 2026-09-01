@@ -24,7 +24,7 @@ AVRO_REVISION = "7f423d69709045e38f8431b3470e0395fce1a595"
 EXTENSION_NAMES = ("avro", "iceberg")
 SIGNING_PROFILES = {
     "ci-test": ("vane-ci-test-key", "VANE_ENABLE_TEST_EXTENSION_SIGNING_KEY"),
-    "testpypi": ("astrovela/vane-testpypi-v1", "VANE_ENABLE_TESTPYPI_EXTENSION_SIGNING_KEY"),
+    "testpypi": ("astrovela/vane-testpypi", "VANE_ENABLE_TESTPYPI_EXTENSION_SIGNING_KEY"),
 }
 LICENSE_EXPRESSION = (
     "0BSD AND Apache-2.0 AND BSD-2-Clause AND BSD-3-Clause AND BSL-1.0 AND ISC AND MIT AND "
