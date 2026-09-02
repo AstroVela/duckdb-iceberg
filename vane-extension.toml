@@ -6,4 +6,4 @@ native_test_selection = "test/sql/local/iceberg_scans/iceberg_v1_existing_manife
 
 [vane]
 repository = "AstroVela/vane"
-revision = "4bd8e72338c804b7f36a44eea29547241e5cd88a"
+revision = "472df75ab51fd3eac2642f6646545075549e5921"
