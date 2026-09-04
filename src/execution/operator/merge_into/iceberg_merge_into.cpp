@@ -20,12 +20,9 @@
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/limits.hpp"
 #include "duckdb/common/multi_file/multi_file_reader.hpp"
-#include "duckdb/common/unordered_map.hpp"
 #include "duckdb/common/unordered_set.hpp"
 #include "duckdb/execution/distributed/extension_write_task_provider.hpp"
-#include "duckdb/execution/operator/projection/physical_projection.hpp"
 #include "duckdb/execution/operator/scan/physical_table_scan.hpp"
-#include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
 #include "catalog/rest/api/table_update.hpp"
 #include "catalog/rest/transaction/iceberg_transaction_data.hpp"
@@ -111,138 +108,44 @@ CopyDistributedMergeExpressions(const vector<unique_ptr<Expression>> &expression
 	return result;
 }
 
-static void ReplaceDistributedMergeProjectionReferences(unique_ptr<Expression> &expression,
-                                                        const PhysicalProjection &projection,
-                                                        unordered_set<idx_t> *referenced_projection_indexes) {
-	ExpressionIterator::VisitExpressionMutable<BoundReferenceExpression>(
-	    expression, [&](BoundReferenceExpression &reference, unique_ptr<Expression> &node) {
-		    if (reference.index >= projection.select_list.size() || reference.index >= projection.types.size() ||
-		        reference.return_type != projection.types[reference.index]) {
-			    throw InternalException("Iceberg distributed MERGE projection reference is invalid");
-		    }
-		    if (referenced_projection_indexes) {
-			    referenced_projection_indexes->insert(reference.index);
-		    }
-		    node = projection.select_list[reference.index]->Copy();
-	    });
-}
-
-static void RemapDistributedMergeInputReferences(unique_ptr<Expression> &expression,
-                                                 const vector<LogicalType> &input_types,
-                                                 const unordered_map<idx_t, idx_t> &output_indexes) {
-	ExpressionIterator::VisitExpressionMutable<BoundReferenceExpression>(
-	    expression, [&](BoundReferenceExpression &reference, unique_ptr<Expression> &) {
+static void CollectDistributedMergeInputReferences(const unique_ptr<Expression> &expression,
+                                                   const vector<LogicalType> &input_types,
+                                                   unordered_set<idx_t> *referenced_input_indexes) {
+	if (!expression) {
+		return;
+	}
+	ExpressionIterator::VisitExpression<BoundReferenceExpression>(
+	    *expression, [&](const BoundReferenceExpression &reference) {
 		    if (reference.index >= input_types.size() || reference.return_type != input_types[reference.index]) {
-			    throw InternalException("Iceberg distributed MERGE input reference is invalid");
+			    throw InternalException("Iceberg distributed MERGE action reference is invalid");
 		    }
-		    auto output_index = output_indexes.find(reference.index);
-		    if (output_index == output_indexes.end()) {
-			    throw InternalException("Iceberg distributed MERGE input reference was not projected");
+		    if (referenced_input_indexes) {
+			    referenced_input_indexes->insert(reference.index);
 		    }
-		    reference.index = output_index->second;
 	    });
 }
 
-static PhysicalOperator &PlanIcebergDistributedMergeWorkerInput(PhysicalPlanGenerator &planner, PhysicalOperator &input,
-                                                                vector<IcebergDistributedMergePlanAction> &actions,
-                                                                vector<idx_t> &null_target_partition_indexes,
-                                                                bool &projection_rewritten) {
-	projection_rewritten = false;
+static bool CollectDistributedMergeInsertPartitionIndexes(const PhysicalOperator &input,
+                                                          const vector<IcebergDistributedMergePlanAction> &actions,
+                                                          vector<idx_t> &null_target_partition_indexes) {
 	if (input.type != PhysicalOperatorType::PROJECTION) {
-		return input;
+		return false;
 	}
-	projection_rewritten = true;
-	auto &root_projection = input.Cast<PhysicalProjection>();
-	if (root_projection.children.size() != 1 || root_projection.select_list.size() != root_projection.types.size()) {
-		throw InternalException("Iceberg distributed MERGE input projection is invalid");
-	}
-
-	vector<const PhysicalProjection *> projection_chain;
-	projection_chain.push_back(&root_projection);
-	auto *base_input = &root_projection.children[0].get();
-	while (base_input->type == PhysicalOperatorType::PROJECTION) {
-		auto &projection = base_input->Cast<PhysicalProjection>();
-		if (projection.children.size() != 1 || projection.select_list.size() != projection.types.size()) {
-			throw InternalException("Iceberg distributed MERGE projection chain is invalid");
-		}
-		projection_chain.push_back(&projection);
-		base_input = &projection.children[0].get();
-	}
-
-	unordered_set<idx_t> action_projection_indexes;
-	unordered_set<idx_t> action_input_indexes;
 	unordered_set<idx_t> insert_input_indexes;
-	const auto output_count = root_projection.types.size();
-	for (auto &action : actions) {
-		auto rewrite_action_expression = [&](unique_ptr<Expression> &expression) {
-			if (!expression) {
-				return;
-			}
-			ReplaceDistributedMergeProjectionReferences(expression, *projection_chain[0], &action_projection_indexes);
-			for (idx_t index = 1; index < projection_chain.size(); index++) {
-				ReplaceDistributedMergeProjectionReferences(expression, *projection_chain[index], nullptr);
-			}
-			ExpressionIterator::VisitExpression<BoundReferenceExpression>(
-			    *expression, [&](const BoundReferenceExpression &reference) {
-				    if (reference.index >= base_input->types.size() ||
-				        reference.return_type != base_input->types[reference.index]) {
-					    throw InternalException("Iceberg distributed MERGE input reference is invalid");
-				    }
-				    action_input_indexes.insert(reference.index);
-				    if (action.action_type == MergeActionType::MERGE_INSERT) {
-					    insert_input_indexes.insert(reference.index);
-				    }
-			    });
-		};
-		rewrite_action_expression(action.condition);
-		for (auto &expression : action.expressions) {
-			rewrite_action_expression(expression);
+	for (const auto &action : actions) {
+		auto referenced_input_indexes =
+		    action.action_type == MergeActionType::MERGE_INSERT ? &insert_input_indexes : nullptr;
+		CollectDistributedMergeInputReferences(action.condition, input.types, referenced_input_indexes);
+		for (const auto &expression : action.expressions) {
+			CollectDistributedMergeInputReferences(expression, input.types, referenced_input_indexes);
 		}
 	}
-
-	vector<unique_ptr<Expression>> worker_expressions;
-	worker_expressions.reserve(output_count + base_input->types.size());
-	for (const auto &root_expression : root_projection.select_list) {
-		auto expression = root_expression->Copy();
-		for (idx_t index = 1; index < projection_chain.size(); index++) {
-			ReplaceDistributedMergeProjectionReferences(expression, *projection_chain[index], nullptr);
-		}
-		worker_expressions.push_back(std::move(expression));
-	}
-	for (auto projection_index : action_projection_indexes) {
-		if (worker_expressions[projection_index]->GetExpressionClass() != ExpressionClass::BOUND_REF) {
-			worker_expressions[projection_index] =
-			    make_uniq<BoundConstantExpression>(Value(root_projection.types[projection_index]));
-		}
-	}
-
-	auto worker_types = root_projection.types;
-	unordered_map<idx_t, idx_t> output_indexes;
-	for (idx_t input_index = 0; input_index < base_input->types.size(); input_index++) {
-		if (action_input_indexes.find(input_index) == action_input_indexes.end()) {
-			continue;
-		}
-		output_indexes.emplace(input_index, worker_types.size());
-		worker_types.push_back(base_input->types[input_index]);
-		worker_expressions.push_back(make_uniq<BoundReferenceExpression>(base_input->types[input_index], input_index));
-	}
-	for (idx_t input_index = 0; input_index < base_input->types.size(); input_index++) {
+	for (idx_t input_index = 0; input_index < input.types.size(); input_index++) {
 		if (insert_input_indexes.find(input_index) != insert_input_indexes.end()) {
-			null_target_partition_indexes.push_back(output_indexes.at(input_index));
+			null_target_partition_indexes.push_back(input_index);
 		}
 	}
-	for (auto &action : actions) {
-		if (action.condition) {
-			RemapDistributedMergeInputReferences(action.condition, base_input->types, output_indexes);
-		}
-		for (auto &expression : action.expressions) {
-			RemapDistributedMergeInputReferences(expression, base_input->types, output_indexes);
-		}
-	}
-	auto &result = planner.Make<PhysicalProjection>(std::move(worker_types), std::move(worker_expressions),
-	                                                input.estimated_cardinality);
-	result.children.push_back(*base_input);
-	return result;
+	return true;
 }
 
 static void FindDistributedMergeTargetScan(PhysicalOperator &plan, const IcebergTableEntry &target,
@@ -781,10 +684,7 @@ PhysicalOperator &IcebergCatalog::PlanMergeInto(ClientContext &context, Physical
 	FindDistributedMergeTargetScan(plan, table_entry, target_file_list);
 	auto worker_plan_is_statically_empty = plan.type == PhysicalOperatorType::EMPTY_RESULT;
 	vector<idx_t> null_target_partition_indexes;
-	bool projection_rewritten;
-	auto &worker_input = PlanIcebergDistributedMergeWorkerInput(planner, plan, distributed_actions,
-	                                                            null_target_partition_indexes, projection_rewritten);
-	if (!projection_rewritten) {
+	if (!CollectDistributedMergeInsertPartitionIndexes(plan, distributed_actions, null_target_partition_indexes)) {
 		for (idx_t index = 0; index < op.row_id_start; index++) {
 			if (!op.source_marker.IsValid() || index != op.source_marker.GetIndex()) {
 				null_target_partition_indexes.push_back(index);
@@ -794,7 +694,7 @@ PhysicalOperator &IcebergCatalog::PlanMergeInto(ClientContext &context, Physical
 	auto iceberg_version = table_entry.table_info.table_metadata.iceberg_version;
 	auto file_path_index = op.row_id_start + (iceberg_version >= 3 ? 1 : 0);
 	auto &distributed_worker_child =
-	    PlanIcebergDistributedMergeRepartition(planner, worker_input, file_path_index, null_target_partition_indexes);
+	    PlanIcebergDistributedMergeRepartition(planner, plan, file_path_index, null_target_partition_indexes);
 	auto &result = planner.Make<PhysicalIcebergDistributedMergeInto>(
 	    op.types, std::move(actions), op.row_id_start, op.source_marker, op.return_chunk, context, table_entry,
 	    target_file_list, distributed_worker_child, std::move(distributed_actions), update_delete_count, has_update,

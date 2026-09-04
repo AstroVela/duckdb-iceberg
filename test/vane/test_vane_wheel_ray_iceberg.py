@@ -777,6 +777,24 @@ def exercise_distributed_merge(harness: RayIcebergHarness) -> None:
         expected_v2_rows,
     )
 
+    volatile_id = SOURCE_ROW_COUNT + 100
+    merge(
+        "distributed Iceberg MERGE preserves projected volatile values",
+        connection.sql(f"SELECT {volatile_id}::INTEGER AS id, random()::VARCHAR AS volatile_value"),
+        MERGE_V2_TABLE,
+        [
+            "WHEN NOT MATCHED THEN INSERT (id, payload, category) "
+            "VALUES (source.id, source.volatile_value, source.volatile_value)"
+        ],
+    )
+    require_equal(
+        connection.execute(
+            f"SELECT payload = category AND payload IS NOT NULL FROM {MERGE_V2_TABLE} WHERE id = {volatile_id}"
+        ).fetchone(),
+        (True,),
+        "distributed MERGE reevaluated one projected volatile value",
+    )
+
     snapshot_count_before_error = connection.execute(
         f"SELECT count(*) FROM iceberg_snapshots({MERGE_V2_TABLE})"
     ).fetchone()
