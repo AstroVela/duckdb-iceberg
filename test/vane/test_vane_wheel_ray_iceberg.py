@@ -685,6 +685,17 @@ def exercise_distributed_merge(harness: RayIcebergHarness) -> None:
                 "WHEN NOT MATCHED THEN INSERT (id, payload) VALUES (source.id, source.payload)",
             ],
         )
+        connection.sql(
+            f"SELECT id, filename, file_row_number, "
+            f"('self-' || id::VARCHAR)::VARCHAR AS payload FROM {MERGE_LOCAL_TABLE} WHERE id = 0"
+        ).merge_into(
+            MERGE_LOCAL_TABLE,
+            "target.id = source.id",
+            [
+                "WHEN MATCHED AND source.filename IS NOT NULL AND source.file_row_number >= 0 "
+                "THEN UPDATE SET payload = source.payload"
+            ],
+        )
     finally:
         if configured_runner is None:
             os.environ.pop("VANE_RUNNER", None)
@@ -697,8 +708,8 @@ def exercise_distributed_merge(harness: RayIcebergHarness) -> None:
     )
     require_equal(
         connection.execute(f"SELECT id, payload FROM {MERGE_LOCAL_TABLE} ORDER BY id").fetchall(),
-        [(0, "value-0"), (1, "value-1")],
-        "local-fast Iceberg MERGE result",
+        [(0, "self-0"), (1, "value-1")],
+        "local-fast Iceberg self-MERGE result",
     )
 
     connection.execute(
@@ -775,6 +786,23 @@ def exercise_distributed_merge(harness: RayIcebergHarness) -> None:
         f"SELECT id, payload, category FROM {MERGE_V2_TABLE} ORDER BY id",
         "distributed Iceberg v2 MERGE action result",
         expected_v2_rows,
+    )
+    merge(
+        "distributed Iceberg self-MERGE with source row identifiers",
+        connection.sql(
+            f"SELECT id, filename, file_row_number, "
+            f"('self-' || id::VARCHAR)::VARCHAR AS payload FROM {MERGE_V2_TABLE} WHERE id = 0"
+        ),
+        MERGE_V2_TABLE,
+        [
+            "WHEN MATCHED AND source.filename IS NOT NULL AND source.file_row_number >= 0 "
+            "THEN UPDATE SET payload = source.payload"
+        ],
+    )
+    harness.require_query(
+        f"SELECT payload FROM {MERGE_V2_TABLE} WHERE id = 0",
+        "distributed Iceberg self-MERGE target-scan identity",
+        [("self-0",)],
     )
 
     volatile_id = SOURCE_ROW_COUNT + 100

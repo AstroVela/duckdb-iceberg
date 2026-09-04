@@ -22,7 +22,14 @@
 #include "duckdb/common/multi_file/multi_file_reader.hpp"
 #include "duckdb/common/unordered_set.hpp"
 #include "duckdb/execution/distributed/extension_write_task_provider.hpp"
+#include "duckdb/execution/operator/join/physical_asof_join.hpp"
+#include "duckdb/execution/operator/join/physical_delim_join.hpp"
+#include "duckdb/execution/operator/join/physical_hash_join.hpp"
+#include "duckdb/execution/operator/join/physical_range_join.hpp"
+#include "duckdb/execution/operator/order/physical_order.hpp"
+#include "duckdb/execution/operator/projection/physical_projection.hpp"
 #include "duckdb/execution/operator/scan/physical_table_scan.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
 #include "catalog/rest/api/table_update.hpp"
 #include "catalog/rest/transaction/iceberg_transaction_data.hpp"
@@ -148,45 +155,184 @@ static bool CollectDistributedMergeInsertPartitionIndexes(const PhysicalOperator
 	return true;
 }
 
-static void FindDistributedMergeTargetScan(PhysicalOperator &plan, const IcebergTableEntry &target,
-                                           optional_ptr<IcebergMultiFileList> &result) {
-	if (plan.type == PhysicalOperatorType::TABLE_SCAN) {
-		auto &scan = plan.Cast<PhysicalTableScan>();
-		if (scan.function.name == "iceberg_scan" &&
-		    scan.function.get_multi_file_reader == IcebergMultiFileReader::CreateInstance && scan.bind_data) {
-			auto &bind = scan.bind_data->Cast<MultiFileBindData>();
-			if (bind.file_list) {
-				auto &file_list = bind.file_list->Cast<IcebergMultiFileList>();
-				bool is_target_scan;
-				if (file_list.HasDistributedScanPlan()) {
-					is_target_scan = file_list.GetDistributedScanTableUUID() == target.GetLogicalWriteTargetIdentity();
-				} else {
-					// local-fast never consumes this result, but retaining pointer identity
-					// here preserves native planning before a runner is selected.
-					is_target_scan = file_list.GetTable() == &target;
-				}
-				if (is_target_scan) {
-					bool has_file_row_number = false;
-					for (const auto &column_id : scan.column_ids) {
-						if (column_id.GetPrimaryIndex() == MultiFileReader::COLUMN_IDENTIFIER_FILE_ROW_NUMBER) {
-							has_file_row_number = true;
-							break;
-						}
-					}
-					if (has_file_row_number) {
-						if (result && result.get() != &file_list) {
-							throw InvalidInputException(
-							    "Distributed Iceberg MERGE found multiple target scans with row identifiers");
-						}
-						result = &file_list;
-					}
-				}
-			}
+struct DistributedMergeTargetScanColumn {
+	optional_ptr<PhysicalTableScan> scan;
+	idx_t output_index = 0;
+};
+
+static DistributedMergeTargetScanColumn TraceDistributedMergeTargetRowPosition(PhysicalOperator &plan,
+                                                                               idx_t output_index) {
+	if (output_index >= plan.types.size()) {
+		throw InternalException("Iceberg distributed MERGE target row-position reference is out of range");
+	}
+	switch (plan.type) {
+	case PhysicalOperatorType::TABLE_SCAN:
+		return {&plan.Cast<PhysicalTableScan>(), output_index};
+	case PhysicalOperatorType::EMPTY_RESULT:
+		return {};
+	case PhysicalOperatorType::PROJECTION: {
+		auto &projection = plan.Cast<PhysicalProjection>();
+		if (projection.children.size() != 1 || output_index >= projection.select_list.size()) {
+			throw InvalidInputException(
+			    "Distributed Iceberg MERGE could not trace the target row position through its projection");
 		}
+		auto &expression = *projection.select_list[output_index];
+		if (expression.GetExpressionClass() == ExpressionClass::BOUND_CONSTANT &&
+		    expression.Cast<BoundConstantExpression>().value.IsNull()) {
+			return {};
+		}
+		if (expression.GetExpressionType() != ExpressionType::BOUND_REF) {
+			throw InvalidInputException(
+			    "Distributed Iceberg MERGE could not trace the target row position through its projection");
+		}
+		auto &reference = expression.Cast<BoundReferenceExpression>();
+		return TraceDistributedMergeTargetRowPosition(projection.children[0].get(), reference.index);
 	}
-	for (auto &child : plan.children) {
-		FindDistributedMergeTargetScan(child.get(), target, result);
+	case PhysicalOperatorType::ORDER_BY: {
+		auto &order = plan.Cast<PhysicalOrder>();
+		if (order.children.size() != 1 || output_index >= order.projections.size()) {
+			throw InvalidInputException(
+			    "Distributed Iceberg MERGE could not trace the target row position through its ordering");
+		}
+		return TraceDistributedMergeTargetRowPosition(order.children[0].get(), order.projections[output_index]);
 	}
+	case PhysicalOperatorType::HASH_JOIN: {
+		auto &join = plan.Cast<PhysicalHashJoin>();
+		if (join.children.size() != 2) {
+			throw InternalException("Iceberg distributed MERGE hash join has an invalid child count");
+		}
+		if (output_index < join.lhs_output_columns.col_idxs.size()) {
+			return TraceDistributedMergeTargetRowPosition(join.children[0].get(),
+			                                              join.lhs_output_columns.col_idxs[output_index]);
+		}
+		auto right_output_index = output_index - join.lhs_output_columns.col_idxs.size();
+		if (right_output_index >= join.rhs_output_columns.col_idxs.size()) {
+			throw InternalException("Iceberg distributed MERGE hash-join output mapping is invalid");
+		}
+		auto hash_table_index = join.rhs_output_columns.col_idxs[right_output_index];
+		idx_t child_index;
+		if (hash_table_index < join.conditions.size()) {
+			auto &condition = join.conditions[hash_table_index];
+			if (condition.right->GetExpressionType() != ExpressionType::BOUND_REF) {
+				throw InternalException("Iceberg distributed MERGE hash-join key mapping is invalid");
+			}
+			child_index = condition.right->Cast<BoundReferenceExpression>().index;
+		} else {
+			auto payload_index = hash_table_index - join.conditions.size();
+			if (payload_index >= join.payload_columns.col_idxs.size()) {
+				throw InternalException("Iceberg distributed MERGE hash-join payload mapping is invalid");
+			}
+			child_index = join.payload_columns.col_idxs[payload_index];
+		}
+		return TraceDistributedMergeTargetRowPosition(join.children[1].get(), child_index);
+	}
+	case PhysicalOperatorType::PIECEWISE_MERGE_JOIN:
+	case PhysicalOperatorType::IE_JOIN: {
+		auto &join = static_cast<PhysicalRangeJoin &>(plan);
+		if (join.children.size() != 2) {
+			throw InternalException("Iceberg distributed MERGE range join has an invalid child count");
+		}
+		if (output_index < join.left_projection_map.size()) {
+			return TraceDistributedMergeTargetRowPosition(join.children[0].get(),
+			                                              join.left_projection_map[output_index]);
+		}
+		auto right_output_index = output_index - join.left_projection_map.size();
+		if (right_output_index >= join.right_projection_map.size()) {
+			throw InternalException("Iceberg distributed MERGE range-join output mapping is invalid");
+		}
+		return TraceDistributedMergeTargetRowPosition(join.children[1].get(),
+		                                              join.right_projection_map[right_output_index]);
+	}
+	case PhysicalOperatorType::ASOF_JOIN: {
+		auto &join = plan.Cast<PhysicalAsOfJoin>();
+		if (join.children.size() != 2) {
+			throw InternalException("Iceberg distributed MERGE ASOF join has an invalid child count");
+		}
+		auto left_count = join.children[0].get().types.size();
+		if (output_index < left_count) {
+			return TraceDistributedMergeTargetRowPosition(join.children[0].get(), output_index);
+		}
+		auto right_output_index = output_index - left_count;
+		if (right_output_index >= join.right_projection_map.size()) {
+			throw InternalException("Iceberg distributed MERGE ASOF-join output mapping is invalid");
+		}
+		return TraceDistributedMergeTargetRowPosition(join.children[1].get(),
+		                                              join.right_projection_map[right_output_index]);
+	}
+	case PhysicalOperatorType::BLOCKWISE_NL_JOIN:
+	case PhysicalOperatorType::NESTED_LOOP_JOIN:
+	case PhysicalOperatorType::CROSS_PRODUCT:
+	case PhysicalOperatorType::POSITIONAL_JOIN: {
+		if (plan.children.size() != 2) {
+			throw InternalException("Iceberg distributed MERGE join has an invalid child count");
+		}
+		auto left_count = plan.children[0].get().types.size();
+		if (output_index < left_count) {
+			return TraceDistributedMergeTargetRowPosition(plan.children[0].get(), output_index);
+		}
+		return TraceDistributedMergeTargetRowPosition(plan.children[1].get(), output_index - left_count);
+	}
+	case PhysicalOperatorType::LEFT_DELIM_JOIN:
+	case PhysicalOperatorType::RIGHT_DELIM_JOIN: {
+		auto &join = static_cast<PhysicalDelimJoin &>(plan);
+		return TraceDistributedMergeTargetRowPosition(join.join, output_index);
+	}
+	case PhysicalOperatorType::FILTER:
+	case PhysicalOperatorType::LIMIT:
+	case PhysicalOperatorType::STREAMING_LIMIT:
+	case PhysicalOperatorType::LIMIT_PERCENT:
+	case PhysicalOperatorType::TOP_N:
+	case PhysicalOperatorType::RESERVOIR_SAMPLE:
+	case PhysicalOperatorType::STREAMING_SAMPLE:
+	case PhysicalOperatorType::LOCAL_EXCHANGE:
+	case PhysicalOperatorType::VERIFY_VECTOR:
+		if (plan.children.size() != 1 || output_index >= plan.children[0].get().types.size() ||
+		    plan.types[output_index] != plan.children[0].get().types[output_index]) {
+			throw InvalidInputException(
+			    "Distributed Iceberg MERGE could not trace the target row position through operator %s",
+			    PhysicalOperatorToString(plan.type));
+		}
+		return TraceDistributedMergeTargetRowPosition(plan.children[0].get(), output_index);
+	default:
+		throw NotImplementedException(
+		    "Distributed Iceberg MERGE cannot trace its target row position through physical operator %s",
+		    PhysicalOperatorToString(plan.type));
+	}
+}
+
+static optional_ptr<IcebergMultiFileList> ResolveDistributedMergeTargetFileList(PhysicalOperator &plan,
+                                                                                idx_t row_position_index,
+                                                                                const IcebergTableEntry &target) {
+	auto scan = TraceDistributedMergeTargetRowPosition(plan, row_position_index);
+	if (!scan.scan) {
+		return nullptr;
+	}
+	auto scan_column_index = scan.output_index;
+	if (!scan.scan->projection_ids.empty()) {
+		if (scan.output_index >= scan.scan->projection_ids.size()) {
+			throw InternalException("Iceberg distributed MERGE target scan projection is invalid");
+		}
+		scan_column_index = scan.scan->projection_ids[scan.output_index];
+	}
+	if (scan_column_index >= scan.scan->column_ids.size() ||
+	    scan.scan->column_ids[scan_column_index].GetPrimaryIndex() !=
+	        MultiFileReader::COLUMN_IDENTIFIER_FILE_ROW_NUMBER) {
+		throw InvalidInputException("Distributed Iceberg MERGE target row position did not resolve to file_row_number");
+	}
+	if (scan.scan->function.name != "iceberg_scan" ||
+	    scan.scan->function.get_multi_file_reader != IcebergMultiFileReader::CreateInstance || !scan.scan->bind_data) {
+		throw InvalidInputException("Distributed Iceberg MERGE target row position did not resolve to an Iceberg scan");
+	}
+	auto &bind = scan.scan->bind_data->Cast<MultiFileBindData>();
+	if (!bind.file_list) {
+		throw InvalidInputException("Distributed Iceberg MERGE target scan has no file list");
+	}
+	auto &file_list = bind.file_list->Cast<IcebergMultiFileList>();
+	if (!file_list.HasDistributedScanPlan() ||
+	    file_list.GetDistributedScanTableUUID() != target.GetLogicalWriteTargetIdentity()) {
+		throw InvalidInputException("Distributed Iceberg MERGE target scan identity does not match its write target");
+	}
+	return &file_list;
 }
 
 static void AddDistributedMergeCommitRequirements(IcebergTransactionData &transaction_data) {
@@ -201,15 +347,14 @@ public:
 	                                    map<MergeActionCondition, vector<unique_ptr<MergeIntoOperator>>> actions,
 	                                    idx_t row_id_index, optional_idx source_marker, bool return_chunk,
 	                                    ClientContext &context, IcebergTableEntry &table,
-	                                    optional_ptr<IcebergMultiFileList> target_file_list_p,
 	                                    PhysicalOperator &distributed_worker_child_p,
 	                                    vector<IcebergDistributedMergePlanAction> distributed_actions_p,
 	                                    idx_t native_update_delete_count_p, bool has_update_p, bool has_delete_p,
 	                                    bool worker_plan_is_statically_empty_p)
 	    : PhysicalMergeInto(physical_plan, std::move(types), std::move(actions), row_id_index, source_marker, true,
 	                        return_chunk),
-	      planning_context(context), planned_table(table), target_file_list(target_file_list_p),
-	      distributed_worker_child(distributed_worker_child_p), distributed_actions(std::move(distributed_actions_p)),
+	      planning_context(context), planned_table(table), distributed_worker_child(distributed_worker_child_p),
+	      distributed_actions(std::move(distributed_actions_p)),
 	      worker_plan_is_statically_empty(worker_plan_is_statically_empty_p),
 	      native_update_delete_count(native_update_delete_count_p), has_update(has_update_p), has_delete(has_delete_p) {
 		distributed_write_plan.extension_name = "iceberg";
@@ -228,7 +373,6 @@ public:
 		auto snapshot = metadata.GetLatestSnapshot();
 		distributed_has_snapshot = snapshot != nullptr;
 		distributed_snapshot_id = snapshot ? snapshot->snapshot_id : 0;
-		target_is_statically_empty = !target_file_list || target_file_list->GetTotalFileCount() == 0;
 	}
 
 	optional_ptr<distributed::ExtensionWriteTaskProvider> GetExtensionWriteTaskProvider() override {
@@ -367,6 +511,12 @@ private:
 		}
 		if (children.size() != 1) {
 			throw InvalidInputException("Distributed Iceberg MERGE requires exactly one native input");
+		}
+		if (has_update || has_delete) {
+			auto row_position_index = row_id_index + (distributed_iceberg_version >= 3 ? 2 : 1);
+			target_file_list =
+			    ResolveDistributedMergeTargetFileList(children[0].get(), row_position_index, planned_table);
+			target_is_statically_empty = !target_file_list || target_file_list->GetTotalFileCount() == 0;
 		}
 		distributed_write_plan.worker_bind_data = BuildIcebergDistributedMergeBind(
 		    planning_context, planned_table, target_file_list.get(), distributed_actions, distributed_worker_child,
@@ -680,8 +830,6 @@ PhysicalOperator &IcebergCatalog::PlanMergeInto(ClientContext &context, Physical
 	}
 
 #ifdef ICEBERG_VANE_DISTRIBUTED
-	optional_ptr<IcebergMultiFileList> target_file_list;
-	FindDistributedMergeTargetScan(plan, table_entry, target_file_list);
 	auto worker_plan_is_statically_empty = plan.type == PhysicalOperatorType::EMPTY_RESULT;
 	vector<idx_t> null_target_partition_indexes;
 	if (!CollectDistributedMergeInsertPartitionIndexes(plan, distributed_actions, null_target_partition_indexes)) {
@@ -697,8 +845,8 @@ PhysicalOperator &IcebergCatalog::PlanMergeInto(ClientContext &context, Physical
 	    PlanIcebergDistributedMergeRepartition(planner, plan, file_path_index, null_target_partition_indexes);
 	auto &result = planner.Make<PhysicalIcebergDistributedMergeInto>(
 	    op.types, std::move(actions), op.row_id_start, op.source_marker, op.return_chunk, context, table_entry,
-	    target_file_list, distributed_worker_child, std::move(distributed_actions), update_delete_count, has_update,
-	    has_delete, worker_plan_is_statically_empty);
+	    distributed_worker_child, std::move(distributed_actions), update_delete_count, has_update, has_delete,
+	    worker_plan_is_statically_empty);
 #else
 	auto &result = planner.Make<PhysicalMergeInto>(op.types, std::move(actions), op.row_id_start, op.source_marker,
 	                                               true, op.return_chunk);
