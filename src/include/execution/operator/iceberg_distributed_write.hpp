@@ -86,7 +86,7 @@ string BuildIcebergDistributedEmptyUpdateBind(ClientContext &context, const Iceb
 string BuildIcebergDistributedMergeBind(ClientContext &context, const IcebergTableEntry &table,
                                         optional_ptr<const IcebergMultiFileList> target_file_list,
                                         const vector<IcebergDistributedMergePlanAction> &actions,
-                                        const vector<LogicalType> &input_types, idx_t row_id_start,
+                                        const PhysicalOperator &worker_plan, idx_t row_id_start,
                                         optional_idx source_marker, bool target_is_statically_empty,
                                         bool worker_plan_is_statically_empty, const string &artifact_namespace);
 

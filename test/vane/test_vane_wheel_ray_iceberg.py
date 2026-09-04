@@ -1399,6 +1399,21 @@ def exercise_v3_distributed_update(harness: RayIcebergHarness) -> None:
         "rejected VARIANT MERGE must not create an Iceberg snapshot",
     )
 
+    harness.require_rejected_write(
+        "distributed Iceberg MERGE DELETE rejects predicate-only raw VARIANT transport",
+        lambda: connection.sql(f"SELECT id FROM {SOURCE_TABLE} WHERE id = 3").merge_into(
+            V3_COMPAT_TABLE,
+            "target.id = source.id",
+            ["WHEN MATCHED AND target.payload.origin::VARCHAR = 'seed' THEN DELETE"],
+        ),
+        "Vane repartition transport cannot preserve raw VARIANT values",
+    )
+    require_equal(
+        connection.execute(f"SELECT count(*) FROM iceberg_snapshots({V3_COMPAT_TABLE})").fetchone(),
+        variant_snapshot_count,
+        "rejected predicate-only VARIANT MERGE must not create an Iceberg snapshot",
+    )
+
     # The partitioned v3 CTAS table has multiple files per identity partition
     # and nested values that must survive the row rewrite. Seed two native DVs
     # in the affected partition, then replace them while preserving row lineage.

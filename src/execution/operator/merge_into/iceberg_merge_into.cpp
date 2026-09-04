@@ -369,9 +369,9 @@ private:
 			throw InvalidInputException("Distributed Iceberg MERGE requires exactly one native input");
 		}
 		distributed_write_plan.worker_bind_data = BuildIcebergDistributedMergeBind(
-		    planning_context, planned_table, target_file_list.get(), distributed_actions,
-		    distributed_worker_child.types, row_id_index, source_marker, target_is_statically_empty,
-		    worker_plan_is_statically_empty, distributed_artifact_namespace);
+		    planning_context, planned_table, target_file_list.get(), distributed_actions, distributed_worker_child,
+		    row_id_index, source_marker, target_is_statically_empty, worker_plan_is_statically_empty,
+		    distributed_artifact_namespace);
 		children[0] = distributed_worker_child;
 		type = PhysicalOperatorType::EXTENSION;
 		distributed_worker_plan_selected = true;

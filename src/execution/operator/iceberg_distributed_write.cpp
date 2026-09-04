@@ -387,6 +387,24 @@ static string EncodePathComponent(const string &input) {
 	return result;
 }
 
+static void ValidateDistributedRepartitionTransportTypes(const vector<LogicalType> &types,
+                                                         const string &operation_name) {
+	for (const auto &type : types) {
+		if (TypeVisitor::Contains(type, LogicalTypeId::VARIANT)) {
+			throw NotImplementedException("Distributed Iceberg %s does not support VARIANT columns because the Vane "
+			                              "repartition transport cannot preserve raw VARIANT values",
+			                              operation_name);
+		}
+	}
+}
+
+static void ValidateDistributedRepartitionTransportPlan(const PhysicalOperator &plan, const string &operation_name) {
+	ValidateDistributedRepartitionTransportTypes(plan.types, operation_name);
+	for (const auto &child : plan.children) {
+		ValidateDistributedRepartitionTransportPlan(child.get(), operation_name);
+	}
+}
+
 static void ValidateDistributedRowRewriteCopyShape(const PhysicalCopyToFile &copy, const string &operation_name) {
 	// Standalone callback finalization does not own DuckDB's pipeline Finalize context. Keep the worker COPY on the
 	// multi-file paths used by Iceberg, which finalize their individual file states without the single-file lifecycle.
@@ -404,13 +422,7 @@ static void ValidateDistributedRowRewriteCopyShape(const PhysicalCopyToFile &cop
 	if (copy.return_type != CopyFunctionReturnType::WRITTEN_FILE_STATISTICS || copy.types != statistics_types) {
 		throw SerializationException("Distributed Iceberg %s COPY must return written-file statistics", operation_name);
 	}
-	for (const auto &type : copy.expected_types) {
-		if (TypeVisitor::Contains(type, LogicalTypeId::VARIANT)) {
-			throw NotImplementedException("Distributed Iceberg %s does not support VARIANT columns because the Vane "
-			                              "repartition transport cannot preserve raw VARIANT values",
-			                              operation_name);
-		}
-	}
+	ValidateDistributedRepartitionTransportTypes(copy.expected_types, operation_name);
 }
 
 static optional_idx GetDistributedUpdateRowIdIndex(const PhysicalCopyToFile &copy, int32_t iceberg_version) {
@@ -668,6 +680,7 @@ static IcebergDistributedMergeBind DeserializeMergeBind(ClientContext &context, 
 	result.worker_plan_is_statically_empty = deserializer.ReadProperty<bool>(13, "worker_plan_is_statically_empty");
 	deserializer.End();
 
+	ValidateDistributedRepartitionTransportTypes(result.input_types, "MERGE");
 	if ((result.iceberg_version != 2 && result.iceberg_version != 3) || result.data_path.empty() ||
 	    result.artifact_namespace.empty() || result.actions.empty()) {
 		throw SerializationException("Invalid Iceberg distributed MERGE bind data");
@@ -2161,9 +2174,10 @@ static void ConfigureDistributedMergeWriter(IcebergDistributedMergeWriterBind &t
 string BuildIcebergDistributedMergeBind(ClientContext &context, const IcebergTableEntry &table,
                                         optional_ptr<const IcebergMultiFileList> target_file_list,
                                         const vector<IcebergDistributedMergePlanAction> &actions,
-                                        const vector<LogicalType> &input_types, idx_t row_id_start,
+                                        const PhysicalOperator &worker_plan, idx_t row_id_start,
                                         optional_idx source_marker, bool target_is_statically_empty,
                                         bool worker_plan_is_statically_empty, const string &artifact_namespace) {
+	ValidateDistributedRepartitionTransportPlan(worker_plan, "MERGE");
 	auto &metadata = table.table_info.table_metadata;
 	IcebergDistributedMergeBind bind;
 	bind.iceberg_version = metadata.iceberg_version;
@@ -2171,7 +2185,7 @@ string BuildIcebergDistributedMergeBind(ClientContext &context, const IcebergTab
 	bind.worker_plan_is_statically_empty = worker_plan_is_statically_empty;
 	bind.data_path = metadata.GetDataPath(FileSystem::GetFileSystem(context));
 	bind.artifact_namespace = artifact_namespace;
-	bind.input_types = input_types;
+	bind.input_types = worker_plan.types;
 	bind.row_id_start = row_id_start;
 	bind.source_marker = source_marker;
 
