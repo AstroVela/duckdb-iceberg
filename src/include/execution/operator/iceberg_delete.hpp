@@ -26,6 +26,7 @@ struct IcebergMultiFileList;
 #ifdef ICEBERG_VANE_DISTRIBUTED
 class IcebergInsert;
 class IcebergUpdate;
+class PhysicalIcebergDistributedMergeInto;
 struct IcebergDistributedDeleteFileResult;
 #endif
 
@@ -182,6 +183,7 @@ private:
 #ifdef ICEBERG_VANE_DISTRIBUTED
 	friend class IcebergInsert;
 	friend class IcebergUpdate;
+	friend class PhysicalIcebergDistributedMergeInto;
 	static void AddDistributedDeleteArtifacts(ClientContext &context, const IcebergMultiFileList &file_list,
 	                                          const vector<IcebergDistributedDeleteFileResult> &files,
 	                                          IcebergDeleteGlobalState &global_state, const string &operation_name);

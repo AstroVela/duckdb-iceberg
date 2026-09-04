@@ -12,8 +12,11 @@
 #include "duckdb/common/serializer/memory_stream.hpp"
 #include "duckdb/common/set.hpp"
 #include "duckdb/common/type_visitor.hpp"
+#include "duckdb/common/types/hash.hpp"
 #include "duckdb/common/types/uuid.hpp"
+#include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/execution/distributed/copy_finalize.hpp"
+#include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/execution/operator/exchange/physical_repartition.hpp"
 #include "duckdb/execution/operator/persistent/physical_copy_to_file.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
@@ -24,6 +27,8 @@
 #include "duckdb/parallel/interrupt.hpp"
 #include "duckdb/parallel/thread_context.hpp"
 #include "duckdb/parser/parsed_data/copy_info.hpp"
+#include "duckdb/parser/statement/merge_into_statement.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 
 #include "catalog/rest/catalog_entry/table/iceberg_table_entry.hpp"
@@ -86,9 +91,72 @@ namespace {
 
 static constexpr uint32_t ICEBERG_ROW_DELTA_PROTOCOL_VERSION = 4;
 static const string ICEBERG_ROW_DELTA_FRAGMENT_CODEC = "iceberg.row-delta-fragment";
+static constexpr uint32_t ICEBERG_MERGE_PROTOCOL_VERSION = 1;
+static const string ICEBERG_MERGE_FRAGMENT_CODEC = "iceberg.merge-fragment";
+static const string ICEBERG_MERGE_PARTITION_FUNCTION = "__iceberg_vane_merge_partition_hash";
 static const DistributedPayloadCodec ICEBERG_DATA_FILE_CODEC {"iceberg.data-file", 1};
 static const DistributedPayloadCodec ICEBERG_POSITION_DELETE_FILE_CODEC {"iceberg.position-delete-file", 1};
 static const DistributedPayloadCodec ICEBERG_DELETION_VECTOR_FILE_CODEC {"iceberg.deletion-vector-puffin", 1};
+
+struct IcebergMergePartitionLocalState : FunctionLocalState {
+	idx_t row_offset = 0;
+};
+
+static unique_ptr<FunctionLocalState> IcebergMergePartitionInit(ExpressionState &, const BoundFunctionExpression &,
+                                                                FunctionData *) {
+	return make_uniq<IcebergMergePartitionLocalState>();
+}
+
+static void IcebergMergePartitionHash(DataChunk &args, ExpressionState &state, Vector &result) {
+	if (args.ColumnCount() == 0) {
+		throw InternalException("Iceberg distributed MERGE partition hash requires a file-path column");
+	}
+	const auto count = args.size();
+	const auto has_null_target_key = args.ColumnCount() > 1;
+	Vector file_is_null(LogicalType::BOOLEAN, count);
+	Vector file_hash(LogicalType::HASH, count);
+	Vector null_target_hash(LogicalType::HASH, count);
+	Vector partition_hash(LogicalType::HASH, count);
+	VectorOperations::IsNull(args.data[0], file_is_null, count);
+	VectorOperations::Hash(args.data[0], file_hash, count);
+	if (has_null_target_key) {
+		VectorOperations::Hash(args.data[1], null_target_hash, count);
+		for (idx_t index = 2; index < args.ColumnCount(); index++) {
+			VectorOperations::CombineHash(null_target_hash, args.data[index], count);
+		}
+	}
+
+	file_is_null.Flatten(count);
+	file_hash.Flatten(count);
+	if (has_null_target_key) {
+		null_target_hash.Flatten(count);
+	}
+	const auto file_is_null_values = FlatVector::GetData<bool>(file_is_null);
+	const auto file_hash_values = FlatVector::GetData<hash_t>(file_hash);
+	const auto null_target_hash_values = has_null_target_key ? FlatVector::GetData<hash_t>(null_target_hash) : nullptr;
+	auto result_values = FlatVector::GetData<hash_t>(partition_hash);
+	auto &local_state = ExecuteFunctionState::GetFunctionState(state)->Cast<IcebergMergePartitionLocalState>();
+	for (idx_t row = 0; row < count; row++) {
+		if (!file_is_null_values[row]) {
+			result_values[row] = file_hash_values[row];
+			continue;
+		}
+		auto row_hash = Hash<idx_t>(local_state.row_offset + row);
+		result_values[row] = has_null_target_key ? CombineHash(null_target_hash_values[row], row_hash) : row_hash;
+	}
+	local_state.row_offset += count;
+	result.Reference(partition_hash);
+}
+
+static ScalarFunction IcebergDistributedMergePartitionFunction() {
+	auto result = ScalarFunction(ICEBERG_MERGE_PARTITION_FUNCTION, {LogicalType::VARCHAR}, LogicalType::HASH,
+	                             IcebergMergePartitionHash);
+	result.varargs = LogicalType::ANY;
+	result.SetInitStateCallback(IcebergMergePartitionInit);
+	result.SetStability(FunctionStability::VOLATILE);
+	result.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+	return result;
+}
 
 struct IcebergDistributedRowDeltaSourceState {
 	string scan_file_path;
@@ -112,9 +180,36 @@ struct IcebergDistributedRowDeltaBind {
 	vector<IcebergDistributedRowDeltaSourceState> delete_sources;
 };
 
+struct IcebergDistributedMergeWriterBind {
+	string copy_operator;
+	vector<unique_ptr<Expression>> projections;
+};
+
+struct IcebergDistributedMergeActionBind {
+	MergeActionCondition condition = MergeActionCondition::WHEN_MATCHED;
+	MergeActionType action_type = MergeActionType::MERGE_DO_NOTHING;
+	unique_ptr<Expression> predicate;
+	vector<unique_ptr<Expression>> expressions;
+};
+
+struct IcebergDistributedMergeBind {
+	int32_t iceberg_version = 0;
+	bool target_is_statically_empty = false;
+	bool worker_plan_is_statically_empty = false;
+	string data_path;
+	string artifact_namespace;
+	vector<LogicalType> input_types;
+	idx_t row_id_start = 0;
+	optional_idx source_marker;
+	IcebergDistributedMergeWriterBind insert_writer;
+	IcebergDistributedMergeWriterBind update_writer;
+	vector<IcebergDistributedMergeActionBind> actions;
+	vector<IcebergDistributedRowDeltaSourceState> delete_sources;
+};
+
 static idx_t CheckedAdd(idx_t left, idx_t right, const string &description) {
 	if (right > NumericLimits<idx_t>::Maximum() - left) {
-		throw InvalidInputException("Iceberg distributed row-delta %s overflow", description);
+		throw InvalidInputException("Iceberg distributed write %s overflow", description);
 	}
 	return left + right;
 }
@@ -187,7 +282,7 @@ static string EncodeExistingDeleteBlob(const IcebergDeleteData &delete_data, idx
 	return string(reinterpret_cast<const char *>(blob.data()), blob.size());
 }
 
-static void PopulateDistributedRowDeltaSources(IcebergDistributedRowDeltaBind &bind,
+static void PopulateDistributedRowDeltaSources(vector<IcebergDistributedRowDeltaSourceState> &delete_sources,
                                                const IcebergMultiFileList &file_list, const string &operation_name) {
 	if (!file_list.HasDistributedScanPlan()) {
 		throw InvalidInputException("Distributed Iceberg v3 %s requires a planned source scan", operation_name);
@@ -197,7 +292,7 @@ static void PopulateDistributedRowDeltaSources(IcebergDistributedRowDeltaBind &b
 	if (files.size() != file_count) {
 		throw InternalException("Distributed Iceberg v3 %s source file count changed during planning", operation_name);
 	}
-	bind.delete_sources.reserve(file_count);
+	delete_sources.reserve(file_count);
 	for (idx_t file_index = 0; file_index < file_count; file_index++) {
 		auto manifest_entry = file_list.GetManifestEntry(file_index);
 		if (manifest_entry.entry.data_file.record_count < 0) {
@@ -213,7 +308,7 @@ static void PopulateDistributedRowDeltaSources(IcebergDistributedRowDeltaBind &b
 		if (existing_deletes) {
 			source.existing_delete_blob = EncodeExistingDeleteBlob(*existing_deletes, source.record_count);
 		}
-		bind.delete_sources.push_back(std::move(source));
+		delete_sources.push_back(std::move(source));
 	}
 }
 
@@ -292,7 +387,7 @@ static string EncodePathComponent(const string &input) {
 	return result;
 }
 
-static void ValidateDistributedUpdateCopyShape(const PhysicalCopyToFile &copy) {
+static void ValidateDistributedRowRewriteCopyShape(const PhysicalCopyToFile &copy, const string &operation_name) {
 	// Standalone callback finalization does not own DuckDB's pipeline Finalize context. Keep the worker COPY on the
 	// multi-file paths used by Iceberg, which finalize their individual file states without the single-file lifecycle.
 	auto partitioned = copy.partition_output && copy.write_empty_file && !copy.rotate && !copy.per_thread_output;
@@ -300,20 +395,20 @@ static void ValidateDistributedUpdateCopyShape(const PhysicalCopyToFile &copy) {
 	                copy.file_size_bytes.IsValid();
 	if (!partitioned && !rotating) {
 		throw NotImplementedException(
-		    "Distributed Iceberg UPDATE requires the canonical partitioned or rotating COPY writer");
+		    "Distributed Iceberg %s requires the canonical partitioned or rotating COPY writer", operation_name);
 	}
 	if (copy.use_tmp_file) {
-		throw NotImplementedException("Distributed Iceberg UPDATE does not support temporary COPY output");
+		throw NotImplementedException("Distributed Iceberg %s does not support temporary COPY output", operation_name);
 	}
 	auto statistics_types = GetCopyFunctionReturnLogicalTypes(CopyFunctionReturnType::WRITTEN_FILE_STATISTICS);
 	if (copy.return_type != CopyFunctionReturnType::WRITTEN_FILE_STATISTICS || copy.types != statistics_types) {
-		throw SerializationException("Distributed Iceberg UPDATE COPY must return written-file statistics");
+		throw SerializationException("Distributed Iceberg %s COPY must return written-file statistics", operation_name);
 	}
 	for (const auto &type : copy.expected_types) {
 		if (TypeVisitor::Contains(type, LogicalTypeId::VARIANT)) {
-			throw NotImplementedException(
-			    "Distributed Iceberg UPDATE does not support VARIANT columns because the Vane repartition "
-			    "transport cannot preserve raw VARIANT values");
+			throw NotImplementedException("Distributed Iceberg %s does not support VARIANT columns because the Vane "
+			                              "repartition transport cannot preserve raw VARIANT values",
+			                              operation_name);
 		}
 	}
 }
@@ -348,8 +443,8 @@ static optional_idx GetDistributedUpdateRowIdIndex(const PhysicalCopyToFile &cop
 	return row_id_index;
 }
 
-static string SerializeShallowCopy(const PhysicalCopyToFile &copy) {
-	ValidateDistributedUpdateCopyShape(copy);
+static string SerializeShallowCopy(const PhysicalCopyToFile &copy, const string &operation_name) {
+	ValidateDistributedRowRewriteCopyShape(copy, operation_name);
 	MemoryStream stream(Allocator::DefaultAllocator());
 	BinarySerializer serializer(stream);
 	serializer.Begin();
@@ -473,10 +568,217 @@ static IcebergDistributedRowDeltaBind DeserializeBind(const string &bytes) {
 	return result;
 }
 
-static unique_ptr<PhysicalOperator> DeserializeShallowCopy(ClientContext &context, PhysicalPlan &physical_plan,
-                                                           const string &bytes) {
+static void SerializeMergeWriter(Serializer &serializer, const IcebergDistributedMergeWriterBind &writer) {
+	serializer.WriteProperty(1, "copy_operator", writer.copy_operator);
+	serializer.WritePropertyWithDefault<vector<unique_ptr<Expression>>>(2, "projections", writer.projections);
+}
+
+static IcebergDistributedMergeWriterBind DeserializeMergeWriter(Deserializer &deserializer) {
+	IcebergDistributedMergeWriterBind result;
+	result.copy_operator = deserializer.ReadProperty<string>(1, "copy_operator");
+	deserializer.ReadPropertyWithDefault<vector<unique_ptr<Expression>>>(2, "projections", result.projections);
+	return result;
+}
+
+static string SerializeMergeBind(const IcebergDistributedMergeBind &bind) {
+	MemoryStream stream(Allocator::DefaultAllocator());
+	BinarySerializer serializer(stream);
+	serializer.Begin();
+	serializer.WriteProperty(1, "iceberg_version", bind.iceberg_version);
+	serializer.WriteProperty(2, "target_is_statically_empty", bind.target_is_statically_empty);
+	serializer.WriteProperty(3, "data_path", bind.data_path);
+	serializer.WriteProperty(4, "artifact_namespace", bind.artifact_namespace);
+	serializer.WriteProperty(5, "input_types", bind.input_types);
+	serializer.WriteProperty(6, "row_id_start", bind.row_id_start);
+	serializer.WriteProperty(7, "has_source_marker", bind.source_marker.IsValid());
+	serializer.WriteProperty(8, "source_marker", bind.source_marker.IsValid() ? bind.source_marker.GetIndex() : 0);
+	serializer.WriteObject(9, "insert_writer",
+	                       [&](Serializer &object) { SerializeMergeWriter(object, bind.insert_writer); });
+	serializer.WriteObject(10, "update_writer",
+	                       [&](Serializer &object) { SerializeMergeWriter(object, bind.update_writer); });
+	serializer.WriteList(11, "actions", bind.actions.size(), [&](Serializer::List &list, idx_t index) {
+		auto &action = bind.actions[index];
+		list.WriteObject([&](Serializer &object) {
+			object.WriteProperty(1, "condition", action.condition);
+			object.WriteProperty(2, "action_type", action.action_type);
+			object.WritePropertyWithDefault<unique_ptr<Expression>>(3, "predicate", action.predicate);
+			object.WritePropertyWithDefault<vector<unique_ptr<Expression>>>(4, "expressions", action.expressions);
+		});
+	});
+	serializer.WriteList(12, "delete_sources", bind.delete_sources.size(), [&](Serializer::List &list, idx_t index) {
+		auto &source = bind.delete_sources[index];
+		list.WriteObject([&](Serializer &object) {
+			object.WriteProperty(1, "scan_file_path", source.scan_file_path);
+			object.WriteProperty(2, "data_file_path", source.data_file_path);
+			object.WriteProperty(3, "record_count", source.record_count);
+			object.WriteProperty(4, "existing_delete_blob", source.existing_delete_blob);
+		});
+	});
+	serializer.WriteProperty(13, "worker_plan_is_statically_empty", bind.worker_plan_is_statically_empty);
+	serializer.End();
+	return BytesFromStream(stream);
+}
+
+static IcebergDistributedMergeBind DeserializeMergeBind(ClientContext &context, const string &bytes) {
 	if (bytes.empty()) {
-		throw SerializationException("Iceberg distributed UPDATE COPY operator is empty");
+		throw SerializationException("Iceberg distributed MERGE bind data is empty");
+	}
+	auto stream = StreamFromBytes(bytes);
+	BinaryDeserializer deserializer(stream);
+	deserializer.Set<ClientContext &>(context);
+	deserializer.Begin();
+	IcebergDistributedMergeBind result;
+	result.iceberg_version = deserializer.ReadProperty<int32_t>(1, "iceberg_version");
+	result.target_is_statically_empty = deserializer.ReadProperty<bool>(2, "target_is_statically_empty");
+	result.data_path = deserializer.ReadProperty<string>(3, "data_path");
+	result.artifact_namespace = deserializer.ReadProperty<string>(4, "artifact_namespace");
+	result.input_types = deserializer.ReadProperty<vector<LogicalType>>(5, "input_types");
+	result.row_id_start = deserializer.ReadProperty<idx_t>(6, "row_id_start");
+	auto has_source_marker = deserializer.ReadProperty<bool>(7, "has_source_marker");
+	auto source_marker = deserializer.ReadProperty<idx_t>(8, "source_marker");
+	if (has_source_marker) {
+		result.source_marker = source_marker;
+	} else if (source_marker != 0) {
+		throw SerializationException("Iceberg distributed MERGE bind has a non-canonical source marker");
+	}
+	deserializer.ReadObject(9, "insert_writer",
+	                        [&](Deserializer &object) { result.insert_writer = DeserializeMergeWriter(object); });
+	deserializer.ReadObject(10, "update_writer",
+	                        [&](Deserializer &object) { result.update_writer = DeserializeMergeWriter(object); });
+	deserializer.ReadList(11, "actions", [&](Deserializer::List &list, idx_t) {
+		IcebergDistributedMergeActionBind action;
+		list.ReadObject([&](Deserializer &object) {
+			action.condition = object.ReadProperty<MergeActionCondition>(1, "condition");
+			action.action_type = object.ReadProperty<MergeActionType>(2, "action_type");
+			object.ReadPropertyWithDefault<unique_ptr<Expression>>(3, "predicate", action.predicate);
+			object.ReadPropertyWithDefault<vector<unique_ptr<Expression>>>(4, "expressions", action.expressions);
+		});
+		result.actions.push_back(std::move(action));
+	});
+	deserializer.ReadList(12, "delete_sources", [&](Deserializer::List &list, idx_t) {
+		IcebergDistributedRowDeltaSourceState source;
+		list.ReadObject([&](Deserializer &object) {
+			source.scan_file_path = object.ReadProperty<string>(1, "scan_file_path");
+			source.data_file_path = object.ReadProperty<string>(2, "data_file_path");
+			source.record_count = object.ReadProperty<idx_t>(3, "record_count");
+			source.existing_delete_blob = object.ReadProperty<string>(4, "existing_delete_blob");
+		});
+		result.delete_sources.push_back(std::move(source));
+	});
+	result.worker_plan_is_statically_empty = deserializer.ReadProperty<bool>(13, "worker_plan_is_statically_empty");
+	deserializer.End();
+
+	if ((result.iceberg_version != 2 && result.iceberg_version != 3) || result.data_path.empty() ||
+	    result.artifact_namespace.empty() || result.actions.empty()) {
+		throw SerializationException("Invalid Iceberg distributed MERGE bind data");
+	}
+	auto row_id_count = result.iceberg_version >= 3 ? 3 : 2;
+	if (result.row_id_start > result.input_types.size() ||
+	    row_id_count > result.input_types.size() - result.row_id_start) {
+		throw SerializationException("Iceberg distributed MERGE row identifiers are out of bounds");
+	}
+	auto file_path_index = result.row_id_start + (result.iceberg_version >= 3 ? 1 : 0);
+	if (result.input_types[file_path_index] != LogicalType::VARCHAR ||
+	    result.input_types[file_path_index + 1] != LogicalType::BIGINT) {
+		throw SerializationException("Iceberg distributed MERGE row identifiers have invalid types");
+	}
+	if (result.iceberg_version >= 3 && result.input_types[result.row_id_start] != LogicalType::BIGINT) {
+		throw SerializationException("Iceberg distributed v3 MERGE _row_id has an invalid type");
+	}
+	if (result.source_marker.IsValid() &&
+	    (result.source_marker.GetIndex() >= result.row_id_start ||
+	     result.input_types[result.source_marker.GetIndex()] != LogicalType::INTEGER)) {
+		throw SerializationException("Iceberg distributed MERGE source marker has an invalid position or type");
+	}
+	bool has_insert = false;
+	bool has_update = false;
+	bool has_row_delta = false;
+	bool has_not_matched_by_source = false;
+	for (const auto &action : result.actions) {
+		switch (action.condition) {
+		case MergeActionCondition::WHEN_MATCHED:
+		case MergeActionCondition::WHEN_NOT_MATCHED_BY_TARGET:
+			break;
+		case MergeActionCondition::WHEN_NOT_MATCHED_BY_SOURCE:
+			has_not_matched_by_source = true;
+			break;
+		default:
+			throw SerializationException("Iceberg distributed MERGE has an invalid match condition");
+		}
+		if (action.predicate && action.predicate->return_type != LogicalType::BOOLEAN) {
+			throw SerializationException("Iceberg distributed MERGE action predicate is not BOOLEAN");
+		}
+		switch (action.action_type) {
+		case MergeActionType::MERGE_INSERT:
+			has_insert = true;
+			if (action.condition != MergeActionCondition::WHEN_NOT_MATCHED_BY_TARGET || action.expressions.empty()) {
+				throw SerializationException("Iceberg distributed MERGE has an invalid INSERT action");
+			}
+			break;
+		case MergeActionType::MERGE_UPDATE:
+			has_update = true;
+			has_row_delta = true;
+			if (action.condition == MergeActionCondition::WHEN_NOT_MATCHED_BY_TARGET || action.expressions.empty()) {
+				throw SerializationException("Iceberg distributed MERGE has an invalid UPDATE action");
+			}
+			break;
+		case MergeActionType::MERGE_DELETE:
+			has_row_delta = true;
+			if (action.condition == MergeActionCondition::WHEN_NOT_MATCHED_BY_TARGET || !action.expressions.empty()) {
+				throw SerializationException("Iceberg distributed MERGE has an invalid DELETE action");
+			}
+			break;
+		case MergeActionType::MERGE_ERROR:
+			if (action.expressions.size() > 1 ||
+			    (!action.expressions.empty() && action.expressions[0]->return_type != LogicalType::VARCHAR)) {
+				throw SerializationException("Iceberg distributed MERGE has an invalid error expression");
+			}
+			break;
+		case MergeActionType::MERGE_DO_NOTHING:
+			if (!action.expressions.empty()) {
+				throw SerializationException("Iceberg distributed MERGE DO NOTHING action has expressions");
+			}
+			break;
+		default:
+			throw SerializationException("Iceberg distributed MERGE has an invalid action type");
+		}
+	}
+	if (has_not_matched_by_source != result.source_marker.IsValid()) {
+		throw SerializationException("Iceberg distributed MERGE source marker does not match its actions");
+	}
+	if (has_insert != !result.insert_writer.copy_operator.empty() ||
+	    has_update != !result.update_writer.copy_operator.empty()) {
+		throw SerializationException("Iceberg distributed MERGE writer state does not match its actions");
+	}
+	if ((!has_insert && !result.insert_writer.projections.empty()) ||
+	    (!has_update && !result.update_writer.projections.empty())) {
+		throw SerializationException("Iceberg distributed MERGE has projections without a writer");
+	}
+	if (result.target_is_statically_empty && !result.delete_sources.empty()) {
+		throw SerializationException("Iceberg distributed MERGE has delete sources for an empty target");
+	}
+	if (result.iceberg_version == 2 && !result.delete_sources.empty()) {
+		throw SerializationException("Iceberg distributed v2 MERGE unexpectedly contains v3 source state");
+	}
+	if (!has_row_delta && !result.delete_sources.empty()) {
+		throw SerializationException("Iceberg distributed MERGE contains unused delete-source state");
+	}
+	unordered_set<string> scan_paths;
+	unordered_set<string> data_paths;
+	for (const auto &source : result.delete_sources) {
+		if (source.scan_file_path.empty() || source.data_file_path.empty() ||
+		    !scan_paths.insert(source.scan_file_path).second || !data_paths.insert(source.data_file_path).second) {
+			throw SerializationException("Iceberg distributed v3 MERGE contains invalid source-file state");
+		}
+		DecodeExistingDeleteBlob(source.existing_delete_blob, source.record_count);
+	}
+	return result;
+}
+
+static unique_ptr<PhysicalOperator> DeserializeShallowCopy(ClientContext &context, PhysicalPlan &physical_plan,
+                                                           const string &bytes, const string &operation_name) {
+	if (bytes.empty()) {
+		throw SerializationException("Iceberg distributed %s COPY operator is empty", operation_name);
 	}
 	auto stream = StreamFromBytes(bytes);
 	BinaryDeserializer deserializer(stream);
@@ -485,10 +787,44 @@ static unique_ptr<PhysicalOperator> DeserializeShallowCopy(ClientContext &contex
 	auto result = PhysicalOperator::Deserialize(deserializer, physical_plan);
 	deserializer.End();
 	if (result->type != PhysicalOperatorType::COPY_TO_FILE || !result->children.empty()) {
-		throw SerializationException("Iceberg distributed UPDATE worker bind is not a shallow COPY operator");
+		throw SerializationException("Iceberg distributed %s worker bind is not a shallow COPY operator",
+		                             operation_name);
 	}
-	ValidateDistributedUpdateCopyShape(result->Cast<PhysicalCopyToFile>());
+	ValidateDistributedRowRewriteCopyShape(result->Cast<PhysicalCopyToFile>(), operation_name);
 	return result;
+}
+
+static void ValidateDistributedMergeWriterShape(const PhysicalCopyToFile &copy,
+                                                const vector<unique_ptr<Expression>> &projections,
+                                                idx_t action_column_count, int32_t iceberg_version, bool is_update,
+                                                const string &action_name) {
+	auto input_column_count = action_column_count + (is_update && iceberg_version >= 3 ? 1 : 0);
+	auto writer_column_count = projections.empty() ? input_column_count : projections.size();
+	if (writer_column_count != copy.expected_types.size()) {
+		throw SerializationException("Distributed Iceberg MERGE %s writer has an invalid input width", action_name);
+	}
+	if (!is_update) {
+		return;
+	}
+
+	auto row_id_index = GetDistributedUpdateRowIdIndex(copy, iceberg_version);
+	if (iceberg_version < 3) {
+		return;
+	}
+	if (!row_id_index.IsValid() || row_id_index.GetIndex() != action_column_count) {
+		throw SerializationException(
+		    "Distributed Iceberg v3 MERGE UPDATE writer has an invalid row-lineage column position");
+	}
+	if (projections.empty()) {
+		return;
+	}
+	auto &row_id_projection = *projections[row_id_index.GetIndex()];
+	if (row_id_projection.GetExpressionClass() != ExpressionClass::BOUND_REF ||
+	    row_id_projection.return_type != LogicalType::BIGINT ||
+	    row_id_projection.Cast<BoundReferenceExpression>().index != action_column_count) {
+		throw SerializationException(
+		    "Distributed Iceberg v3 MERGE UPDATE projection does not preserve the target _row_id");
+	}
 }
 
 static void SerializeCopyFile(Serializer &serializer, const distributed::DistributedCopyFileInfo &file) {
@@ -589,6 +925,12 @@ static string IcebergDistributedRowDeltaRoot(ClientContext &context, const strin
 	return fs.JoinPath(data_path, "_vane_row_delta_" + EncodePathComponent(artifact_namespace));
 }
 
+static string IcebergDistributedMergeRoot(ClientContext &context, const string &data_path,
+                                          const string &artifact_namespace) {
+	auto &fs = FileSystem::GetFileSystem(context);
+	return fs.JoinPath(data_path, "_vane_merge_" + EncodePathComponent(artifact_namespace));
+}
+
 class IcebergDistributedRowDeltaGlobalState final : public DistributedWriteGlobalState {
 public:
 	IcebergDistributedRowDeltaGlobalState(ClientContext &context, IcebergDistributedRowDeltaBind bind_p,
@@ -601,7 +943,7 @@ public:
 			fs.CreateDirectoriesRecursive(attempt_root);
 		}
 		if (bind.kind == IcebergDistributedRowDeltaKind::UPDATE) {
-			copy_holder = DeserializeShallowCopy(context, copy_plan, bind.copy_operator);
+			copy_holder = DeserializeShallowCopy(context, copy_plan, bind.copy_operator, "UPDATE");
 			copy = &copy_holder->Cast<PhysicalCopyToFile>();
 			copy->file_path = attempt_root;
 			if (copy->expected_types.size() != bind.copy_column_count) {
@@ -641,6 +983,429 @@ public:
 	unordered_map<string, vector<idx_t>> deleted_rows;
 	idx_t affected_rows = 0;
 };
+
+class IcebergDistributedMergeCopyWriter {
+public:
+	IcebergDistributedMergeCopyWriter(ClientContext &context, const string &copy_operator, string output_path_p)
+	    : plan(Allocator::Get(context)), output_path(std::move(output_path_p)) {
+		holder = DeserializeShallowCopy(context, plan, copy_operator, "MERGE");
+		copy = &holder->Cast<PhysicalCopyToFile>();
+		copy->file_path = output_path;
+		auto &fs = FileSystem::GetFileSystem(context);
+		if (!fs.IsRemoteFile(output_path)) {
+			fs.CreateDirectoriesRecursive(output_path);
+		}
+	}
+
+	PhysicalPlan plan;
+	unique_ptr<PhysicalOperator> holder;
+	optional_ptr<PhysicalCopyToFile> copy;
+	string output_path;
+	mutex lock;
+	bool sink_initialized = false;
+};
+
+struct IcebergDistributedMergeCopyLocalState {
+	unique_ptr<LocalSinkState> sink_state;
+	unique_ptr<ExpressionExecutor> projection_executor;
+	DataChunk projected_chunk;
+	DataChunk cast_chunk;
+};
+
+struct IcebergDistributedMergeActionLocalState {
+	unique_ptr<ExpressionExecutor> predicate_executor;
+	unique_ptr<ExpressionExecutor> expression_executor;
+	DataChunk expression_chunk;
+	DataChunk update_chunk;
+};
+
+class IcebergDistributedMergeGlobalState final : public DistributedWriteGlobalState {
+public:
+	IcebergDistributedMergeGlobalState(ClientContext &context, IcebergDistributedMergeBind bind_p,
+	                                   const DistributedWriteTaskContext &task)
+	    : bind(std::move(bind_p)) {
+		auto &fs = FileSystem::GetFileSystem(context);
+		auto operation_root = IcebergDistributedMergeRoot(context, bind.data_path, bind.artifact_namespace);
+		attempt_root = fs.JoinPath(operation_root, EncodePathComponent(task.task_attempt_id));
+		if (!fs.IsRemoteFile(attempt_root)) {
+			fs.CreateDirectoriesRecursive(attempt_root);
+		}
+		if (!bind.insert_writer.copy_operator.empty()) {
+			insert_writer = make_uniq<IcebergDistributedMergeCopyWriter>(context, bind.insert_writer.copy_operator,
+			                                                             fs.JoinPath(attempt_root, "insert"));
+		}
+		if (!bind.update_writer.copy_operator.empty()) {
+			update_writer = make_uniq<IcebergDistributedMergeCopyWriter>(context, bind.update_writer.copy_operator,
+			                                                             fs.JoinPath(attempt_root, "update"));
+		}
+		for (const auto &action : bind.actions) {
+			if (action.action_type == MergeActionType::MERGE_INSERT) {
+				ValidateDistributedMergeWriterShape(*insert_writer->copy, bind.insert_writer.projections,
+				                                    action.expressions.size(), bind.iceberg_version, false, "INSERT");
+			} else if (action.action_type == MergeActionType::MERGE_UPDATE) {
+				ValidateDistributedMergeWriterShape(*update_writer->copy, bind.update_writer.projections,
+				                                    action.expressions.size(), bind.iceberg_version, true, "UPDATE");
+			}
+		}
+		for (idx_t index = 0; index < bind.delete_sources.size(); index++) {
+			if (!delete_source_indexes.emplace(bind.delete_sources[index].scan_file_path, index).second) {
+				throw SerializationException("Iceberg distributed v3 MERGE contains duplicate source-file state");
+			}
+		}
+	}
+
+	IcebergDistributedMergeBind bind;
+	unique_ptr<IcebergDistributedMergeCopyWriter> insert_writer;
+	unique_ptr<IcebergDistributedMergeCopyWriter> update_writer;
+	string attempt_root;
+	unordered_map<string, idx_t> delete_source_indexes;
+	mutex lock;
+	unordered_map<string, vector<idx_t>> deleted_rows;
+	mutex modified_rows_lock;
+	unordered_map<string, unordered_set<idx_t>> modified_rows;
+	idx_t inserted_rows = 0;
+	idx_t updated_rows = 0;
+	idx_t deleted_row_count = 0;
+};
+
+class IcebergDistributedMergeLocalState final : public DistributedWriteLocalState {
+public:
+	IcebergDistributedMergeLocalState(ExecutionContext &context, const IcebergDistributedMergeGlobalState &global) {
+		action_states.reserve(global.bind.actions.size());
+		for (const auto &action : global.bind.actions) {
+			auto state = make_uniq<IcebergDistributedMergeActionLocalState>();
+			if (action.predicate) {
+				state->predicate_executor = make_uniq<ExpressionExecutor>(context.client, *action.predicate);
+			}
+			if (!action.expressions.empty()) {
+				state->expression_executor = make_uniq<ExpressionExecutor>(context.client, action.expressions);
+				vector<LogicalType> expression_types;
+				for (const auto &expression : action.expressions) {
+					expression_types.push_back(expression->return_type);
+				}
+				state->expression_chunk.Initialize(context.client, expression_types);
+				if (action.action_type == MergeActionType::MERGE_UPDATE && global.bind.iceberg_version >= 3) {
+					expression_types.push_back(LogicalType::BIGINT);
+					state->update_chunk.Initialize(context.client, expression_types);
+				}
+			}
+			action_states.push_back(std::move(state));
+		}
+		InitializeCopyState(context, global.insert_writer.get(), global.bind.insert_writer, insert_copy);
+		InitializeCopyState(context, global.update_writer.get(), global.bind.update_writer, update_copy);
+	}
+
+	static void InitializeCopyState(ExecutionContext &context, const IcebergDistributedMergeCopyWriter *writer,
+	                                const IcebergDistributedMergeWriterBind &bind,
+	                                IcebergDistributedMergeCopyLocalState &state) {
+		if (!writer) {
+			return;
+		}
+		if (!bind.projections.empty()) {
+			state.projection_executor = make_uniq<ExpressionExecutor>(context.client, bind.projections);
+			vector<LogicalType> projected_types;
+			for (const auto &projection : bind.projections) {
+				projected_types.push_back(projection->return_type);
+			}
+			state.projected_chunk.Initialize(context.client, projected_types);
+		}
+		state.cast_chunk.Initialize(context.client, writer->copy->expected_types);
+	}
+
+	vector<unique_ptr<IcebergDistributedMergeActionLocalState>> action_states;
+	IcebergDistributedMergeCopyLocalState insert_copy;
+	IcebergDistributedMergeCopyLocalState update_copy;
+	unordered_map<string, vector<idx_t>> deleted_rows;
+	idx_t inserted_rows = 0;
+	idx_t updated_rows = 0;
+	idx_t deleted_row_count = 0;
+};
+
+static unique_ptr<DistributedWriteGlobalState> IcebergMergeInitializeGlobal(ClientContext &context,
+                                                                            const DistributedExtensionWriteInfo &info,
+                                                                            const DistributedWriteTaskContext &task) {
+	task.Validate();
+	auto bind = DeserializeMergeBind(context, info.worker_bind_data);
+	return make_uniq<IcebergDistributedMergeGlobalState>(context, std::move(bind), task);
+}
+
+static unique_ptr<DistributedWriteLocalState> IcebergMergeInitializeLocal(ExecutionContext &context,
+                                                                          const DistributedExtensionWriteInfo &,
+                                                                          const DistributedWriteTaskContext &,
+                                                                          DistributedWriteGlobalState &global_state) {
+	return make_uniq<IcebergDistributedMergeLocalState>(context,
+	                                                    global_state.Cast<IcebergDistributedMergeGlobalState>());
+}
+
+static void SinkDistributedMergeCopy(ExecutionContext &context, IcebergDistributedMergeCopyWriter &writer,
+                                     IcebergDistributedMergeCopyLocalState &local_state, DataChunk &input) {
+	if (input.size() == 0) {
+		return;
+	}
+	reference<DataChunk> copy_input = input;
+	if (local_state.projection_executor) {
+		local_state.projected_chunk.Reset();
+		local_state.projection_executor->Execute(input, local_state.projected_chunk);
+		copy_input = local_state.projected_chunk;
+	}
+	if (copy_input.get().ColumnCount() != writer.copy->expected_types.size()) {
+		throw InvalidInputException("Iceberg distributed MERGE writer input has an invalid width");
+	}
+	local_state.cast_chunk.Reset();
+	for (idx_t index = 0; index < copy_input.get().ColumnCount(); index++) {
+		if (copy_input.get().data[index].GetType() != writer.copy->expected_types[index]) {
+			VectorOperations::Cast(context.client, copy_input.get().data[index], local_state.cast_chunk.data[index],
+			                       copy_input.get().size());
+		} else {
+			local_state.cast_chunk.data[index].Reference(copy_input.get().data[index]);
+		}
+	}
+	local_state.cast_chunk.SetCardinality(copy_input.get().size());
+	{
+		lock_guard<mutex> guard(writer.lock);
+		if (!writer.sink_initialized) {
+			writer.copy->sink_state = writer.copy->GetGlobalSinkState(context.client);
+			writer.sink_initialized = true;
+		}
+	}
+	if (!local_state.sink_state) {
+		local_state.sink_state = writer.copy->GetLocalSinkState(context);
+	}
+	InterruptState interrupt_state;
+	OperatorSinkInput sink_input {*writer.copy->sink_state, *local_state.sink_state, interrupt_state};
+	if (writer.copy->Sink(context, local_state.cast_chunk, sink_input) != SinkResultType::NEED_MORE_INPUT) {
+		throw InternalException("Iceberg distributed MERGE COPY writer stopped before consuming its input");
+	}
+}
+
+static void CombineDistributedMergeCopy(ExecutionContext &context, IcebergDistributedMergeCopyWriter *writer,
+                                        IcebergDistributedMergeCopyLocalState &local_state) {
+	if (!writer || !local_state.sink_state) {
+		return;
+	}
+	InterruptState interrupt_state;
+	OperatorSinkCombineInput combine_input {*writer->copy->sink_state, *local_state.sink_state, interrupt_state};
+	if (writer->copy->Combine(context, combine_input) != SinkCombineResultType::FINISHED) {
+		throw InternalException("Iceberg distributed MERGE COPY combine did not finish synchronously");
+	}
+}
+
+static void CollectDistributedMergeDeletes(IcebergDistributedMergeGlobalState &global_state,
+                                           IcebergDistributedMergeLocalState &local_state, DataChunk &input,
+                                           MergeActionType action_type) {
+	auto file_path_index = global_state.bind.row_id_start + (global_state.bind.iceberg_version >= 3 ? 1 : 0);
+	auto row_position_index = file_path_index + 1;
+	lock_guard<mutex> modified_rows_guard(global_state.modified_rows_lock);
+	for (idx_t row = 0; row < input.size(); row++) {
+		auto file_value = input.GetValue(file_path_index, row);
+		auto position_value = input.GetValue(row_position_index, row);
+		if (file_value.IsNull() || position_value.IsNull()) {
+			throw InvalidInputException("Iceberg distributed MERGE received a NULL target row identifier");
+		}
+		auto file_path = file_value.GetValue<string>();
+		auto position = position_value.GetValue<int64_t>();
+		if (file_path.empty() || position < 0) {
+			throw InvalidInputException("Iceberg distributed MERGE received an invalid target row identifier");
+		}
+		if (global_state.bind.iceberg_version >= 3) {
+			auto source = global_state.delete_source_indexes.find(file_path);
+			if (source == global_state.delete_source_indexes.end() ||
+			    NumericCast<idx_t>(position) >= global_state.bind.delete_sources[source->second].record_count) {
+				throw InvalidInputException(
+				    "Iceberg distributed v3 MERGE received a target row outside its planned source files");
+			}
+			if (action_type == MergeActionType::MERGE_UPDATE) {
+				auto row_id = input.GetValue(global_state.bind.row_id_start, row);
+				if (row_id.IsNull() || row_id.GetValue<int64_t>() < 0) {
+					throw InvalidInputException("Iceberg distributed v3 MERGE UPDATE received an invalid _row_id");
+				}
+			}
+		}
+		if (!global_state.modified_rows[file_path].insert(NumericCast<idx_t>(position)).second) {
+			throw InvalidInputException("The same Iceberg row was modified multiple times in one distributed MERGE; "
+			                            "eliminate duplicate matches");
+		}
+		local_state.deleted_rows[std::move(file_path)].push_back(NumericCast<idx_t>(position));
+	}
+}
+
+static void ExecuteDistributedMergeAction(ExecutionContext &context, IcebergDistributedMergeGlobalState &global_state,
+                                          IcebergDistributedMergeLocalState &local_state, idx_t action_index,
+                                          DataChunk &input) {
+	auto &action = global_state.bind.actions[action_index];
+	auto &action_state = *local_state.action_states[action_index];
+	switch (action.action_type) {
+	case MergeActionType::MERGE_INSERT:
+		action_state.expression_chunk.Reset();
+		action_state.expression_executor->Execute(input, action_state.expression_chunk);
+		SinkDistributedMergeCopy(context, *global_state.insert_writer, local_state.insert_copy,
+		                         action_state.expression_chunk);
+		local_state.inserted_rows =
+		    CheckedAdd(local_state.inserted_rows, input.size(), "MERGE worker inserted row count");
+		return;
+	case MergeActionType::MERGE_UPDATE: {
+		CollectDistributedMergeDeletes(global_state, local_state, input, action.action_type);
+		action_state.expression_chunk.Reset();
+		action_state.expression_executor->Execute(input, action_state.expression_chunk);
+		reference<DataChunk> copy_input = action_state.expression_chunk;
+		if (global_state.bind.iceberg_version >= 3) {
+			action_state.update_chunk.Reset();
+			for (idx_t column = 0; column < action_state.expression_chunk.ColumnCount(); column++) {
+				action_state.update_chunk.data[column].Reference(action_state.expression_chunk.data[column]);
+			}
+			action_state.update_chunk.data.back().Reference(input.data[global_state.bind.row_id_start]);
+			action_state.update_chunk.SetCardinality(input.size());
+			copy_input = action_state.update_chunk;
+		}
+		SinkDistributedMergeCopy(context, *global_state.update_writer, local_state.update_copy, copy_input);
+		local_state.updated_rows = CheckedAdd(local_state.updated_rows, input.size(), "MERGE worker updated row count");
+		return;
+	}
+	case MergeActionType::MERGE_DELETE:
+		CollectDistributedMergeDeletes(global_state, local_state, input, action.action_type);
+		local_state.deleted_row_count =
+		    CheckedAdd(local_state.deleted_row_count, input.size(), "MERGE worker deleted row count");
+		return;
+	case MergeActionType::MERGE_ERROR: {
+		string merge_condition = MergeIntoStatement::ActionConditionToString(action.condition);
+		if (action.predicate) {
+			merge_condition += " AND " + action.predicate->ToString();
+		}
+		if (action_state.expression_executor) {
+			action_state.expression_chunk.Reset();
+			action_state.expression_executor->Execute(input, action_state.expression_chunk);
+			merge_condition += ": " + action_state.expression_chunk.GetValue(0, 0).ToString();
+		}
+		throw ConstraintException("Merge error condition %s", merge_condition);
+	}
+	case MergeActionType::MERGE_DO_NOTHING:
+		return;
+	default:
+		throw InternalException("Unsupported Iceberg distributed MERGE action");
+	}
+}
+
+static void ExecuteDistributedMergeCondition(ExecutionContext &context,
+                                             IcebergDistributedMergeGlobalState &global_state,
+                                             IcebergDistributedMergeLocalState &local_state,
+                                             MergeActionCondition condition, DataChunk &input,
+                                             const SelectionVector &condition_selection, idx_t condition_count) {
+	if (condition_count == 0) {
+		return;
+	}
+	DataChunk condition_chunk;
+	condition_chunk.Initialize(context.client, global_state.bind.input_types);
+	condition_chunk.Slice(input, condition_selection, condition_count);
+	SelectionVector current_selection;
+	SelectionVector selected_selection(STANDARD_VECTOR_SIZE);
+	SelectionVector remaining_selection(STANDARD_VECTOR_SIZE);
+	idx_t current_count = condition_count;
+	for (idx_t action_index = 0; action_index < global_state.bind.actions.size(); action_index++) {
+		auto &action = global_state.bind.actions[action_index];
+		if (action.condition != condition || current_count == 0) {
+			continue;
+		}
+		auto &action_state = *local_state.action_states[action_index];
+		idx_t selected_count;
+		if (action_state.predicate_executor) {
+			selected_count = action_state.predicate_executor->SelectExpression(
+			    condition_chunk, selected_selection, remaining_selection, current_selection, current_count);
+			if (selected_count == 0) {
+				continue;
+			}
+			current_count -= selected_count;
+			current_selection.Initialize(remaining_selection);
+		} else {
+			selected_selection.Initialize(current_selection);
+			selected_count = current_count;
+			current_count = 0;
+		}
+		DataChunk action_chunk;
+		action_chunk.Initialize(context.client, global_state.bind.input_types);
+		action_chunk.Slice(condition_chunk, selected_selection, selected_count);
+		ExecuteDistributedMergeAction(context, global_state, local_state, action_index, action_chunk);
+	}
+}
+
+static void IcebergMergeSink(ExecutionContext &context, const DistributedExtensionWriteInfo &,
+                             const DistributedWriteTaskContext &, DistributedWriteGlobalState &global_state_p,
+                             DistributedWriteLocalState &local_state_p, DataChunk &input) {
+	auto &global_state = global_state_p.Cast<IcebergDistributedMergeGlobalState>();
+	auto &local_state = local_state_p.Cast<IcebergDistributedMergeLocalState>();
+	if (global_state.bind.worker_plan_is_statically_empty) {
+		if (input.size() != 0) {
+			throw InvalidInputException("Iceberg distributed MERGE received rows from a statically empty worker plan");
+		}
+		return;
+	}
+	if (input.GetTypes() != global_state.bind.input_types) {
+		throw InvalidInputException("Iceberg distributed MERGE worker input schema changed during transport");
+	}
+	SelectionVector matched(STANDARD_VECTOR_SIZE);
+	SelectionVector not_matched_by_target(STANDARD_VECTOR_SIZE);
+	SelectionVector not_matched_by_source(STANDARD_VECTOR_SIZE);
+	idx_t matched_count = 0;
+	idx_t not_matched_by_target_count = 0;
+	idx_t not_matched_by_source_count = 0;
+	UnifiedVectorFormat target_marker_data;
+	input.data[global_state.bind.row_id_start].ToUnifiedFormat(input.size(), target_marker_data);
+	if (global_state.bind.source_marker.IsValid()) {
+		UnifiedVectorFormat source_marker_data;
+		input.data[global_state.bind.source_marker.GetIndex()].ToUnifiedFormat(input.size(), source_marker_data);
+		for (idx_t row = 0; row < input.size(); row++) {
+			auto source_index = source_marker_data.sel->get_index(row);
+			auto target_index = target_marker_data.sel->get_index(row);
+			if (!source_marker_data.validity.RowIsValid(source_index)) {
+				not_matched_by_source.set_index(not_matched_by_source_count++, row);
+			} else if (!target_marker_data.validity.RowIsValid(target_index)) {
+				not_matched_by_target.set_index(not_matched_by_target_count++, row);
+			} else {
+				matched.set_index(matched_count++, row);
+			}
+		}
+	} else {
+		for (idx_t row = 0; row < input.size(); row++) {
+			auto target_index = target_marker_data.sel->get_index(row);
+			if (target_marker_data.validity.RowIsValid(target_index)) {
+				matched.set_index(matched_count++, row);
+			} else {
+				not_matched_by_target.set_index(not_matched_by_target_count++, row);
+			}
+		}
+	}
+	if (global_state.bind.target_is_statically_empty && (matched_count != 0 || not_matched_by_source_count != 0)) {
+		throw InvalidInputException(
+		    "Iceberg distributed MERGE received target rows from a statically empty target scan");
+	}
+	ExecuteDistributedMergeCondition(context, global_state, local_state, MergeActionCondition::WHEN_MATCHED, input,
+	                                 matched, matched_count);
+	ExecuteDistributedMergeCondition(context, global_state, local_state,
+	                                 MergeActionCondition::WHEN_NOT_MATCHED_BY_TARGET, input, not_matched_by_target,
+	                                 not_matched_by_target_count);
+	ExecuteDistributedMergeCondition(context, global_state, local_state,
+	                                 MergeActionCondition::WHEN_NOT_MATCHED_BY_SOURCE, input, not_matched_by_source,
+	                                 not_matched_by_source_count);
+}
+
+static void IcebergMergeCombine(ExecutionContext &context, const DistributedExtensionWriteInfo &,
+                                const DistributedWriteTaskContext &, DistributedWriteGlobalState &global_state_p,
+                                DistributedWriteLocalState &local_state_p) {
+	auto &global_state = global_state_p.Cast<IcebergDistributedMergeGlobalState>();
+	auto &local_state = local_state_p.Cast<IcebergDistributedMergeLocalState>();
+	CombineDistributedMergeCopy(context, global_state.insert_writer.get(), local_state.insert_copy);
+	CombineDistributedMergeCopy(context, global_state.update_writer.get(), local_state.update_copy);
+	lock_guard<mutex> guard(global_state.lock);
+	for (auto &entry : local_state.deleted_rows) {
+		auto &target = global_state.deleted_rows[entry.first];
+		target.insert(target.end(), entry.second.begin(), entry.second.end());
+	}
+	global_state.inserted_rows =
+	    CheckedAdd(global_state.inserted_rows, local_state.inserted_rows, "MERGE worker inserted row count");
+	global_state.updated_rows =
+	    CheckedAdd(global_state.updated_rows, local_state.updated_rows, "MERGE worker updated row count");
+	global_state.deleted_row_count =
+	    CheckedAdd(global_state.deleted_row_count, local_state.deleted_row_count, "MERGE worker deleted row count");
+}
 
 static unique_ptr<DistributedWriteGlobalState>
 IcebergRowDeltaInitializeGlobal(ClientContext &context, const DistributedExtensionWriteInfo &info,
@@ -1020,6 +1785,184 @@ static vector<DistributedWriteFragment> IcebergRowDeltaFinalize(ClientContext &c
 	return {std::move(fragment)};
 }
 
+static vector<distributed::DistributedCopyFileInfo>
+FinalizeMergeCopyAndReadStatistics(ClientContext &context, IcebergDistributedMergeCopyWriter *writer,
+                                   idx_t expected_rows, const string &action_name) {
+	vector<distributed::DistributedCopyFileInfo> result;
+	if (expected_rows == 0) {
+		if (writer && writer->sink_initialized) {
+			throw InternalException("Iceberg distributed MERGE %s writer was initialized without rows", action_name);
+		}
+		return result;
+	}
+	if (!writer || !writer->sink_initialized || !writer->copy->sink_state) {
+		throw InternalException("Iceberg distributed MERGE %s rows are missing their COPY writer", action_name);
+	}
+	if (writer->copy->FinalizeInternal(context, *writer->copy->sink_state) != SinkFinalizeType::READY) {
+		throw InternalException("Iceberg distributed MERGE %s COPY finalization did not finish synchronously",
+		                        action_name);
+	}
+	auto source_global = writer->copy->GetGlobalSourceState(context);
+	ThreadContext thread_context(context);
+	ExecutionContext execution_context(context, thread_context, nullptr);
+	auto source_local = writer->copy->GetLocalSourceState(execution_context, *source_global);
+	InterruptState interrupt_state;
+	OperatorSourceInput source_input {*source_global, *source_local, interrupt_state};
+	while (true) {
+		DataChunk chunk;
+		chunk.Initialize(context, writer->copy->types);
+		auto state = writer->copy->GetDataInternal(execution_context, chunk, source_input);
+		for (idx_t row = 0; row < chunk.size(); row++) {
+			distributed::DistributedCopyFileInfo file;
+			file.final_path = chunk.GetValue(0, row).GetValue<string>();
+			file.row_count = chunk.GetValue(1, row).GetValue<idx_t>();
+			file.file_size_bytes = chunk.GetValue(2, row).GetValue<idx_t>();
+			file.footer_size_bytes = chunk.GetValue(3, row);
+			file.column_statistics = chunk.GetValue(4, row);
+			file.partition_keys = chunk.GetValue(5, row);
+			result.push_back(std::move(file));
+		}
+		if (state == SourceResultType::FINISHED) {
+			break;
+		}
+		if (state != SourceResultType::HAVE_MORE_OUTPUT) {
+			throw InternalException("Iceberg distributed MERGE %s COPY statistics source blocked unexpectedly",
+			                        action_name);
+		}
+	}
+	return result;
+}
+
+static string SerializeMergeFragmentPayload(const IcebergDistributedMergeResult &result) {
+	MemoryStream stream(Allocator::DefaultAllocator());
+	BinarySerializer serializer(stream);
+	serializer.Begin();
+	serializer.WriteProperty(1, "inserted_rows", result.inserted_rows);
+	serializer.WriteProperty(2, "updated_rows", result.updated_rows);
+	serializer.WriteProperty(3, "deleted_rows", result.deleted_rows);
+	serializer.WriteList(4, "data_files", result.data_files.size(), [&](Serializer::List &list, idx_t index) {
+		list.WriteObject([&](Serializer &object) { SerializeCopyFile(object, result.data_files[index]); });
+	});
+	serializer.WriteList(5, "delete_files", result.delete_files.size(), [&](Serializer::List &list, idx_t index) {
+		list.WriteObject([&](Serializer &object) { SerializeDeleteFile(object, result.delete_files[index]); });
+	});
+	serializer.End();
+	return BytesFromStream(stream);
+}
+
+static IcebergDistributedMergeResult DeserializeMergeFragmentPayload(const string &bytes) {
+	if (bytes.empty()) {
+		throw SerializationException("Iceberg distributed MERGE fragment is empty");
+	}
+	auto stream = StreamFromBytes(bytes);
+	BinaryDeserializer deserializer(stream);
+	deserializer.Begin();
+	IcebergDistributedMergeResult result;
+	result.inserted_rows = deserializer.ReadProperty<idx_t>(1, "inserted_rows");
+	result.updated_rows = deserializer.ReadProperty<idx_t>(2, "updated_rows");
+	result.deleted_rows = deserializer.ReadProperty<idx_t>(3, "deleted_rows");
+	deserializer.ReadList(4, "data_files", [&](Deserializer::List &list, idx_t) {
+		list.ReadObject([&](Deserializer &object) { result.data_files.push_back(DeserializeCopyFile(object)); });
+	});
+	deserializer.ReadList(5, "delete_files", [&](Deserializer::List &list, idx_t) {
+		list.ReadObject([&](Deserializer &object) { result.delete_files.push_back(DeserializeDeleteFile(object)); });
+	});
+	deserializer.End();
+	return result;
+}
+
+static vector<DistributedWriteFragment> IcebergMergeFinalize(ClientContext &context,
+                                                             const DistributedExtensionWriteInfo &,
+                                                             const DistributedWriteTaskContext &task,
+                                                             DistributedWriteGlobalState &global_state_p) {
+	auto &global_state = global_state_p.Cast<IcebergDistributedMergeGlobalState>();
+	IcebergDistributedMergeResult result;
+	unordered_map<string, vector<idx_t>> deleted_rows;
+	{
+		lock_guard<mutex> guard(global_state.lock);
+		result.inserted_rows = global_state.inserted_rows;
+		result.updated_rows = global_state.updated_rows;
+		result.deleted_rows = global_state.deleted_row_count;
+		deleted_rows = std::move(global_state.deleted_rows);
+	}
+	auto affected_rows = CheckedAdd(result.inserted_rows, result.updated_rows, "MERGE worker affected row count");
+	affected_rows = CheckedAdd(affected_rows, result.deleted_rows, "MERGE worker affected row count");
+	if (affected_rows == 0) {
+		return {};
+	}
+
+	auto insert_files =
+	    FinalizeMergeCopyAndReadStatistics(context, global_state.insert_writer.get(), result.inserted_rows, "INSERT");
+	auto update_files =
+	    FinalizeMergeCopyAndReadStatistics(context, global_state.update_writer.get(), result.updated_rows, "UPDATE");
+	result.data_files.reserve(insert_files.size() + update_files.size());
+	for (auto &file : insert_files) {
+		result.data_files.push_back(std::move(file));
+	}
+	for (auto &file : update_files) {
+		result.data_files.push_back(std::move(file));
+	}
+
+	for (auto &entry : deleted_rows) {
+		auto &fs = FileSystem::GetFileSystem(context);
+		if (global_state.bind.iceberg_version >= 3) {
+			auto source_index = global_state.delete_source_indexes.find(entry.first);
+			if (source_index == global_state.delete_source_indexes.end()) {
+				throw InvalidInputException(
+				    "Iceberg distributed v3 MERGE produced rows for an unplanned source data file");
+			}
+			auto file_name = UUID::ToString(UUID::GenerateRandomUUID()) + "-deletes.puffin";
+			auto output_path = fs.JoinPath(global_state.attempt_root, file_name);
+			result.delete_files.push_back(WriteDeletionVectorFile(
+			    context, output_path, global_state.bind.delete_sources[source_index->second], entry.second));
+		} else {
+			auto file_name = UUID::ToString(UUID::GenerateRandomUUID()) + "-deletes.parquet";
+			auto output_path = fs.JoinPath(global_state.attempt_root, file_name);
+			result.delete_files.push_back(WritePositionDeleteFile(context, output_path, entry.first, entry.second));
+		}
+	}
+
+	idx_t data_rows = 0;
+	idx_t delete_row_count = 0;
+	idx_t byte_count = 0;
+	for (const auto &file : result.data_files) {
+		data_rows = CheckedAdd(data_rows, file.row_count, "MERGE worker data row count");
+		byte_count = CheckedAdd(byte_count, file.file_size_bytes, "MERGE worker byte count");
+	}
+	for (const auto &file : result.delete_files) {
+		delete_row_count = CheckedAdd(delete_row_count, file.new_delete_count, "MERGE worker delete row count");
+		byte_count = CheckedAdd(byte_count, file.file_size_bytes, "MERGE worker byte count");
+	}
+	auto expected_data_rows = CheckedAdd(result.inserted_rows, result.updated_rows, "MERGE worker data row count");
+	auto expected_delete_rows = CheckedAdd(result.updated_rows, result.deleted_rows, "MERGE worker delete row count");
+	if (data_rows != expected_data_rows || delete_row_count != expected_delete_rows) {
+		throw InternalException("Iceberg distributed MERGE worker produced inconsistent action counts");
+	}
+
+	DistributedWriteFragment fragment;
+	fragment.fragment_id = task.query_id + "/" + task.task_attempt_id;
+	fragment.payload = SerializeMergeFragmentPayload(result);
+	fragment.row_count = affected_rows;
+	fragment.byte_count = byte_count;
+	for (idx_t index = 0; index < result.data_files.size(); index++) {
+		DistributedWriteArtifact artifact;
+		artifact.artifact_id = "data:" + std::to_string(index);
+		artifact.uri = result.data_files[index].final_path.empty() ? result.data_files[index].staging_path
+		                                                           : result.data_files[index].final_path;
+		artifact.codec = ICEBERG_DATA_FILE_CODEC;
+		fragment.artifacts.push_back(std::move(artifact));
+	}
+	for (idx_t index = 0; index < result.delete_files.size(); index++) {
+		DistributedWriteArtifact artifact;
+		artifact.artifact_id = "delete:" + std::to_string(index);
+		artifact.uri = result.delete_files[index].delete_file_path;
+		artifact.codec = result.delete_files[index].is_deletion_vector ? ICEBERG_DELETION_VECTOR_FILE_CODEC
+		                                                               : ICEBERG_POSITION_DELETE_FILE_CODEC;
+		fragment.artifacts.push_back(std::move(artifact));
+	}
+	return {std::move(fragment)};
+}
+
 static string CanonicalIcebergDistributedPath(FileSystem &fs, const string &path, const string &description) {
 	auto canonical = distributed::CanonicalDistributedCopyBasePath(fs, path);
 	if (canonical.is_err()) {
@@ -1104,6 +2047,33 @@ PhysicalOperator &PlanIcebergDistributedRowDeltaRepartition(PhysicalPlanGenerato
 	return result;
 }
 
+PhysicalOperator &PlanIcebergDistributedMergeRepartition(PhysicalPlanGenerator &planner, PhysicalOperator &input,
+                                                         idx_t file_path_index,
+                                                         const vector<idx_t> &null_target_partition_indexes) {
+	if (file_path_index >= input.types.size() || input.types[file_path_index] != LogicalType::VARCHAR) {
+		throw InternalException("Iceberg distributed MERGE file-path column is invalid");
+	}
+	vector<unique_ptr<Expression>> arguments;
+	arguments.push_back(make_uniq<BoundReferenceExpression>(LogicalType::VARCHAR, file_path_index));
+	for (auto partition_index : null_target_partition_indexes) {
+		if (partition_index >= input.types.size() || partition_index == file_path_index) {
+			throw InternalException("Iceberg distributed MERGE null-target partition column is invalid");
+		}
+		if (input.types[partition_index].id() == LogicalTypeId::SQLNULL) {
+			continue;
+		}
+		arguments.push_back(make_uniq<BoundReferenceExpression>(input.types[partition_index], partition_index));
+	}
+	vector<ExprRef> partition_by;
+	partition_by.emplace_back(make_uniq<BoundFunctionExpression>(
+	    LogicalType::HASH, IcebergDistributedMergePartitionFunction(), std::move(arguments), nullptr));
+	auto repartition_spec = RepartitionSpec::create_hash(0, std::move(partition_by));
+	auto &result =
+	    planner.Make<PhysicalRepartition>(input.types, std::move(repartition_spec), input.estimated_cardinality);
+	result.children.push_back(input);
+	return result;
+}
+
 string BuildIcebergDistributedDeleteBind(ClientContext &context, const IcebergTableEntry &table,
                                          const IcebergMultiFileList &file_list, const vector<idx_t> &row_id_indexes,
                                          const string &artifact_namespace) {
@@ -1115,7 +2085,7 @@ string BuildIcebergDistributedDeleteBind(ClientContext &context, const IcebergTa
 	bind.artifact_namespace = artifact_namespace;
 	bind.row_id_indexes = row_id_indexes;
 	if (metadata.iceberg_version >= 3) {
-		PopulateDistributedRowDeltaSources(bind, file_list, "DELETE");
+		PopulateDistributedRowDeltaSources(bind.delete_sources, file_list, "DELETE");
 	}
 	return SerializeBind(bind);
 }
@@ -1139,9 +2109,9 @@ static string BuildIcebergDistributedUpdateBindInternal(ClientContext &context, 
 	bind.row_id_indexes = {file_path_index, row_position_index};
 	bind.copy_column_count = copy_column_count;
 	bind.copy_row_id_index = GetDistributedUpdateRowIdIndex(copy, metadata.iceberg_version);
-	bind.copy_operator = SerializeShallowCopy(copy);
+	bind.copy_operator = SerializeShallowCopy(copy, "UPDATE");
 	if (metadata.iceberg_version >= 3 && file_list) {
-		PopulateDistributedRowDeltaSources(bind, *file_list, "UPDATE");
+		PopulateDistributedRowDeltaSources(bind.delete_sources, *file_list, "UPDATE");
 	}
 	return SerializeBind(bind);
 }
@@ -1162,6 +2132,96 @@ string BuildIcebergDistributedEmptyUpdateBind(ClientContext &context, const Iceb
 	                                                 row_position_index, artifact_namespace, true);
 }
 
+static vector<unique_ptr<Expression>> CopyExpressionList(const vector<unique_ptr<Expression>> &expressions) {
+	vector<unique_ptr<Expression>> result;
+	result.reserve(expressions.size());
+	for (const auto &expression : expressions) {
+		result.push_back(expression->Copy());
+	}
+	return result;
+}
+
+static void ConfigureDistributedMergeWriter(IcebergDistributedMergeWriterBind &target, const PhysicalCopyToFile &copy,
+                                            const vector<unique_ptr<Expression>> &projections,
+                                            idx_t action_column_count, int32_t iceberg_version, bool is_update,
+                                            const string &action_name) {
+	ValidateDistributedMergeWriterShape(copy, projections, action_column_count, iceberg_version, is_update,
+	                                    action_name);
+	auto serialized_copy = SerializeShallowCopy(copy, "MERGE");
+	if (target.copy_operator.empty()) {
+		target.copy_operator = std::move(serialized_copy);
+		target.projections = CopyExpressionList(projections);
+		return;
+	}
+	if (target.copy_operator != serialized_copy || !Expression::ListEquals(target.projections, projections)) {
+		throw NotImplementedException("Distributed Iceberg MERGE requires one canonical %s writer", action_name);
+	}
+}
+
+string BuildIcebergDistributedMergeBind(ClientContext &context, const IcebergTableEntry &table,
+                                        optional_ptr<const IcebergMultiFileList> target_file_list,
+                                        const vector<IcebergDistributedMergePlanAction> &actions,
+                                        const vector<LogicalType> &input_types, idx_t row_id_start,
+                                        optional_idx source_marker, bool target_is_statically_empty,
+                                        bool worker_plan_is_statically_empty, const string &artifact_namespace) {
+	auto &metadata = table.table_info.table_metadata;
+	IcebergDistributedMergeBind bind;
+	bind.iceberg_version = metadata.iceberg_version;
+	bind.target_is_statically_empty = target_is_statically_empty;
+	bind.worker_plan_is_statically_empty = worker_plan_is_statically_empty;
+	bind.data_path = metadata.GetDataPath(FileSystem::GetFileSystem(context));
+	bind.artifact_namespace = artifact_namespace;
+	bind.input_types = input_types;
+	bind.row_id_start = row_id_start;
+	bind.source_marker = source_marker;
+
+	bool has_row_delta = false;
+	for (const auto &planned_action : actions) {
+		IcebergDistributedMergeActionBind action;
+		action.condition = planned_action.match_condition;
+		action.action_type = planned_action.action_type;
+		if (planned_action.condition) {
+			action.predicate = planned_action.condition->Copy();
+		}
+		action.expressions = CopyExpressionList(planned_action.expressions);
+		switch (planned_action.action_type) {
+		case MergeActionType::MERGE_INSERT:
+			if (!planned_action.copy) {
+				throw InternalException("Iceberg MERGE INSERT action is missing its physical writer");
+			}
+			ConfigureDistributedMergeWriter(bind.insert_writer, *planned_action.copy, planned_action.projections,
+			                                action.expressions.size(), metadata.iceberg_version, false, "INSERT");
+			break;
+		case MergeActionType::MERGE_UPDATE:
+			if (!planned_action.copy) {
+				throw InternalException("Iceberg MERGE UPDATE action is missing its physical writer");
+			}
+			ConfigureDistributedMergeWriter(bind.update_writer, *planned_action.copy, planned_action.projections,
+			                                action.expressions.size(), metadata.iceberg_version, true, "UPDATE");
+			has_row_delta = true;
+			break;
+		case MergeActionType::MERGE_DELETE:
+			has_row_delta = true;
+			break;
+		case MergeActionType::MERGE_ERROR:
+		case MergeActionType::MERGE_DO_NOTHING:
+			break;
+		default:
+			throw InternalException("Unsupported Iceberg MERGE action");
+		}
+		bind.actions.push_back(std::move(action));
+	}
+	if (has_row_delta && !target_is_statically_empty) {
+		if (!target_file_list || !target_file_list->HasDistributedScanPlan()) {
+			throw InvalidInputException("Distributed Iceberg MERGE requires a planned target scan");
+		}
+		if (metadata.iceberg_version >= 3) {
+			PopulateDistributedRowDeltaSources(bind.delete_sources, *target_file_list, "MERGE");
+		}
+	}
+	return SerializeMergeBind(bind);
+}
+
 DistributedExtensionWriteCallbacks IcebergDistributedRowDeltaCallbacks() {
 	DistributedExtensionWriteCallbacks callbacks;
 	callbacks.initialize_global = IcebergRowDeltaInitializeGlobal;
@@ -1169,6 +2229,16 @@ DistributedExtensionWriteCallbacks IcebergDistributedRowDeltaCallbacks() {
 	callbacks.sink = IcebergRowDeltaSink;
 	callbacks.combine = IcebergRowDeltaCombine;
 	callbacks.finalize = IcebergRowDeltaFinalize;
+	return callbacks;
+}
+
+static DistributedExtensionWriteCallbacks IcebergDistributedMergeCallbacks() {
+	DistributedExtensionWriteCallbacks callbacks;
+	callbacks.initialize_global = IcebergMergeInitializeGlobal;
+	callbacks.initialize_local = IcebergMergeInitializeLocal;
+	callbacks.sink = IcebergMergeSink;
+	callbacks.combine = IcebergMergeCombine;
+	callbacks.finalize = IcebergMergeFinalize;
 	return callbacks;
 }
 
@@ -1335,13 +2405,166 @@ IcebergDistributedRowDeltaResult DecodeIcebergDistributedRowDeltaResults(
 	return combined;
 }
 
-void CleanupIcebergDistributedRowDelta(ClientContext &context, const string &data_path,
-                                       const string &artifact_namespace, const unordered_set<string> *paths_to_keep) {
-	if (data_path.empty() || artifact_namespace.empty()) {
-		return;
+IcebergDistributedMergeResult DecodeIcebergDistributedMergeResults(ClientContext &context, const string &data_path,
+                                                                   const string &artifact_namespace,
+                                                                   const DistributedExtensionWriteInfo &info,
+                                                                   const vector<DistributedWriteTaskResult> &results,
+                                                                   int32_t expected_iceberg_version,
+                                                                   bool worker_plan_is_statically_empty) {
+	info.Validate();
+	if (info.mode != DistributedWriteMode::CALLBACK ||
+	    info.fragment_codec != DistributedPayloadCodec {ICEBERG_MERGE_FRAGMENT_CODEC, ICEBERG_MERGE_PROTOCOL_VERSION}) {
+		throw InvalidInputException("Iceberg distributed MERGE coordinator resolved the wrong worker protocol");
 	}
+	if (expected_iceberg_version != 2 && expected_iceberg_version != 3) {
+		throw InvalidInputException("Iceberg distributed MERGE coordinator has an unsupported table version");
+	}
+	if (results.empty() && !worker_plan_is_statically_empty) {
+		throw InvalidInputException("Iceberg distributed MERGE returned no selected task results");
+	}
+
+	IcebergDistributedMergeResult combined;
+	set<string> task_attempt_ids;
+	set<string> fragment_ids;
+	set<string> artifact_paths;
+	set<string> referenced_data_paths;
+	string query_id;
+	auto operation_root = IcebergDistributedMergeRoot(context, data_path, artifact_namespace);
+	for (const auto &task_result : results) {
+		task_result.Validate();
+		if (task_result.capability != info.capability || task_result.fragment_codec != info.fragment_codec) {
+			throw InvalidInputException("Iceberg distributed MERGE received a mismatched task result protocol");
+		}
+		if (query_id.empty()) {
+			query_id = task_result.query_id;
+		} else if (task_result.query_id != query_id) {
+			throw InvalidInputException("Iceberg distributed MERGE received results from multiple queries");
+		}
+		if (!task_attempt_ids.insert(task_result.task_attempt_id).second) {
+			throw InvalidInputException("Iceberg distributed MERGE selected task attempt '%s' more than once",
+			                            task_result.task_attempt_id);
+		}
+		if (task_result.fragments.size() > 1) {
+			throw InvalidInputException("Iceberg distributed MERGE task attempt '%s' returned more than one fragment",
+			                            task_result.task_attempt_id);
+		}
+		for (const auto &fragment : task_result.fragments) {
+			if (!fragment_ids.insert(fragment.fragment_id).second) {
+				throw InvalidInputException("Iceberg distributed MERGE selected fragment '%s' more than once",
+				                            fragment.fragment_id);
+			}
+			if (fragment.fragment_id != task_result.query_id + "/" + task_result.task_attempt_id ||
+			    fragment.row_count == 0) {
+				throw InvalidInputException("Iceberg distributed MERGE fragment has an invalid identity or row count");
+			}
+			auto decoded = DeserializeMergeFragmentPayload(fragment.payload);
+			auto affected_rows = CheckedAdd(decoded.inserted_rows, decoded.updated_rows, "MERGE affected row count");
+			affected_rows = CheckedAdd(affected_rows, decoded.deleted_rows, "MERGE affected row count");
+			if (affected_rows != fragment.row_count) {
+				throw InvalidInputException("Iceberg distributed MERGE fragment has inconsistent action counts");
+			}
+
+			idx_t data_row_count = 0;
+			idx_t delete_row_count = 0;
+			idx_t byte_count = 0;
+			vector<pair<string, DistributedPayloadCodec>> expected_artifacts;
+			vector<string> expected_artifact_ids;
+			idx_t data_artifact_index = 0;
+			for (auto &file : decoded.data_files) {
+				const auto &path = file.final_path.empty() ? file.staging_path : file.final_path;
+				if (path.empty() || file.row_count == 0 || file.file_size_bytes == 0 ||
+				    !artifact_paths.insert(path).second) {
+					throw InvalidInputException(
+					    "Iceberg distributed MERGE returned a duplicate or empty data-file path");
+				}
+				ValidateIcebergSignedFileCounts(file.row_count, file.file_size_bytes, "MERGE data-file");
+				ValidateIcebergDistributedDataFileValues(file);
+				ValidateIcebergDistributedAttemptArtifactPath(context, operation_root, task_result.task_attempt_id,
+				                                              path, file.file_size_bytes, "MERGE data-file");
+				data_row_count = CheckedAdd(data_row_count, file.row_count, "MERGE data row count");
+				byte_count = CheckedAdd(byte_count, file.file_size_bytes, "MERGE byte count");
+				expected_artifacts.emplace_back(path, ICEBERG_DATA_FILE_CODEC);
+				expected_artifact_ids.push_back("data:" + std::to_string(data_artifact_index++));
+				combined.data_files.push_back(std::move(file));
+			}
+			idx_t delete_artifact_index = 0;
+			for (auto &file : decoded.delete_files) {
+				auto expects_deletion_vector = expected_iceberg_version >= 3;
+				if (file.data_file_path.empty() || file.delete_file_path.empty() || file.new_delete_count == 0 ||
+				    file.delete_count == 0 || file.new_delete_count > file.delete_count || file.file_size_bytes == 0 ||
+				    file.pos_min_value > file.pos_max_value ||
+				    file.delete_count - 1 > file.pos_max_value - file.pos_min_value ||
+				    file.is_deletion_vector != expects_deletion_vector ||
+				    !artifact_paths.insert(file.delete_file_path).second) {
+					throw InvalidInputException("Iceberg distributed MERGE returned invalid delete-file metadata");
+				}
+				if (file.is_deletion_vector) {
+					if (file.footer_size_bytes != 0 || file.content_offset != 4 || file.content_size_in_bytes < 12 ||
+					    CheckedAdd(file.content_offset, file.content_size_in_bytes,
+					               "MERGE deletion-vector content range") >= file.file_size_bytes) {
+						throw InvalidInputException(
+						    "Iceberg distributed v3 MERGE returned invalid deletion-vector metadata");
+					}
+				} else if (file.new_delete_count != file.delete_count || file.footer_size_bytes == 0 ||
+				           file.footer_size_bytes > file.file_size_bytes || file.content_offset != 0 ||
+				           file.content_size_in_bytes != 0) {
+					throw InvalidInputException(
+					    "Iceberg distributed v2 MERGE returned invalid positional-delete metadata");
+				}
+				ValidateIcebergSignedFileCounts(file.delete_count, file.file_size_bytes, "MERGE delete-file");
+				ValidateIcebergDistributedAttemptArtifactPath(context, operation_root, task_result.task_attempt_id,
+				                                              file.delete_file_path, file.file_size_bytes,
+				                                              "MERGE delete-file");
+				if (!referenced_data_paths.insert(file.data_file_path).second) {
+					throw NotImplementedException(
+					    "Distributed Iceberg MERGE produced multiple delete files for one data file");
+				}
+				delete_row_count = CheckedAdd(delete_row_count, file.new_delete_count, "MERGE delete row count");
+				byte_count = CheckedAdd(byte_count, file.file_size_bytes, "MERGE byte count");
+				expected_artifacts.emplace_back(file.delete_file_path, file.is_deletion_vector
+				                                                           ? ICEBERG_DELETION_VECTOR_FILE_CODEC
+				                                                           : ICEBERG_POSITION_DELETE_FILE_CODEC);
+				expected_artifact_ids.push_back("delete:" + std::to_string(delete_artifact_index++));
+				combined.delete_files.push_back(std::move(file));
+			}
+			auto expected_data_rows = CheckedAdd(decoded.inserted_rows, decoded.updated_rows, "MERGE data row count");
+			auto expected_delete_rows =
+			    CheckedAdd(decoded.updated_rows, decoded.deleted_rows, "MERGE delete row count");
+			if (data_row_count != expected_data_rows || delete_row_count != expected_delete_rows ||
+			    byte_count != fragment.byte_count || fragment.artifacts.size() != expected_artifacts.size()) {
+				throw InvalidInputException("Iceberg distributed MERGE fragment counts are inconsistent");
+			}
+			for (idx_t index = 0; index < fragment.artifacts.size(); index++) {
+				auto &artifact = fragment.artifacts[index];
+				if (artifact.artifact_id != expected_artifact_ids[index] ||
+				    artifact.uri != expected_artifacts[index].first ||
+				    artifact.codec != expected_artifacts[index].second || !artifact.payload.empty()) {
+					throw InvalidInputException("Iceberg distributed MERGE fragment has invalid artifact metadata");
+				}
+				combined.selected_artifact_paths.insert(artifact.uri);
+			}
+			combined.inserted_rows =
+			    CheckedAdd(combined.inserted_rows, decoded.inserted_rows, "MERGE inserted row count");
+			combined.updated_rows = CheckedAdd(combined.updated_rows, decoded.updated_rows, "MERGE updated row count");
+			combined.deleted_rows = CheckedAdd(combined.deleted_rows, decoded.deleted_rows, "MERGE deleted row count");
+		}
+	}
+	auto affected_rows = CheckedAdd(combined.inserted_rows, combined.updated_rows, "MERGE affected row count");
+	affected_rows = CheckedAdd(affected_rows, combined.deleted_rows, "MERGE affected row count");
+	if (worker_plan_is_statically_empty && affected_rows != 0) {
+		throw InvalidInputException("Iceberg distributed MERGE returned mutations for a statically empty worker plan");
+	}
+	if (affected_rows > NumericCast<idx_t>(NumericLimits<int64_t>::Maximum())) {
+		throw InvalidInputException("Iceberg distributed MERGE affected row count exceeds signed 64-bit limits");
+	}
+	combined.affected_rows = affected_rows;
+	return combined;
+}
+
+static void CleanupIcebergDistributedWriteRoot(ClientContext &context, const string &root,
+                                               const unordered_set<string> *paths_to_keep,
+                                               const string &operation_name) {
 	auto &fs = FileSystem::GetFileSystem(context);
-	auto root = IcebergDistributedRowDeltaRoot(context, data_path, artifact_namespace);
 	if (!paths_to_keep || paths_to_keep->empty()) {
 		distributed::RemoveDistributedCopyDirectoryTree(fs, root);
 	} else {
@@ -1364,7 +2587,7 @@ void CleanupIcebergDistributedRowDelta(ClientContext &context, const string &dat
 		for (const auto &file : remaining_files) {
 			if (canonical_paths_to_keep.find(CanonicalIcebergDistributedPath(fs, file, "remaining artifact")) ==
 			    canonical_paths_to_keep.end()) {
-				throw IOException("Iceberg distributed row-delta cleanup left artifact '%s'", file);
+				throw IOException("Iceberg distributed %s cleanup left artifact '%s'", operation_name, file);
 			}
 		}
 		return;
@@ -1374,12 +2597,32 @@ void CleanupIcebergDistributedRowDelta(ClientContext &context, const string &dat
 	distributed::ListDistributedCopyFilesRecursive(fs, root, remaining_files);
 	for (const auto &file : remaining_files) {
 		if (!paths_to_keep || paths_to_keep->find(file) == paths_to_keep->end()) {
-			throw IOException("Iceberg distributed row-delta cleanup left artifact '%s'", file);
+			throw IOException("Iceberg distributed %s cleanup left artifact '%s'", operation_name, file);
 		}
 	}
 }
 
+void CleanupIcebergDistributedRowDelta(ClientContext &context, const string &data_path,
+                                       const string &artifact_namespace, const unordered_set<string> *paths_to_keep) {
+	if (data_path.empty() || artifact_namespace.empty()) {
+		return;
+	}
+	CleanupIcebergDistributedWriteRoot(context, IcebergDistributedRowDeltaRoot(context, data_path, artifact_namespace),
+	                                   paths_to_keep, "row-delta");
+}
+
+void CleanupIcebergDistributedMerge(ClientContext &context, const string &data_path, const string &artifact_namespace,
+                                    const unordered_set<string> *paths_to_keep) {
+	if (data_path.empty() || artifact_namespace.empty()) {
+		return;
+	}
+	CleanupIcebergDistributedWriteRoot(context, IcebergDistributedMergeRoot(context, data_path, artifact_namespace),
+	                                   paths_to_keep, "MERGE");
+}
+
 void RegisterIcebergDistributedWrites(ExtensionLoader &loader) {
+	loader.RegisterFunction(IcebergDistributedMergePartitionFunction());
+
 	auto register_file_write = [&](const string &name) {
 		DistributedWriteOperatorExtension extension;
 		extension.name = name;
@@ -1403,6 +2646,14 @@ void RegisterIcebergDistributedWrites(ExtensionLoader &loader) {
 	};
 	register_row_delta("delete");
 	register_row_delta("update");
+
+	DistributedWriteOperatorExtension merge;
+	merge.name = "merge";
+	merge.protocol_version = ICEBERG_MERGE_PROTOCOL_VERSION;
+	merge.mode = DistributedWriteMode::CALLBACK;
+	merge.fragment_codec = {ICEBERG_MERGE_FRAGMENT_CODEC, ICEBERG_MERGE_PROTOCOL_VERSION};
+	merge.callbacks = IcebergDistributedMergeCallbacks();
+	DistributedWriteOperatorExtension::Register(loader, std::move(merge));
 }
 
 } // namespace duckdb

@@ -36,6 +36,9 @@ V3_DELETE_NAME = "vane_wheel_ray_v3_delete"
 V3_SNAPSHOT_CONFLICT_NAME = "vane_wheel_ray_v3_snapshot_conflict"
 V3_SCHEMA_CONFLICT_NAME = "vane_wheel_ray_v3_schema_conflict"
 V3_SPEC_CONFLICT_NAME = "vane_wheel_ray_v3_spec_conflict"
+MERGE_V2_NAME = "vane_wheel_ray_merge_v2"
+MERGE_V3_NAME = "vane_wheel_ray_merge_v3"
+MERGE_LOCAL_NAME = "vane_wheel_local_merge"
 FAILED_CTAS_NAME = "vane_wheel_ray_failed_ctas"
 SOURCE_TABLE = f"{CATALOG_NAME}.default.{SOURCE_NAME}"
 TARGET_TABLE = f"{CATALOG_NAME}.default.{TARGET_NAME}"
@@ -49,6 +52,9 @@ V3_DELETE_TABLE = f"{CATALOG_NAME}.default.{V3_DELETE_NAME}"
 V3_SNAPSHOT_CONFLICT_TABLE = f"{CATALOG_NAME}.default.{V3_SNAPSHOT_CONFLICT_NAME}"
 V3_SCHEMA_CONFLICT_TABLE = f"{CATALOG_NAME}.default.{V3_SCHEMA_CONFLICT_NAME}"
 V3_SPEC_CONFLICT_TABLE = f"{CATALOG_NAME}.default.{V3_SPEC_CONFLICT_NAME}"
+MERGE_V2_TABLE = f"{CATALOG_NAME}.default.{MERGE_V2_NAME}"
+MERGE_V3_TABLE = f"{CATALOG_NAME}.default.{MERGE_V3_NAME}"
+MERGE_LOCAL_TABLE = f"{CATALOG_NAME}.default.{MERGE_LOCAL_NAME}"
 FAILED_CTAS_TABLE = f"{CATALOG_NAME}.default.{FAILED_CTAS_NAME}"
 TABLES = (
     TARGET_TABLE,
@@ -63,6 +69,9 @@ TABLES = (
     V3_SNAPSHOT_CONFLICT_TABLE,
     V3_SCHEMA_CONFLICT_TABLE,
     V3_SPEC_CONFLICT_TABLE,
+    MERGE_V2_TABLE,
+    MERGE_V3_TABLE,
+    MERGE_LOCAL_TABLE,
     FAILED_CTAS_TABLE,
 )
 DATA_ROOT = "s3://warehouse/vane-wheel-ray-integration"
@@ -271,9 +280,22 @@ class RayIcebergHarness:
         try:
             operation()
         except Exception as error:
-            if expected_message not in str(error):
+            messages: list[str] = []
+            seen: set[int] = set()
+            current: BaseException | None = error
+            while current is not None and id(current) not in seen:
+                seen.add(id(current))
+                messages.append(str(current))
+                if current.__cause__ is not None:
+                    current = current.__cause__
+                elif not current.__suppress_context__:
+                    current = current.__context__
+                else:
+                    current = None
+            error_text = "\n".join(messages)
+            if expected_message not in error_text:
                 raise AssertionError(
-                    f"{description}: expected error containing {expected_message!r}, got {error!r}"
+                    f"{description}: expected error containing {expected_message!r}, got {error_text!r}"
                 ) from error
         else:
             raise AssertionError(f"{description}: operation unexpectedly succeeded")
@@ -342,8 +364,7 @@ class WaitForCoordinatorConflict:
 
 def require_concurrent_write_conflict(
     harness: RayIcebergHarness,
-    relation: object,
-    target_table: str,
+    operation: Callable[[], object],
     description: str,
     mutate_catalog: Callable[[], None],
     expected_message: str,
@@ -355,7 +376,7 @@ def require_concurrent_write_conflict(
 
     def execute_write() -> None:
         try:
-            relation.insert_into(target_table)
+            operation()
         except BaseException as error:
             errors.append(error)
 
@@ -625,6 +646,363 @@ def exercise_source_target_and_topology(
         f"SELECT count(*)::BIGINT FROM {TARGET_TABLE} WHERE payload = 'updated'",
         "distributed Iceberg UPDATE row count",
         [(SOURCE_ROW_COUNT // 64,)],
+    )
+
+
+def exercise_distributed_merge(harness: RayIcebergHarness) -> None:
+    connection = harness.connection
+    distributed_insert_ids = tuple(range(10, SOURCE_ROW_COUNT, 16))
+
+    def merge(
+        description: str,
+        source: object,
+        target: str,
+        when_clauses: list[str],
+    ) -> None:
+        harness.require_write(
+            description,
+            lambda: source.merge_into(
+                target,
+                "target.id = source.id",
+                when_clauses,
+            ),
+        )
+
+    connection.execute(
+        f"CREATE TABLE {MERGE_LOCAL_TABLE} (id INTEGER, payload VARCHAR) "
+        f"WITH ('format-version' = '2', 'write.data.path' = '{DATA_ROOT}/merge-local')"
+    )
+    connection.execute(f"INSERT INTO {MERGE_LOCAL_TABLE} VALUES (0, 'old')")
+    configured_runner = os.environ.get("VANE_RUNNER")
+    previous_write_count = harness.write_dispatch_count
+    os.environ["VANE_RUNNER"] = "local-fast"
+    try:
+        connection.sql(f"SELECT id, payload FROM {SOURCE_TABLE} WHERE id IN (0, 1)").merge_into(
+            MERGE_LOCAL_TABLE,
+            "target.id = source.id",
+            [
+                "WHEN MATCHED THEN UPDATE SET payload = source.payload",
+                "WHEN NOT MATCHED THEN INSERT (id, payload) VALUES (source.id, source.payload)",
+            ],
+        )
+    finally:
+        if configured_runner is None:
+            os.environ.pop("VANE_RUNNER", None)
+        else:
+            os.environ["VANE_RUNNER"] = configured_runner
+    require_equal(
+        harness.write_dispatch_count,
+        previous_write_count,
+        "local-fast Iceberg MERGE Ray dispatch count",
+    )
+    require_equal(
+        connection.execute(f"SELECT id, payload FROM {MERGE_LOCAL_TABLE} ORDER BY id").fetchall(),
+        [(0, "value-0"), (1, "value-1")],
+        "local-fast Iceberg MERGE result",
+    )
+
+    connection.execute(
+        f"CREATE TABLE {MERGE_V2_TABLE} (id INTEGER, payload VARCHAR, category VARCHAR) "
+        f"WITH ('format-version' = '2', 'write.data.path' = '{DATA_ROOT}/merge-v2')"
+    )
+    merge(
+        "statically empty distributed Iceberg MERGE",
+        connection.sql(f"SELECT id, payload, 'unused'::VARCHAR AS category FROM {SOURCE_TABLE} WHERE false"),
+        MERGE_V2_TABLE,
+        [
+            "WHEN MATCHED THEN UPDATE SET payload = source.payload",
+            "WHEN NOT MATCHED THEN INSERT (id, payload, category) "
+            "VALUES (source.id, source.payload, source.category)",
+        ],
+    )
+    require_equal(
+        connection.execute(f"SELECT count(*) FROM iceberg_snapshots({MERGE_V2_TABLE})").fetchone(),
+        (0,),
+        "statically empty MERGE must not create a snapshot",
+    )
+    merge(
+        "distributed Iceberg v2 INSERT-only MERGE into an empty target",
+        connection.sql(
+            f"SELECT id, ('insert-' || id::VARCHAR)::VARCHAR AS payload, 'C'::VARCHAR AS category "
+            f"FROM {SOURCE_TABLE} WHERE id % 16 = 10"
+        ),
+        MERGE_V2_TABLE,
+        ["WHEN NOT MATCHED THEN INSERT (id, payload, category) VALUES (source.id, source.payload, source.category)"],
+    )
+    connection.execute(
+        f"INSERT INTO {MERGE_V2_TABLE} VALUES "
+        "(0, 'old-0', 'A'), (1, 'old-1', 'A'), (2, 'old-2', 'B'), (3, 'keep-3', 'B')"
+    )
+    merge(
+        "distributed Iceberg v2 ordered UPDATE-only MERGE",
+        connection.sql(
+            f"SELECT id, payload, category FROM {SOURCE_TABLE} CROSS JOIN (SELECT 'unused'::VARCHAR AS category) "
+            "WHERE id IN (0, 1)"
+        ),
+        MERGE_V2_TABLE,
+        [
+            "WHEN MATCHED AND source.id = 0 THEN UPDATE SET payload = 'first-action'",
+            "WHEN MATCHED THEN UPDATE SET payload = 'second-action'",
+        ],
+    )
+    merge(
+        "distributed Iceberg v2 DELETE-only MERGE",
+        connection.sql(f"SELECT id FROM {SOURCE_TABLE} WHERE id = 2"),
+        MERGE_V2_TABLE,
+        ["WHEN MATCHED THEN DELETE"],
+    )
+    merge(
+        "distributed Iceberg v2 DELETE+INSERT and target-only MERGE",
+        connection.sql(
+            f"SELECT id, ('merge-' || id::VARCHAR)::VARCHAR AS payload, 'D'::VARCHAR AS category "
+            f"FROM {SOURCE_TABLE} WHERE id IN (3, 12)"
+        ),
+        MERGE_V2_TABLE,
+        [
+            "WHEN MATCHED THEN DO NOTHING",
+            "WHEN NOT MATCHED THEN INSERT (id, payload, category) VALUES (source.id, source.payload, source.category)",
+            "WHEN NOT MATCHED BY SOURCE AND target.id = 1 THEN DELETE",
+        ],
+    )
+    expected_v2_rows = [
+        (0, "first-action", "A"),
+        (3, "keep-3", "B"),
+        *((row_id, f"insert-{row_id}", "C") for row_id in distributed_insert_ids),
+        (12, "merge-12", "D"),
+    ]
+    expected_v2_rows.sort(key=lambda row: row[0])
+    harness.require_query(
+        f"SELECT id, payload, category FROM {MERGE_V2_TABLE} ORDER BY id",
+        "distributed Iceberg v2 MERGE action result",
+        expected_v2_rows,
+    )
+
+    snapshot_count_before_error = connection.execute(
+        f"SELECT count(*) FROM iceberg_snapshots({MERGE_V2_TABLE})"
+    ).fetchone()
+    table_state_before_error = connection.execute(
+        f"SELECT count(*), sum(id), sum(length(payload)), sum(length(category)) FROM {MERGE_V2_TABLE}"
+    ).fetchone()
+    artifacts_before_error = connection.execute(
+        f"SELECT file FROM glob('{DATA_ROOT}/merge-v2/_vane_merge_*/**/*') ORDER BY file"
+    ).fetchall()
+    harness.require_rejected_write(
+        "distributed Iceberg MERGE partial worker failure",
+        lambda: connection.sql(
+            f"SELECT id, payload, 'failure'::VARCHAR AS category FROM {SOURCE_TABLE} "
+            "WHERE id = 3 OR id BETWEEN 100 AND 199"
+        ).merge_into(
+            MERGE_V2_TABLE,
+            "target.id = source.id",
+            [
+                "WHEN MATCHED AND target.id = 3 THEN ERROR CONCAT('blocked-', source.id::VARCHAR)",
+                "WHEN MATCHED THEN DO NOTHING",
+                "WHEN NOT MATCHED THEN INSERT (id, payload, category) "
+                "VALUES (source.id, source.payload, source.category)",
+            ],
+        ),
+        "blocked-3",
+    )
+    require_equal(
+        connection.execute(f"SELECT count(*) FROM iceberg_snapshots({MERGE_V2_TABLE})").fetchone(),
+        snapshot_count_before_error,
+        "MERGE error action must not commit a snapshot",
+    )
+    require_equal(
+        connection.execute(
+            f"SELECT count(*), sum(id), sum(length(payload)), sum(length(category)) FROM {MERGE_V2_TABLE}"
+        ).fetchone(),
+        table_state_before_error,
+        "failed distributed MERGE must not expose partial rows",
+    )
+    require_equal(
+        connection.execute(
+            f"SELECT file FROM glob('{DATA_ROOT}/merge-v2/_vane_merge_*/**/*') ORDER BY file"
+        ).fetchall(),
+        artifacts_before_error,
+        "failed distributed MERGE worker artifacts were not cleaned",
+    )
+
+    merge(
+        "zero-row distributed Iceberg MERGE",
+        connection.sql(f"SELECT id FROM {SOURCE_TABLE} WHERE id = -1"),
+        MERGE_V2_TABLE,
+        ["WHEN MATCHED THEN DO NOTHING"],
+    )
+    require_equal(
+        connection.execute(f"SELECT count(*) FROM iceberg_snapshots({MERGE_V2_TABLE})").fetchone(),
+        snapshot_count_before_error,
+        "zero-row MERGE must not commit a snapshot",
+    )
+
+    snapshot_count_before_duplicate = connection.execute(
+        f"SELECT count(*) FROM iceberg_snapshots({MERGE_V2_TABLE})"
+    ).fetchone()
+    harness.require_rejected_write(
+        "distributed Iceberg MERGE duplicate target match",
+        lambda: connection.sql(f"SELECT 3::INTEGER AS id, payload FROM {SOURCE_TABLE} WHERE id IN (20, 21)").merge_into(
+            MERGE_V2_TABLE,
+            "target.id = source.id",
+            ["WHEN MATCHED THEN UPDATE SET payload = source.payload"],
+        ),
+        "same Iceberg row was modified multiple times",
+    )
+    require_equal(
+        connection.execute(f"SELECT count(*) FROM iceberg_snapshots({MERGE_V2_TABLE})").fetchone(),
+        snapshot_count_before_duplicate,
+        "duplicate-match MERGE must not commit a snapshot",
+    )
+
+    connection.execute(
+        f"CREATE TABLE {MERGE_V3_TABLE} (id INTEGER, payload VARCHAR, partition_key INTEGER) "
+        "PARTITIONED BY (partition_key) "
+        f"WITH ('format-version' = '3', 'write.data.path' = '{DATA_ROOT}/merge-v3')"
+    )
+    connection.execute(
+        f"INSERT INTO {MERGE_V3_TABLE} "
+        "SELECT id, ('old-' || id::VARCHAR)::VARCHAR, (id % 2)::INTEGER FROM range(6) AS source(id)"
+    )
+    original_lineage = connection.execute(f"SELECT id, _row_id FROM {MERGE_V3_TABLE} ORDER BY id").fetchall()
+    original_row_ids = {int(row[1]) for row in original_lineage}
+    connection.execute(f"DELETE FROM {MERGE_V3_TABLE} WHERE id = 0")
+    lineage_before = connection.execute(
+        f"SELECT id, _row_id, _last_updated_sequence_number FROM {MERGE_V3_TABLE} " "ORDER BY id"
+    ).fetchall()
+    lineage_before_by_id = {int(row[0]): row for row in lineage_before}
+    active_dvs_before = connection.execute(
+        f"SELECT file_path FROM iceberg_metadata({MERGE_V3_TABLE}) "
+        "WHERE content = 'POSITION_DELETES' AND status != 'DELETED'"
+    ).fetchall()
+    require_equal(len(active_dvs_before), 1, "distributed v3 MERGE existing deletion-vector setup")
+
+    merge(
+        "partitioned distributed Iceberg v3 UPDATE+INSERT MERGE",
+        connection.sql(
+            f"SELECT id, ('new-' || id::VARCHAR)::VARCHAR AS payload, (id % 2)::INTEGER AS partition_key "
+            f"FROM {SOURCE_TABLE} WHERE id IN (2, 8)"
+        ),
+        MERGE_V3_TABLE,
+        [
+            "WHEN MATCHED THEN UPDATE SET payload = source.payload, partition_key = 9",
+            "WHEN NOT MATCHED THEN INSERT (id, payload, partition_key) "
+            "VALUES (source.id, source.payload, source.partition_key)",
+        ],
+    )
+    latest_sequence = connection.execute(
+        f"SELECT max(sequence_number) FROM iceberg_snapshots({MERGE_V3_TABLE})"
+    ).fetchone()[0]
+    lineage_after = harness.require_query(
+        f"SELECT id, payload, partition_key, _row_id, _last_updated_sequence_number "
+        f"FROM {MERGE_V3_TABLE} ORDER BY id",
+        "partitioned distributed Iceberg v3 MERGE result and row lineage",
+    )
+    require_equal(
+        [(row[0], row[1], row[2]) for row in lineage_after],
+        [
+            (1, "old-1", 1),
+            (2, "new-2", 9),
+            (3, "old-3", 1),
+            (4, "old-4", 0),
+            (5, "old-5", 1),
+            (8, "new-8", 0),
+        ],
+        "distributed v3 MERGE values and partitions",
+    )
+    lineage_after_by_id = {int(row[0]): row for row in lineage_after}
+    for row_id in (1, 3, 4, 5):
+        require_equal(
+            lineage_after_by_id[row_id][3:],
+            lineage_before_by_id[row_id][1:],
+            f"distributed v3 MERGE unchanged lineage for row {row_id}",
+        )
+    require_equal(
+        lineage_after_by_id[2][3],
+        lineage_before_by_id[2][1],
+        "distributed v3 MERGE UPDATE preserved _row_id",
+    )
+    require_equal(
+        lineage_after_by_id[2][4],
+        latest_sequence,
+        "distributed v3 MERGE UPDATE sequence number",
+    )
+    require_equal(
+        lineage_after_by_id[8][4],
+        latest_sequence,
+        "distributed v3 MERGE INSERT sequence number",
+    )
+    require_true(
+        lineage_after_by_id[8][3] not in original_row_ids and lineage_after_by_id[8][3] > max(original_row_ids),
+        "distributed v3 MERGE INSERT reused a historical row ID",
+    )
+    require_equal(
+        len({row[3] for row in lineage_after}),
+        len(lineage_after),
+        "distributed v3 MERGE row IDs remain unique",
+    )
+    active_dvs_after = connection.execute(
+        f"SELECT file_path FROM iceberg_metadata({MERGE_V3_TABLE}) "
+        "WHERE content = 'POSITION_DELETES' AND status != 'DELETED'"
+    ).fetchall()
+    require_equal(len(active_dvs_after), 1, "distributed v3 MERGE deletion-vector consolidation")
+    require_true(
+        str(active_dvs_after[0][0]).endswith(".puffin") and active_dvs_after != active_dvs_before,
+        "distributed v3 MERGE did not replace the existing Puffin deletion vector",
+    )
+    require_equal(
+        connection.execute(
+            f"SELECT operation FROM iceberg_snapshots({MERGE_V3_TABLE}) ORDER BY sequence_number DESC LIMIT 1"
+        ).fetchone(),
+        ("overwrite",),
+        "distributed v3 MERGE snapshot operation",
+    )
+
+    def blocked_merge_source() -> object:
+        return connection.sql(f"SELECT id, payload FROM {SOURCE_TABLE} WHERE id = 3").map_batches(
+            WaitForCoordinatorConflict,
+            schema={"id": harness.vane.sqltype("INTEGER"), "payload": harness.vane.sqltype("VARCHAR")},
+            batch_size=1,
+            cpus=1.0,
+            execution_backend="ray_actor",
+            actor_number=1,
+            target_max_batch_bytes=4096,
+        )
+
+    def blocked_merge() -> object:
+        return blocked_merge_source().merge_into(
+            MERGE_V3_TABLE,
+            "target.id = source.id",
+            ["WHEN MATCHED THEN UPDATE SET payload = source.payload"],
+        )
+
+    conflict_connection = open_catalog_connection(harness.vane)
+    try:
+        require_concurrent_write_conflict(
+            harness,
+            blocked_merge,
+            "stale distributed MERGE target snapshot",
+            lambda: conflict_connection.execute(f"INSERT INTO {MERGE_V3_TABLE} VALUES (99, 'concurrent', 1)"),
+            "Failed to commit Iceberg transaction",
+        )
+        require_concurrent_write_conflict(
+            harness,
+            blocked_merge,
+            "stale distributed MERGE target schema",
+            lambda: conflict_connection.execute(f"ALTER TABLE {MERGE_V3_TABLE} ADD COLUMN concurrent_column INTEGER"),
+            "Failed to commit Iceberg transaction",
+        )
+        require_concurrent_write_conflict(
+            harness,
+            blocked_merge,
+            "stale distributed MERGE target partition spec",
+            lambda: conflict_connection.execute(f"ALTER TABLE {MERGE_V3_TABLE} SET PARTITIONED BY (payload)"),
+            "Failed to commit Iceberg transaction",
+        )
+    finally:
+        conflict_connection.close()
+    harness.require_query(
+        f"SELECT payload FROM {MERGE_V3_TABLE} WHERE id = 3",
+        "failed distributed MERGE conflicts did not modify the target row",
+        [("old-3",)],
     )
 
 
@@ -988,6 +1366,21 @@ def exercise_v3_distributed_update(harness: RayIcebergHarness) -> None:
         "rejected VARIANT UPDATE must not create an Iceberg snapshot",
     )
 
+    harness.require_rejected_write(
+        "distributed Iceberg MERGE rejects raw VARIANT transport",
+        lambda: connection.sql(f"SELECT id FROM {SOURCE_TABLE} WHERE id = 3").merge_into(
+            V3_COMPAT_TABLE,
+            "target.id = source.id",
+            ["WHEN MATCHED THEN UPDATE SET category = 'UNSUPPORTED'"],
+        ),
+        "Vane repartition transport cannot preserve raw VARIANT values",
+    )
+    require_equal(
+        connection.execute(f"SELECT count(*) FROM iceberg_snapshots({V3_COMPAT_TABLE})").fetchone(),
+        variant_snapshot_count,
+        "rejected VARIANT MERGE must not create an Iceberg snapshot",
+    )
+
     # The partitioned v3 CTAS table has multiple files per identity partition
     # and nested values that must survive the row rewrite. Seed two native DVs
     # in the affected partition, then replace them while preserving row lineage.
@@ -1228,8 +1621,7 @@ def exercise_v3_conflicts(harness: RayIcebergHarness) -> None:
 
         require_concurrent_write_conflict(
             harness,
-            blocked_source(10000),
-            V3_SNAPSHOT_CONFLICT_TABLE,
+            lambda: blocked_source(10000).insert_into(V3_SNAPSHOT_CONFLICT_TABLE),
             "stale v3 INSERT target snapshot",
             lambda: conflict_connection.execute(f"INSERT INTO {V3_SNAPSHOT_CONFLICT_TABLE} VALUES (2, 'concurrent')"),
             "Failed to commit Iceberg transaction",
@@ -1242,8 +1634,7 @@ def exercise_v3_conflicts(harness: RayIcebergHarness) -> None:
 
         require_concurrent_write_conflict(
             harness,
-            blocked_source(20000),
-            V3_SCHEMA_CONFLICT_TABLE,
+            lambda: blocked_source(20000).insert_into(V3_SCHEMA_CONFLICT_TABLE),
             "stale v3 INSERT target schema",
             lambda: conflict_connection.execute(
                 f"ALTER TABLE {V3_SCHEMA_CONFLICT_TABLE} ADD COLUMN concurrent_column INTEGER"
@@ -1258,8 +1649,7 @@ def exercise_v3_conflicts(harness: RayIcebergHarness) -> None:
 
         require_concurrent_write_conflict(
             harness,
-            blocked_source(30000),
-            V3_SPEC_CONFLICT_TABLE,
+            lambda: blocked_source(30000).insert_into(V3_SPEC_CONFLICT_TABLE),
             "stale v3 INSERT target partition spec",
             lambda: conflict_connection.execute(f"ALTER TABLE {V3_SPEC_CONFLICT_TABLE} SET PARTITIONED BY (payload)"),
             "Failed to commit Iceberg transaction",
@@ -1592,6 +1982,7 @@ def main() -> None:
             "source/target writes and worker topology",
             lambda: exercise_source_target_and_topology(harness, ray, expected_nodes),
         )
+        run_scenario("distributed MERGE", lambda: exercise_distributed_merge(harness))
         run_scenario("version-aware distributed CTAS", lambda: exercise_versioned_ctas(harness))
         run_scenario("v3 distributed reads and append", lambda: exercise_v3_reads_and_append(harness))
         run_scenario("v3 distributed DELETE", lambda: exercise_v3_distributed_delete(harness))
@@ -1606,8 +1997,8 @@ def main() -> None:
             "conflicts and fail-closed writes",
             lambda: exercise_conflicts_and_fail_closed_writes(harness),
         )
-        require_true(harness.read_dispatch_count >= 26, "comprehensive suite did not exercise enough Ray reads")
-        require_true(harness.write_dispatch_count >= 24, "comprehensive suite did not exercise enough Ray writes")
+        require_true(harness.read_dispatch_count >= 29, "comprehensive suite did not exercise enough Ray reads")
+        require_true(harness.write_dispatch_count >= 37, "comprehensive suite did not exercise enough Ray writes")
 
         drop_test_tables(connection)
     finally:
