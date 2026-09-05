@@ -332,9 +332,9 @@ void IcebergInsert::ValidateDistributedWrite(ClientContext &context) const {
 static void ValidateDistributedPartitionKeys(const distributed::DistributedCopyFileInfo &file,
                                              const IcebergTableMetadata &metadata);
 
-static void AddDistributedDataFiles(ClientContext &context, IcebergInsertGlobalState &global_state,
-                                    IcebergTableEntry &table,
-                                    const vector<distributed::DistributedCopyFileInfo> &files) {
+void IcebergInsert::AddDistributedDataFiles(ClientContext &context, IcebergInsertGlobalState &global_state,
+                                            IcebergTableEntry &table,
+                                            const vector<distributed::DistributedCopyFileInfo> &files) {
 	auto copy_return_types = GetCopyFunctionReturnLogicalTypes(CopyFunctionReturnType::WRITTEN_FILE_STATISTICS);
 	for (const auto &file : files) {
 		ValidateDistributedPartitionKeys(file, table.table_info.table_metadata);

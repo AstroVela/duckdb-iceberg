@@ -24,6 +24,10 @@
 
 namespace duckdb {
 
+#ifdef ICEBERG_VANE_DISTRIBUTED
+class PhysicalIcebergDistributedMergeInto;
+#endif
+
 enum class IcebergInsertVirtualColumns { NONE, WRITE_ROW_ID, WRITE_SEQUENCE_NUMBER, WRITE_ROW_ID_AND_SEQUENCE_NUMBER };
 
 struct IcebergCopyInput {
@@ -167,6 +171,10 @@ public:
 
 private:
 #ifdef ICEBERG_VANE_DISTRIBUTED
+	friend class PhysicalIcebergDistributedMergeInto;
+	static void AddDistributedDataFiles(ClientContext &context, IcebergInsertGlobalState &global_state,
+	                                    IcebergTableEntry &table,
+	                                    const vector<distributed::DistributedCopyFileInfo> &files);
 	void InitializeDistributedWritePlan();
 	void SelectDistributedWorkerPlan();
 	void ValidateDistributedWriteShape() const;

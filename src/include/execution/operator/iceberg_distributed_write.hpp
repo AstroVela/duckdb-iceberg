@@ -10,6 +10,7 @@
 #include "duckdb/common/unordered_set.hpp"
 #include "duckdb/execution/distributed/copy_to_file.hpp"
 #include "duckdb/execution/distributed/extension_write_task_provider.hpp"
+#include "duckdb/execution/operator/persistent/physical_merge_into.hpp"
 #include "duckdb/function/distributed_write.hpp"
 
 namespace duckdb {
@@ -46,9 +47,31 @@ struct IcebergDistributedRowDeltaResult {
 	idx_t affected_rows = 0;
 };
 
+struct IcebergDistributedMergeResult {
+	vector<distributed::DistributedCopyFileInfo> data_files;
+	vector<IcebergDistributedDeleteFileResult> delete_files;
+	unordered_set<string> selected_artifact_paths;
+	idx_t inserted_rows = 0;
+	idx_t updated_rows = 0;
+	idx_t deleted_rows = 0;
+	idx_t affected_rows = 0;
+};
+
+struct IcebergDistributedMergePlanAction {
+	MergeActionCondition match_condition = MergeActionCondition::WHEN_MATCHED;
+	MergeActionType action_type = MergeActionType::MERGE_DO_NOTHING;
+	unique_ptr<Expression> condition;
+	vector<unique_ptr<Expression>> expressions;
+	vector<unique_ptr<Expression>> projections;
+	optional_ptr<PhysicalCopyToFile> copy;
+};
+
 string CreateIcebergDistributedArtifactNamespace();
 PhysicalOperator &PlanIcebergDistributedRowDeltaRepartition(PhysicalPlanGenerator &planner, PhysicalOperator &input,
                                                             idx_t file_path_index);
+PhysicalOperator &PlanIcebergDistributedMergeRepartition(PhysicalPlanGenerator &planner, PhysicalOperator &input,
+                                                         idx_t file_path_index,
+                                                         const vector<idx_t> &null_target_partition_indexes);
 string BuildIcebergDistributedDeleteBind(ClientContext &context, const IcebergTableEntry &table,
                                          const IcebergMultiFileList &file_list, const vector<idx_t> &row_id_indexes,
                                          const string &artifact_namespace);
@@ -60,6 +83,12 @@ string BuildIcebergDistributedEmptyUpdateBind(ClientContext &context, const Iceb
                                               const PhysicalCopyToFile &copy, idx_t copy_column_count,
                                               idx_t file_path_index, idx_t row_position_index,
                                               const string &artifact_namespace);
+string BuildIcebergDistributedMergeBind(ClientContext &context, const IcebergTableEntry &table,
+                                        optional_ptr<const IcebergMultiFileList> target_file_list,
+                                        const vector<IcebergDistributedMergePlanAction> &actions,
+                                        const PhysicalOperator &worker_plan, idx_t row_id_start,
+                                        optional_idx source_marker, bool target_is_statically_empty,
+                                        bool worker_plan_is_statically_empty, const string &artifact_namespace);
 
 DistributedExtensionWriteCallbacks IcebergDistributedRowDeltaCallbacks();
 
@@ -68,6 +97,12 @@ DecodeIcebergDistributedRowDeltaResults(ClientContext &context, const string &da
                                         const string &artifact_namespace, const DistributedExtensionWriteInfo &info,
                                         const vector<DistributedWriteTaskResult> &results,
                                         IcebergDistributedRowDeltaKind expected_kind, int32_t expected_iceberg_version);
+IcebergDistributedMergeResult DecodeIcebergDistributedMergeResults(ClientContext &context, const string &data_path,
+                                                                   const string &artifact_namespace,
+                                                                   const DistributedExtensionWriteInfo &info,
+                                                                   const vector<DistributedWriteTaskResult> &results,
+                                                                   int32_t expected_iceberg_version,
+                                                                   bool worker_plan_is_statically_empty);
 void ValidateIcebergDistributedDataFileArtifacts(ClientContext &context, const string &data_path,
                                                  const vector<distributed::DistributedCopyFileInfo> &files);
 void ValidateIcebergDistributedTargetPartitionSpec(const IcebergTableMetadata &metadata, const string &operation_name);
@@ -80,6 +115,8 @@ void ValidateIcebergDistributedRowDeltaSourceBaseline(const IcebergMultiFileList
 void CleanupIcebergDistributedRowDelta(ClientContext &context, const string &data_path,
                                        const string &artifact_namespace,
                                        const unordered_set<string> *paths_to_keep = nullptr);
+void CleanupIcebergDistributedMerge(ClientContext &context, const string &data_path, const string &artifact_namespace,
+                                    const unordered_set<string> *paths_to_keep = nullptr);
 
 void RegisterIcebergDistributedWrites(ExtensionLoader &loader);
 
