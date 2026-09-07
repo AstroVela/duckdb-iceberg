@@ -25,12 +25,40 @@ jobs:
   vane-native:
     if: inputs.operation != 'testpypi-dev'
     # The called workflow verifies its exact SHA from GitHub job metadata.
-    uses: AstroVela/vane-extension-ci-tools/.github/workflows/_vane_extension_ci.yml@28c253d71645b627e90307a8c0f42bf74bda0046
+    uses: AstroVela/vane-extension-ci-tools/.github/workflows/_vane_extension_ci.yml@671717e4816c21e65aa32a32dd0def8b030baa44
     with:
-      ci_tools_version: 28c253d71645b627e90307a8c0f42bf74bda0046
+      ci_tools_version: 671717e4816c21e65aa32a32dd0def8b030baa44
       manifest: vane-extension.toml
       build_jobs: 12
       run_native_tests: true
+
+  vane-provider-release-tooling:
+    if: inputs.operation != 'testpypi-dev'
+    name: Validate Avro and Iceberg provider release tooling
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout release tooling
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Initialize exact shared release tooling
+        run: git submodule update --init vane-extension-ci-tools
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Install release validation tooling
+        run: python -m pip install --disable-pip-version-check -r vane-extension-ci-tools/requirements-release.txt
+
+      - name: Exercise the configured provider graph and index verification
+        run: python -I test/vane/test_vane_provider_release.py
 
   vane-dynamic-wheels:
     if: inputs.operation != 'testpypi-dev'
@@ -98,7 +126,7 @@ jobs:
       - name: Validate exact Vane and CI-tools identities
         shell: bash
         env:
-          VANE_CI_TOOLS_VERSION: 28c253d71645b627e90307a8c0f42bf74bda0046
+          VANE_CI_TOOLS_VERSION: 671717e4816c21e65aa32a32dd0def8b030baa44
         run: |
           set -euo pipefail
           actual_ci_tools="$(git -C extension/vane-extension-ci-tools rev-parse HEAD)"
@@ -138,7 +166,7 @@ jobs:
             build \
             "cmake>=3.29" \
             "ninja>=1.10" \
-            packaging \
+            -r extension/vane-extension-ci-tools/requirements-release.txt \
             "patchelf>=0.17.2" \
             "pybind11[global]>=3.0.0" \
             "scikit-build-core>=0.11.4" \
@@ -149,25 +177,32 @@ jobs:
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ${{ env.CCACHE_DIR }}
-          key: vane-dynamic-wheel-ccache-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.manifest.outputs.vane_revision }}-${{ hashFiles('extension/vcpkg.json') }}
+          key: vane-dynamic-wheel-ccache-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.manifest.outputs.vane_revision }}-${{ steps.manifest.outputs.vcpkg_revision }}-${{ hashFiles('extension/vcpkg.json') }}
 
       - name: Reset dynamic-wheel compiler cache statistics
         run: ccache --zero-stats
 
-      - name: Read extension vcpkg baseline
-        id: vcpkg
-        shell: bash
-        run: |
-          set -euo pipefail
-          baseline="$(python -c 'import json; print(json.load(open("extension/vcpkg.json"))["builtin-baseline"])')"
-          [[ "$baseline" =~ ^[0-9a-f]{40}$ ]]
-          echo "baseline=$baseline" >> "$GITHUB_OUTPUT"
-
       - name: Set up extension vcpkg
         uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11.6
         with:
-          vcpkgGitCommitId: ${{ steps.vcpkg.outputs.baseline }}
+          vcpkgGitCommitId: ${{ steps.manifest.outputs.vcpkg_revision }}
           vcpkgDirectory: ${{ github.workspace }}/vcpkg
+
+      - name: Remove verified run-vcpkg state marker
+        shell: bash
+        env:
+          VANE_EXTENSION_VCPKG_REVISION: ${{ steps.manifest.outputs.vcpkg_revision }}
+          VANE_EXTENSION_VCPKG_ROOT: ${{ github.workspace }}/vcpkg
+        run: |
+          set -euo pipefail
+          marker="$VANE_EXTENSION_VCPKG_ROOT/vcpkgLastBuiltCommitId"
+          test -f "$marker"
+          test ! -L "$marker"
+          test "$(wc -c < "$marker")" -eq 40
+          test "$(<"$marker")" = "$VANE_EXTENSION_VCPKG_REVISION"
+          rm -- "$marker"
+          vcpkg_status="$(git -C "$VANE_EXTENSION_VCPKG_ROOT" status --porcelain --untracked-files=all)"
+          test -z "$vcpkg_status"
 
       - name: Bootstrap exact Vane dependencies
         env:
@@ -394,7 +429,7 @@ jobs:
             build \
             "cmake>=3.29" \
             "ninja>=1.10" \
-            packaging \
+            -r extension/vane-extension-ci-tools/requirements-release.txt \
             "patchelf>=0.17.2" \
             "pybind11[global]>=3.0.0" \
             "scikit-build-core>=0.11.4" \
@@ -405,7 +440,7 @@ jobs:
       - name: Validate exact Vane and CI-tools identities
         shell: bash
         env:
-          VANE_CI_TOOLS_VERSION: 28c253d71645b627e90307a8c0f42bf74bda0046
+          VANE_CI_TOOLS_VERSION: 671717e4816c21e65aa32a32dd0def8b030baa44
         run: |
           set -euo pipefail
           actual_ci_tools="$(git -C extension/vane-extension-ci-tools rev-parse HEAD)"
@@ -429,25 +464,32 @@ jobs:
           path: |
             ${{ env.CCACHE_DIR }}
             ${{ env.VCPKG_DEFAULT_BINARY_CACHE }}
-          key: vane-testpypi-wheel-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.manifest.outputs.vane_revision }}-${{ hashFiles('extension/vcpkg.json') }}
+          key: vane-testpypi-wheel-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.manifest.outputs.vane_revision }}-${{ steps.manifest.outputs.vcpkg_revision }}-${{ hashFiles('extension/vcpkg.json') }}
 
       - name: Reset compiler cache statistics
         run: ccache --zero-stats
 
-      - name: Read extension vcpkg baseline
-        id: vcpkg
-        shell: bash
-        run: |
-          set -euo pipefail
-          baseline="$("$VANE_PYTHON" -c 'import json; print(json.load(open("extension/vcpkg.json"))["builtin-baseline"])')"
-          [[ "$baseline" =~ ^[0-9a-f]{40}$ ]]
-          echo "baseline=$baseline" >> "$GITHUB_OUTPUT"
-
       - name: Set up extension vcpkg
         uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11.6
         with:
-          vcpkgGitCommitId: ${{ steps.vcpkg.outputs.baseline }}
+          vcpkgGitCommitId: ${{ steps.manifest.outputs.vcpkg_revision }}
           vcpkgDirectory: ${{ github.workspace }}/vcpkg
+
+      - name: Remove verified run-vcpkg state marker
+        shell: bash
+        env:
+          VANE_EXTENSION_VCPKG_REVISION: ${{ steps.manifest.outputs.vcpkg_revision }}
+          VANE_EXTENSION_VCPKG_ROOT: ${{ github.workspace }}/vcpkg
+        run: |
+          set -euo pipefail
+          marker="$VANE_EXTENSION_VCPKG_ROOT/vcpkgLastBuiltCommitId"
+          test -f "$marker"
+          test ! -L "$marker"
+          test "$(wc -c < "$marker")" -eq 40
+          test "$(<"$marker")" = "$VANE_EXTENSION_VCPKG_REVISION"
+          rm -- "$marker"
+          vcpkg_status="$(git -C "$VANE_EXTENSION_VCPKG_ROOT" status --porcelain --untracked-files=all)"
+          test -z "$vcpkg_status"
 
       - name: Bootstrap exact Vane dependencies
         env:
@@ -544,7 +586,11 @@ jobs:
         id: release
         shell: bash
         run: |
-          "$VANE_PYTHON" extension/scripts/validate_vane_provider_release.py validate \
+          "$VANE_PYTHON" -I extension/vane-extension-ci-tools/scripts/vane_provider_release.py validate \
+            --manifest "$VANE_MANIFEST" --extension-root "$VANE_EXTENSION_ROOT" \
+            --vane-source "$VANE_SOURCE_DIR" \
+            --ci-tools-version "$(git -C "$VANE_EXTENSION_ROOT" rev-parse HEAD:vane-extension-ci-tools)" \
+            --config extension/vane-provider-release.toml \
             --directory "$VANE_DYNAMIC_DIST_DIR" \
             --vane-version "${{ steps.vane_candidate.outputs.version }}" \
             --require-testpypi-publishable \
@@ -587,13 +633,32 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
+      - name: Initialize exact shared release tooling
+        run: git submodule update --init vane-extension-ci-tools
+
       - name: Set up Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.12"
 
       - name: Install release validation tooling
-        run: python -m pip install --disable-pip-version-check packaging
+        run: python -m pip install --disable-pip-version-check -r vane-extension-ci-tools/requirements-release.txt
+
+      - name: Read exact Vane source pin
+        id: manifest
+        run: |
+          python -I vane-extension-ci-tools/scripts/vane_extension.py \
+            --manifest vane-extension.toml --extension-root . \
+            manifest --github-output "$GITHUB_OUTPUT"
+
+      - name: Checkout exact Vane source for release verification
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: ${{ steps.manifest.outputs.vane_repository }}
+          ref: ${{ steps.manifest.outputs.vane_revision }}
+          path: vane
+          fetch-depth: 1
+          persist-credentials: false
 
       - name: Download provider wheels
         uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
@@ -603,7 +668,11 @@ jobs:
 
       - name: Revalidate the complete release set
         run: |
-          python scripts/validate_vane_provider_release.py validate \
+          python -I vane-extension-ci-tools/scripts/vane_provider_release.py validate \
+            --manifest vane-extension.toml --extension-root . \
+            --vane-source vane \
+            --ci-tools-version "$(git rev-parse HEAD:vane-extension-ci-tools)" \
+            --config vane-provider-release.toml \
             --directory packages \
             --vane-version "${{ needs.vane-testpypi-wheels.outputs.vane_version }}" \
             --require-testpypi-publishable
@@ -704,13 +773,32 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
+      - name: Initialize exact shared release tooling
+        run: git submodule update --init vane-extension-ci-tools
+
       - name: Set up Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.12"
 
       - name: Install release validation tooling
-        run: python -m pip install --disable-pip-version-check packaging
+        run: python -m pip install --disable-pip-version-check -r vane-extension-ci-tools/requirements-release.txt
+
+      - name: Read exact Vane source pin
+        id: manifest
+        run: |
+          python -I vane-extension-ci-tools/scripts/vane_extension.py \
+            --manifest vane-extension.toml --extension-root . \
+            manifest --github-output "$GITHUB_OUTPUT"
+
+      - name: Checkout exact Vane source for release verification
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: ${{ steps.manifest.outputs.vane_repository }}
+          ref: ${{ steps.manifest.outputs.vane_revision }}
+          path: vane
+          fetch-depth: 1
+          persist-credentials: false
 
       - name: Download Avro distributions
         uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
@@ -720,9 +808,13 @@ jobs:
 
       - name: Compare the immutable indexed release
         run: |
-          python scripts/validate_vane_provider_release.py verify-index \
+          python -I vane-extension-ci-tools/scripts/vane_provider_release.py verify-index \
+            --manifest vane-extension.toml --extension-root . \
+            --vane-source vane \
+            --ci-tools-version "$(git rev-parse HEAD:vane-extension-ci-tools)" \
+            --config vane-provider-release.toml \
             --directory dist \
-            --distribution-name vane-extension-avro \
+            --provider avro \
             --version "${{ needs.assemble-testpypi-providers.outputs.avro_version }}"
 
   publish-testpypi-iceberg:
@@ -764,13 +856,32 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
+      - name: Initialize exact shared release tooling
+        run: git submodule update --init vane-extension-ci-tools
+
       - name: Set up Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.12"
 
       - name: Install release validation tooling
-        run: python -m pip install --disable-pip-version-check packaging
+        run: python -m pip install --disable-pip-version-check -r vane-extension-ci-tools/requirements-release.txt
+
+      - name: Read exact Vane source pin
+        id: manifest
+        run: |
+          python -I vane-extension-ci-tools/scripts/vane_extension.py \
+            --manifest vane-extension.toml --extension-root . \
+            manifest --github-output "$GITHUB_OUTPUT"
+
+      - name: Checkout exact Vane source for release verification
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: ${{ steps.manifest.outputs.vane_repository }}
+          ref: ${{ steps.manifest.outputs.vane_revision }}
+          path: vane
+          fetch-depth: 1
+          persist-credentials: false
 
       - name: Download Iceberg distributions
         uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
@@ -780,9 +891,13 @@ jobs:
 
       - name: Compare the immutable indexed release
         run: |
-          python scripts/validate_vane_provider_release.py verify-index \
+          python -I vane-extension-ci-tools/scripts/vane_provider_release.py verify-index \
+            --manifest vane-extension.toml --extension-root . \
+            --vane-source vane \
+            --ci-tools-version "$(git rev-parse HEAD:vane-extension-ci-tools)" \
+            --config vane-provider-release.toml \
             --directory dist \
-            --distribution-name vane-extension-iceberg \
+            --provider iceberg \
             --version "${{ needs.assemble-testpypi-providers.outputs.iceberg_version }}"
 
   testpypi-local-iceberg-integration:
