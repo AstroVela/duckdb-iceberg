@@ -1,0 +1,13 @@
+# Run this release gate with Python 3.11+, independently of wheel interpreters.
+interpreters = ["cp310", "cp311", "cp312", "cp313", "cp314"]
+platforms = ["manylinux_2_28_x86_64"]
+# TestPyPI upload budget, independent of Vane's native artifact safety limits.
+max_wheel_bytes = 100000000
+
+[providers.avro]
+distribution = "vane-extension-avro"
+dependencies = []
+
+[providers.iceberg]
+distribution = "vane-extension-iceberg"
+dependencies = ["avro"]

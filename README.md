@@ -133,6 +133,9 @@ The current reusable Vane CI lane builds the extension and runs a native
 sqllogictest against Vane's DuckDB fork. Ray integration tests require a full
 Vane wheel and catalog services and remain an explicit integration lane.
 
+See [Vane provider releases](docs/VANE_RELEASE.md) for the shared Avro/Iceberg
+release matrix, exact dependencies, and ordered TestPyPI publication gates.
+
 ### Running tests
 
 #### Generating test data

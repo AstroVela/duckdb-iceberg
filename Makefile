@@ -15,7 +15,7 @@ include extension-ci-tools/makefiles/duckdb_extension.Makefile
 # Run Vane-only targets in a recursive Make invocation so their variables never
 # enter DuckDB's upstream extension build.
 VANE_EXTENSION_MAKEFILE := $(PROJ_DIR)vane-extension-ci-tools/makefiles/vane_extension.Makefile
-VANE_EXTENSION_TARGETS := vane_verify_ci_tools vane_validate vane_prepare vane_identity \
+VANE_EXTENSION_TARGETS := vane_verify_ci_tools vane_validate vane_prepare vane_identity vane_verify_vcpkg \
 	vane_native vane_ci vane_wheel_dependencies vane_wheel
 .PHONY: $(VANE_EXTENSION_TARGETS)
 
