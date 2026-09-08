@@ -42,8 +42,15 @@ runtime fallback is available.
 All official providers share the `astrovela/vane` RSA-2048 signer. Its public
 DER SubjectPublicKeyInfo SHA-256 fingerprint is
 `8729fbfbf5276be4b159c0b698c9e4214edd72eaad3e21bcefc03bcb36dffaeb`.
-The builder checks this fingerprint before native build subprocesses, requires
-consumed ephemeral key input and clears its key memory on failure and success.
+An isolated signer checks this fingerprint using system OpenSSL. It runs only
+reviewed standard-library Python with `-I -S`: no pip dependencies, native builds
+or native loading. It reads the exact official Vane revision from the committed
+manifest, validates fixed regular unsigned inputs (at most 384 MiB each), and
+uses Vane's existing signing utility. The key is removed from the environment
+before any child process, held in a private temporary file only while signing,
+and cleared on failure and success. Only signed native data is uploaded.
+Both development and production publishing use this isolation; CI-only builds
+may still use the public CI fixture key in-process.
 Both testing-key CMake flags are explicitly OFF for production. A locally
 built runtime cannot substitute for the exact indexed release. Unsigned loading
 and alternative trust roots stay disabled.
@@ -72,8 +79,11 @@ environments, register publishers, upload secrets, create tags or publish packag
 
 ## Immutable release order
 
-1. Pass the read-only context/version gate and signing approval. Build and sign
-   both native extensions once. Vane's existing builder and clean verifier
+1. Pass the read-only context/version gate. Build unsigned native data and
+   license bundles without a signing environment or secrets. After signing
+   approval, sign in a fresh minimal job. Another fresh, unprivileged job checks
+   that signing changed only the signature slots and packages the original
+   license data. Vane's existing builder and clean verifier
    qualify all ten wheels against the exact indexed runtimes: descriptors,
    SourceID, platform, signatures, native dependencies, licenses and archive safety.
 2. Validate the complete graph and both index destinations, assemble checksums,
@@ -85,12 +95,23 @@ environments, register publishers, upload secrets, create tags or publish packag
    use TestPyPI. Ordinary Python dependencies come from PyPI.
 4. Only after **both** smoke jobs succeed, approve `pypi-avro`. Download the
    complete original candidate graph, re-run shared `verify-promotion` against
-   TestPyPI and PyPI, upload the unchanged Avro subset and verify PyPI hashes.
-5. Approve `pypi-iceberg` after Avro succeeds. Recheck the complete graph again,
-   upload the unchanged Iceberg subset and verify its PyPI files.
+   TestPyPI and PyPI with read-only permissions. A separate minimal publisher
+   downloads the original assembled Avro artifact by immutable ID and uploads
+   it using only pinned actions; it never installs or imports validator code.
+   Verify the indexed PyPI hashes in another read-only job.
+5. Approve `pypi-iceberg` after Avro's PyPI verification succeeds. Recheck the
+   complete graph again, publish the original Iceberg artifact with the same
+   privilege separation and verify its PyPI files.
+
+Promotion validation and upload both reference the corresponding PyPI
+environment; GitHub may request a second approval for the separate upload job.
+Only that minimal upload job has publishing OIDC. Validation cannot mint a
+publishing token or replace the uploader's artifact with its own output.
 
 Promotion never rebuilds, relabels or re-signs wheels. Every workflow artifact
-download rejects digest mismatches. Identical indexed files are retryable;
+download rejects digest mismatches. Publishing steps consume the original
+producer's immutable artifact IDs, not mutable names or verifier-created copies.
+Identical indexed files are retryable;
 conflicts, extra files, yanks or changed hashes fail validation. Rerun failed
 jobs within the 30-day artifact retention period to continue with the same
 candidate. A fresh workflow run is a new build, not promotion of an older run.

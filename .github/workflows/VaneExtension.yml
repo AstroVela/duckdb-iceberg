@@ -301,6 +301,7 @@ jobs:
             --build-directory "$VANE_DYNAMIC_BUILD_DIR" \
             --output-directory "$VANE_DYNAMIC_DIST_DIR" \
             --jobs "$VANE_BUILD_JOBS" \
+            --phase full \
             --signing-profile ci-test \
             --signing-private-key "$VANE_SOURCE_DIR/external/duckdb/test/mbedtls/private.pem" \
             --package-local-runtime
@@ -396,23 +397,19 @@ jobs:
         if: always()
         run: docker compose -f scripts/docker-compose.yml down -v
 
-  vane-testpypi-wheels:
+  vane-provider-prepare:
     if: inputs.operation == 'testpypi-dev' || inputs.operation == 'release'
     needs: release-preflight
-    name: Build signed TestPyPI provider wheels
+    name: Build unsigned provider artifacts without signing credentials
     runs-on: ubuntu-24.04
     timeout-minutes: 180
-    environment:
-      name: ${{ inputs.operation == 'release' && 'production-signing' || 'testpypi' }}
-      url: https://test.pypi.org/p/vane-extension-iceberg
     container:
       image: quay.io/pypa/manylinux_2_28_x86_64@sha256:012f4a50472412f18bb2b450c1cce7158434cfae4ae878591c2748a13a30c2be
     permissions:
       contents: read
     outputs:
-      vane_version: ${{ steps.release.outputs.vane_version }}
-      avro_version: ${{ steps.release.outputs.avro_version }}
-      iceberg_version: ${{ steps.release.outputs.iceberg_version }}
+      artifact_id: ${{ steps.unsigned_artifact.outputs.artifact-id }}
+      vane_version: ${{ needs.release-preflight.outputs.vane_version }}
     env:
       VANE_EXTENSION_ROOT: ${{ github.workspace }}/extension
       VANE_MANIFEST: ${{ github.workspace }}/extension/${{ inputs.operation == 'release' && 'vane-extension-release.toml' || 'vane-extension.toml' }}
@@ -604,32 +601,18 @@ jobs:
             VANE_BUILD_JOBS="$VANE_BUILD_JOBS" \
             VANE_PYTHON="$VANE_PYTHON"
 
-      - name: Build, sign and verify the provider wheel matrix
+      - name: Prepare unsigned native artifacts and licenses
         shell: bash
         env:
-          VANE_TESTPYPI_EXTENSION_SIGNING_PRIVATE_KEY: ${{ inputs.operation != 'release' && secrets.VANE_TESTPYPI_EXTENSION_SIGNING_PRIVATE_KEY || '' }}
-          VANE_PRODUCTION_SIGNING_PRIVATE_KEY: ${{ inputs.operation == 'release' && secrets.VANE_EXTENSION_SIGNING_PRIVATE_KEY || '' }}
           VCPKG_TOOLCHAIN_PATH: ${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake
           VCPKG_MAX_CONCURRENCY: ${{ env.VANE_BUILD_JOBS }}
         run: |
           set -euo pipefail
           if [ "$VANE_RELEASE_CHANNEL" = release ]; then
-            signing_contents="$VANE_PRODUCTION_SIGNING_PRIVATE_KEY"
             signing_profile=production
           else
-            signing_contents="$VANE_TESTPYPI_EXTENSION_SIGNING_PRIVATE_KEY"
             signing_profile=testpypi
           fi
-          test -n "$signing_contents"
-          signing_key="$(mktemp "$RUNNER_TEMP/vane-provider-signing.XXXXXX")"
-          cleanup() {
-            shred --force --remove "$signing_key" 2>/dev/null || true
-          }
-          trap cleanup EXIT
-          umask 077
-          printf '%s' "$signing_contents" > "$signing_key"
-          unset signing_contents VANE_TESTPYPI_EXTENSION_SIGNING_PRIVATE_KEY VANE_PRODUCTION_SIGNING_PRIVATE_KEY
-
           runtime_arguments=()
           for runtime in cp310-cp310 cp311-cp311 cp312-cp312 cp313-cp313 cp314-cp314; do
             interpreter="/opt/python/$runtime/bin/python"
@@ -649,10 +632,201 @@ jobs:
             --output-directory "$VANE_DYNAMIC_DIST_DIR" \
             --jobs "$VANE_BUILD_JOBS" \
             --signing-profile "$signing_profile" \
-            --signing-private-key "$signing_key" \
-            --consume-signing-private-key \
+            --phase prepare \
             "${runtime_arguments[@]}"
 
+      - name: Report compiler cache
+        if: always()
+        shell: bash
+        env:
+          VANE_CACHE_ACTION_HIT: ${{ steps.testpypi_cache.outputs.cache-hit }}
+        run: |
+          printf 'GitHub Actions cache restore hit: %s\n' "${VANE_CACHE_ACTION_HIT:-false}"
+          ccache --show-stats
+
+      - name: Upload unsigned native artifacts and licenses
+        id: unsigned_artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vane-unsigned-provider-artifacts
+          path: ${{ env.VANE_DYNAMIC_DIST_DIR }}/
+          if-no-files-found: error
+          retention-days: 30
+
+  vane-provider-sign:
+    name: Sign native provider data in an isolated job
+    needs: vane-provider-prepare
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    environment:
+      name: ${{ inputs.operation == 'release' && 'production-signing' || 'testpypi' }}
+    outputs:
+      artifact_id: ${{ steps.signed_artifact.outputs.artifact-id }}
+    env:
+      VANE_SIGNING_PROFILE: ${{ inputs.operation == 'release' && 'production' || 'testpypi' }}
+    steps:
+      - name: Checkout only the reviewed signing wrapper
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Read committed source pin without installing dependencies
+        id: manifest
+        run: |
+          /usr/bin/python3 -I -S scripts/sign_vane_release.py \
+            --manifest "$VANE_RELEASE_MANIFEST" manifest --github-output "$GITHUB_OUTPUT"
+
+      - name: Checkout the exact reviewed stdlib signing utility
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: AstroVela/vane
+          ref: ${{ steps.manifest.outputs.vane_revision }}
+          path: vane
+          persist-credentials: false
+
+      - name: Download original unsigned data by immutable ID
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.vane-provider-prepare.outputs.artifact_id }}
+          merge-multiple: true
+          digest-mismatch: error
+          path: incoming
+
+      - name: Fingerprint-check and sign data without importing build tooling
+        env:
+          VANE_SIGNING_PRIVATE_KEY: ${{ secrets[inputs.operation == 'release' && 'VANE_EXTENSION_SIGNING_PRIVATE_KEY' || 'VANE_TESTPYPI_EXTENSION_SIGNING_PRIVATE_KEY'] }}
+        run: |
+          /usr/bin/python3 -I -S scripts/sign_vane_release.py \
+            --manifest "$VANE_RELEASE_MANIFEST" sign --vane-source "$GITHUB_WORKSPACE/vane" \
+            --profile "$VANE_SIGNING_PROFILE" \
+            --input-directory "$GITHUB_WORKSPACE/incoming/artifacts" \
+            --output-directory "$GITHUB_WORKSPACE/signed"
+
+      - name: Upload only the signed native files
+        id: signed_artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vane-signed-provider-artifacts
+          path: signed/*.duckdb_extension
+          if-no-files-found: error
+          retention-days: 30
+
+  vane-testpypi-wheels:
+    name: Package and verify signed provider wheels without credentials
+    needs: [vane-provider-prepare, vane-provider-sign]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    container:
+      image: quay.io/pypa/manylinux_2_28_x86_64@sha256:012f4a50472412f18bb2b450c1cce7158434cfae4ae878591c2748a13a30c2be
+    permissions:
+      contents: read
+    outputs:
+      vane_version: ${{ steps.release.outputs.vane_version }}
+      avro_version: ${{ steps.release.outputs.avro_version }}
+      iceberg_version: ${{ steps.release.outputs.iceberg_version }}
+      artifact_id: ${{ steps.wheels.outputs.artifact-id }}
+    env:
+      VANE_EXTENSION_ROOT: ${{ github.workspace }}/extension
+      VANE_MANIFEST: ${{ github.workspace }}/extension/${{ inputs.operation == 'release' && 'vane-extension-release.toml' || 'vane-extension.toml' }}
+      VANE_SOURCE_DIR: ${{ github.workspace }}/vane
+      VANE_PYTHON: /opt/python/cp312-cp312/bin/python
+      VANE_RUNTIME_WHEEL_DIR: ${{ github.workspace }}/runtime-wheels
+      VANE_DYNAMIC_DIST_DIR: ${{ github.workspace }}/dist
+      VANE_SIGNING_PROFILE: ${{ inputs.operation == 'release' && 'production' || 'testpypi' }}
+    steps:
+      - name: Checkout packaging code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          path: extension
+          persist-credentials: false
+
+      - name: Initialize exact shared packaging validation
+        shell: bash
+        run: git -C extension submodule update --init vane-extension-ci-tools
+
+      - name: Install unprivileged packaging tooling
+        shell: bash
+        run: |
+          "$VANE_PYTHON" -m pip install -r extension/vane-extension-ci-tools/requirements-release.txt
+      - name: Read integration manifest
+        id: manifest
+        shell: bash
+        run: |
+          "$VANE_PYTHON" extension/vane-extension-ci-tools/scripts/vane_extension.py \
+            --manifest "$VANE_MANIFEST" \
+            --extension-root "$VANE_EXTENSION_ROOT" \
+            manifest \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Checkout exact Vane source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: ${{ steps.manifest.outputs.vane_repository }}
+          ref: ${{ steps.manifest.outputs.vane_revision }}
+          path: vane
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download every exact indexed Vane runtime wheel
+        id: vane_candidate
+        shell: bash
+        env:
+          INDEX_URL: ${{ env.VANE_RUNTIME_INDEX_URL }}
+          VANE_VERSION: ${{ needs.vane-provider-prepare.outputs.vane_version }}
+        run: |
+          set -euo pipefail
+          version="$VANE_VERSION"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          mkdir -p "$VANE_RUNTIME_WHEEL_DIR"
+          for runtime in cp310-cp310 cp311-cp311 cp312-cp312 cp313-cp313 cp314-cp314; do
+            interpreter="/opt/python/$runtime/bin/python"
+            destination="$VANE_RUNTIME_WHEEL_DIR/$runtime"
+            mkdir -p "$destination"
+            "$interpreter" -m pip download \
+              --disable-pip-version-check \
+              --no-cache-dir \
+              --no-deps \
+              --only-binary=:all: \
+              --index-url "$INDEX_URL" \
+              --dest "$destination" \
+              "vane-ai==$version"
+            test "$(find "$destination" -maxdepth 1 -type f -name 'vane_ai-*.whl' | wc -l)" -eq 1
+          done
+
+      - name: Download original unsigned license bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.vane-provider-prepare.outputs.artifact_id }}
+          merge-multiple: true
+          digest-mismatch: error
+          path: unsigned
+      - name: Download original signed native data
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.vane-provider-sign.outputs.artifact_id }}
+          merge-multiple: true
+          digest-mismatch: error
+          path: signed
+      - name: Package and qualify the full provider matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          runtime_arguments=()
+          for runtime in cp310-cp310 cp311-cp311 cp312-cp312 cp313-cp313 cp314-cp314; do
+            interpreter="/opt/python/$runtime/bin/python"
+            mapfile -t wheels < <(find "$VANE_RUNTIME_WHEEL_DIR/$runtime" -maxdepth 1 -type f -name 'vane_ai-*.whl' -print)
+            test "${#wheels[@]}" -eq 1
+            runtime_arguments+=(--runtime-python "$interpreter" --runtime-wheel "${wheels[0]}")
+          done
+          "$VANE_PYTHON" -I extension/scripts/package_vane_dynamic_wheels.py \
+            --vane-source "$VANE_SOURCE_DIR" \
+            --vane-revision "${{ steps.manifest.outputs.vane_revision }}" \
+            --unsigned-directory "$GITHUB_WORKSPACE/unsigned" \
+            --signed-directory "$GITHUB_WORKSPACE/signed" \
+            --output-directory "$VANE_DYNAMIC_DIST_DIR" \
+            --signing-profile "$VANE_SIGNING_PROFILE" \
+            "${runtime_arguments[@]}"
       - name: Validate the immutable publishable release set
         id: release
         shell: bash
@@ -672,16 +846,8 @@ jobs:
             "${publish_checks[@]}" \
             --github-output "$GITHUB_OUTPUT"
 
-      - name: Report compiler cache
-        if: always()
-        shell: bash
-        env:
-          VANE_CACHE_ACTION_HIT: ${{ steps.testpypi_cache.outputs.cache-hit }}
-        run: |
-          printf 'GitHub Actions cache restore hit: %s\n' "${VANE_CACHE_ACTION_HIT:-false}"
-          ccache --show-stats
-
       - name: Upload verified provider wheels
+        id: wheels
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: vane-testpypi-provider-wheels
@@ -701,6 +867,9 @@ jobs:
       vane_version: ${{ needs.vane-testpypi-wheels.outputs.vane_version }}
       avro_version: ${{ needs.vane-testpypi-wheels.outputs.avro_version }}
       iceberg_version: ${{ needs.vane-testpypi-wheels.outputs.iceberg_version }}
+      candidate_artifact_id: ${{ needs.vane-testpypi-wheels.outputs.artifact_id }}
+      avro_artifact_id: ${{ steps.avro_artifact.outputs.artifact-id }}
+      iceberg_artifact_id: ${{ steps.iceberg_artifact.outputs.artifact-id }}
 
     steps:
       - name: Checkout release tooling
@@ -740,7 +909,8 @@ jobs:
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           digest-mismatch: error
-          name: vane-testpypi-provider-wheels
+          artifact-ids: ${{ needs.vane-testpypi-wheels.outputs.artifact_id }}
+          merge-multiple: true
           path: packages
 
       - name: Revalidate the complete release set
@@ -791,6 +961,7 @@ jobs:
           inputs: packages/*.whl
 
       - name: Upload Avro distributions
+        id: avro_artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: vane-testpypi-avro-distributions
@@ -799,6 +970,7 @@ jobs:
           retention-days: 30
 
       - name: Upload Iceberg distributions
+        id: iceberg_artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: vane-testpypi-iceberg-distributions
@@ -832,7 +1004,8 @@ jobs:
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           digest-mismatch: error
-          name: vane-testpypi-avro-distributions
+          artifact-ids: ${{ needs.assemble-testpypi-providers.outputs.avro_artifact_id }}
+          merge-multiple: true
           path: dist
 
       - name: Publish through trusted publishing
@@ -887,7 +1060,8 @@ jobs:
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           digest-mismatch: error
-          name: vane-testpypi-avro-distributions
+          artifact-ids: ${{ needs.assemble-testpypi-providers.outputs.avro_artifact_id }}
+          merge-multiple: true
           path: dist
 
       - name: Compare the immutable indexed release
@@ -918,7 +1092,8 @@ jobs:
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           digest-mismatch: error
-          name: vane-testpypi-iceberg-distributions
+          artifact-ids: ${{ needs.assemble-testpypi-providers.outputs.iceberg_artifact_id }}
+          merge-multiple: true
           path: dist
 
       - name: Publish through trusted publishing
@@ -973,7 +1148,8 @@ jobs:
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           digest-mismatch: error
-          name: vane-testpypi-iceberg-distributions
+          artifact-ids: ${{ needs.assemble-testpypi-providers.outputs.iceberg_artifact_id }}
+          merge-multiple: true
           path: dist
 
       - name: Compare the immutable indexed release
@@ -1011,14 +1187,16 @@ jobs:
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           digest-mismatch: error
-          name: vane-testpypi-avro-distributions
+          artifact-ids: ${{ needs.assemble-testpypi-providers.outputs.avro_artifact_id }}
+          merge-multiple: true
           path: expected/avro
 
       - name: Download expected Iceberg distributions
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           digest-mismatch: error
-          name: vane-testpypi-iceberg-distributions
+          artifact-ids: ${{ needs.assemble-testpypi-providers.outputs.iceberg_artifact_id }}
+          merge-multiple: true
           path: expected/iceberg
 
       - name: Set up Python
@@ -1130,14 +1308,16 @@ jobs:
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           digest-mismatch: error
-          name: vane-testpypi-avro-distributions
+          artifact-ids: ${{ needs.assemble-testpypi-providers.outputs.avro_artifact_id }}
+          merge-multiple: true
           path: expected/avro
 
       - name: Download expected Iceberg distributions
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           digest-mismatch: error
-          name: vane-testpypi-iceberg-distributions
+          artifact-ids: ${{ needs.assemble-testpypi-providers.outputs.iceberg_artifact_id }}
+          merge-multiple: true
           path: expected/iceberg
 
       - name: Set up Python
@@ -1223,9 +1403,9 @@ jobs:
         if: always()
         run: docker compose -f scripts/docker-compose.yml down -v
 
-  publish-pypi-avro:
+  verify-pypi-avro-promotion:
     if: inputs.operation == 'release'
-    name: Promote identical Avro wheels to PyPI
+    name: Verify immutable Avro promotion after approval
     needs: [assemble-testpypi-providers, testpypi-local-iceberg-integration, testpypi-ray-iceberg-integration]
     runs-on: ubuntu-24.04
     environment:
@@ -1233,7 +1413,6 @@ jobs:
       url: https://pypi.org/p/vane-extension-avro
     permissions:
       contents: read
-      id-token: write
     steps:
       - name: Checkout reviewed release tooling
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -1270,7 +1449,8 @@ jobs:
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           digest-mismatch: error
-          name: vane-testpypi-provider-wheels
+          artifact-ids: ${{ needs.assemble-testpypi-providers.outputs.candidate_artifact_id }}
+          merge-multiple: true
           path: packages
 
       - name: Recheck immutable promotion after environment approval
@@ -1281,14 +1461,79 @@ jobs:
             --ci-tools-version "$(git rev-parse HEAD:vane-extension-ci-tools)" \
             --config vane-provider-release.toml --directory packages \
             --vane-version "${{ needs.assemble-testpypi-providers.outputs.vane_version }}"
-          mkdir dist
-          cp packages/vane_extension_avro-*.whl dist/
+
+  publish-pypi-avro:
+    if: inputs.operation == 'release'
+    name: Publish approved Avro bytes to PyPI
+    needs: [assemble-testpypi-providers, verify-pypi-avro-promotion]
+    runs-on: ubuntu-24.04
+    environment:
+      name: pypi-avro
+      url: https://pypi.org/p/vane-extension-avro
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Download original approved distributions by immutable ID
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.assemble-testpypi-providers.outputs.avro_artifact_id }}
+          merge-multiple: true
+          digest-mismatch: error
+          path: dist
 
       - name: Publish the same Avro bytes through trusted publishing
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
         with:
           packages-dir: dist
           skip-existing: true
+
+  verify-pypi-avro:
+    if: inputs.operation == 'release'
+    name: Verify published Avro hashes without OIDC
+    needs: [assemble-testpypi-providers, publish-pypi-avro]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout reviewed release tooling
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Initialize exact shared release tooling
+        run: git submodule update --init vane-extension-ci-tools
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Install shared promotion validator
+        run: python -m pip install --disable-pip-version-check -r vane-extension-ci-tools/requirements-release.txt
+
+      - name: Read exact production Vane source pin
+        id: manifest
+        run: |
+          python -I vane-extension-ci-tools/scripts/vane_extension.py \
+            --manifest vane-extension-release.toml --extension-root . \
+            manifest --github-output "$GITHUB_OUTPUT"
+
+      - name: Checkout exact production Vane source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: ${{ steps.manifest.outputs.vane_repository }}
+          ref: ${{ steps.manifest.outputs.vane_revision }}
+          path: vane
+          persist-credentials: false
+
+      - name: Download original provider distributions by immutable ID
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.assemble-testpypi-providers.outputs.avro_artifact_id }}
+          merge-multiple: true
+          digest-mismatch: error
+          path: dist
 
       - name: Verify the indexed PyPI Avro files
         run: |
@@ -1301,17 +1546,16 @@ jobs:
             --provider avro \
             --version "${{ needs.assemble-testpypi-providers.outputs.avro_version }}"
 
-  publish-pypi-iceberg:
+  verify-pypi-iceberg-promotion:
     if: inputs.operation == 'release'
-    name: Promote identical Iceberg wheels to PyPI
-    needs: [assemble-testpypi-providers, testpypi-local-iceberg-integration, testpypi-ray-iceberg-integration, publish-pypi-avro]
+    name: Verify immutable Iceberg promotion after approval
+    needs: [assemble-testpypi-providers, testpypi-local-iceberg-integration, testpypi-ray-iceberg-integration, verify-pypi-avro]
     runs-on: ubuntu-24.04
     environment:
       name: pypi-iceberg
       url: https://pypi.org/p/vane-extension-iceberg
     permissions:
       contents: read
-      id-token: write
     steps:
       - name: Checkout reviewed release tooling
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -1348,7 +1592,8 @@ jobs:
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           digest-mismatch: error
-          name: vane-testpypi-provider-wheels
+          artifact-ids: ${{ needs.assemble-testpypi-providers.outputs.candidate_artifact_id }}
+          merge-multiple: true
           path: packages
 
       - name: Recheck immutable promotion after environment approval
@@ -1359,14 +1604,79 @@ jobs:
             --ci-tools-version "$(git rev-parse HEAD:vane-extension-ci-tools)" \
             --config vane-provider-release.toml --directory packages \
             --vane-version "${{ needs.assemble-testpypi-providers.outputs.vane_version }}"
-          mkdir dist
-          cp packages/vane_extension_iceberg-*.whl dist/
+
+  publish-pypi-iceberg:
+    if: inputs.operation == 'release'
+    name: Publish approved Iceberg bytes to PyPI
+    needs: [assemble-testpypi-providers, verify-pypi-iceberg-promotion]
+    runs-on: ubuntu-24.04
+    environment:
+      name: pypi-iceberg
+      url: https://pypi.org/p/vane-extension-iceberg
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Download original approved distributions by immutable ID
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.assemble-testpypi-providers.outputs.iceberg_artifact_id }}
+          merge-multiple: true
+          digest-mismatch: error
+          path: dist
 
       - name: Publish the same Iceberg bytes through trusted publishing
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
         with:
           packages-dir: dist
           skip-existing: true
+
+  verify-pypi-iceberg:
+    if: inputs.operation == 'release'
+    name: Verify published Iceberg hashes without OIDC
+    needs: [assemble-testpypi-providers, publish-pypi-iceberg]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout reviewed release tooling
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Initialize exact shared release tooling
+        run: git submodule update --init vane-extension-ci-tools
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Install shared promotion validator
+        run: python -m pip install --disable-pip-version-check -r vane-extension-ci-tools/requirements-release.txt
+
+      - name: Read exact production Vane source pin
+        id: manifest
+        run: |
+          python -I vane-extension-ci-tools/scripts/vane_extension.py \
+            --manifest vane-extension-release.toml --extension-root . \
+            manifest --github-output "$GITHUB_OUTPUT"
+
+      - name: Checkout exact production Vane source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: ${{ steps.manifest.outputs.vane_repository }}
+          ref: ${{ steps.manifest.outputs.vane_revision }}
+          path: vane
+          persist-credentials: false
+
+      - name: Download original provider distributions by immutable ID
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.assemble-testpypi-providers.outputs.iceberg_artifact_id }}
+          merge-multiple: true
+          digest-mismatch: error
+          path: dist
 
       - name: Verify the indexed PyPI Iceberg files
         run: |

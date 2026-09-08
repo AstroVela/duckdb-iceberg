@@ -261,7 +261,9 @@ class ProviderReleaseTest(unittest.TestCase):
                 publish = job(f"publish-testpypi-{provider}")
                 verify = job(f"verify-testpypi-{provider}")
                 for fragment in (publish, verify):
-                    self.assertIn(f"name: vane-testpypi-{provider}-distributions\n          path: dist", fragment)
+                    self.assertIn(f"needs.assemble-testpypi-providers.outputs.{provider}_artifact_id", fragment)
+                    self.assertIn("path: dist", fragment)
+                    self.assertNotIn("name: vane-testpypi-", fragment)
                 self.assertIn(f"--provider {provider} \\\n", verify)
                 self.assertIn("--directory dist \\\n", verify)
                 self.assertIn("--vane-source vane \\\n", verify)
