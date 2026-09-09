@@ -1,0 +1,15 @@
+# Preparation pin: this commit contains the production key but is not a
+# released Vane version. Replace it through review when that runtime is on PyPI.
+schema_version = 2
+name = "iceberg"
+extension_config = "extension_config_vane.cmake"
+build_extensions = ["httpfs", "parquet"]
+native_test_selection = "test/sql/local/iceberg_scans/iceberg_v1_existing_manifest_entry.test"
+
+[vane]
+repository = "AstroVela/vane"
+revision = "033b549afcb498633fd6669b26c054c00363004e"
+
+[vcpkg]
+repository = "microsoft/vcpkg"
+revision = "84bab45d415d22042bd0b9081aea57f362da3f35"

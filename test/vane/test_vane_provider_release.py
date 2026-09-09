@@ -40,10 +40,12 @@ def load_validator():
     return module
 
 
-def write_wheels(directory: Path, provider: str, *, avro_requirement: str | None = None) -> list[Path]:
+def write_wheels(
+    directory: Path, provider: str, *, avro_requirement: str | None = None, vane_version: str = VANE_VERSION
+) -> list[Path]:
     distribution = f"vane_extension_{provider}"
     version = VERSIONS[provider]
-    requirements = [f"vane-ai==={VANE_VERSION}"]
+    requirements = [f"vane-ai==={vane_version}"]
     if provider == "iceberg":
         requirements.append(avro_requirement or f"vane-extension-avro==={VERSIONS['avro']}")
     metadata = (
@@ -110,7 +112,10 @@ class ProviderReleaseTest(unittest.TestCase):
                 VANE_VERSION,
                 "--github-output",
                 str(outputs),
-                "--require-testpypi-publishable",
+                "--channel",
+                "testpypi-dev",
+                "--require-publishable-on",
+                "testpypi",
             ]
             output = io.StringIO()
             with (
@@ -137,7 +142,14 @@ class ProviderReleaseTest(unittest.TestCase):
             for requirement in ("vane-extension-avro>=0.2", "vane-extension-avro===0.2.0.0.612.9"):
                 with self.subTest(requirement=requirement):
                     write_wheels(directory, "iceberg", avro_requirement=requirement)
-                    command = ["validate", *source_arguments(directory), "--vane-version", VANE_VERSION]
+                    command = [
+                        "validate",
+                        *source_arguments(directory),
+                        "--channel",
+                        "testpypi-dev",
+                        "--vane-version",
+                        VANE_VERSION,
+                    ]
                     with mock.patch.object(self.validator, "verify_sources"), redirect_stderr(io.StringIO()):
                         self.assertEqual(self.validator.main(command), 2)
 
@@ -159,7 +171,7 @@ class ProviderReleaseTest(unittest.TestCase):
                         for path in paths
                     ]
                 }
-                command = ["verify-index", *source_arguments(directory)]
+                command = ["verify-index", *source_arguments(directory), "--index", "testpypi"]
                 command += ["--provider", provider, "--version", version, "--attempts", "1", "--delay-seconds", "0"]
                 with (
                     mock.patch.object(self.validator, "verify_sources") as verify,
@@ -171,11 +183,63 @@ class ProviderReleaseTest(unittest.TestCase):
                 )
                 query.assert_called_once_with(f"https://test.pypi.org/pypi/vane-extension-{provider}/{version}/json")
 
+    def test_release_channel_rejects_development_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            directory = Path(value)
+            for provider in VERSIONS:
+                write_wheels(directory, provider)
+            command = ["validate", *source_arguments(directory), "--channel", "release", "--vane-version", VANE_VERSION]
+            with mock.patch.object(self.validator, "verify_sources"), redirect_stderr(io.StringIO()):
+                self.assertEqual(self.validator.main(command), 2)
+
+    def test_promote_requires_the_complete_identical_avro_iceberg_graph(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            directory = Path(value)
+            indexed = {}
+            for provider in VERSIONS:
+                paths = write_wheels(directory, provider, vane_version="0.2.0")
+                indexed[provider] = {
+                    "urls": [
+                        {
+                            "filename": path.name,
+                            "packagetype": "bdist_wheel",
+                            "digests": {"sha256": hashlib.sha256(path.read_bytes()).hexdigest()},
+                            "yanked": False,
+                        }
+                        for path in paths
+                    ]
+                }
+
+            def query(url):
+                if url.startswith("https://pypi.org/"):
+                    return 404, None
+                for provider, document in indexed.items():
+                    if f"/vane-extension-{provider}/" in url:
+                        return 200, document
+                self.fail(f"unexpected index URL: {url}")
+
+            command = ["verify-promotion", *source_arguments(directory), "--vane-version", "0.2.0", "--attempts", "1"]
+            with (
+                mock.patch.object(self.validator, "verify_sources"),
+                mock.patch.object(self.validator, "_request_json", side_effect=query) as request,
+                redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(self.validator.main(command), 0)
+                self.assertEqual(request.call_count, 4)
+                indexed["avro"]["urls"][0]["digests"]["sha256"] = "0" * 64
+                with redirect_stderr(io.StringIO()):
+                    self.assertEqual(self.validator.main(command), 2)
+
     def test_integration_source_pins(self) -> None:
         with (REPOSITORY_ROOT / "vane-extension.toml").open("rb") as source:
             manifest = tomllib.load(source)
         vcpkg = json.loads((REPOSITORY_ROOT / "vcpkg.json").read_text())
         self.assertEqual(manifest["schema_version"], 2)
+        self.assertEqual(manifest["vane"]["revision"], "472df75ab51fd3eac2642f6646545075549e5921")
+        release = tomllib.loads((REPOSITORY_ROOT / "vane-extension-release.toml").read_text())
+        self.assertEqual(release["schema_version"], 2)
+        self.assertEqual(release["vane"]["revision"], "033b549afcb498633fd6669b26c054c00363004e")
+        self.assertEqual(release["vcpkg"], manifest["vcpkg"])
         self.assertEqual(manifest["vcpkg"]["repository"], "microsoft/vcpkg")
         self.assertEqual(manifest["vcpkg"]["revision"], vcpkg["builtin-baseline"])
         tools = REPOSITORY_ROOT / "vane-extension-ci-tools"
@@ -197,7 +261,9 @@ class ProviderReleaseTest(unittest.TestCase):
                 publish = job(f"publish-testpypi-{provider}")
                 verify = job(f"verify-testpypi-{provider}")
                 for fragment in (publish, verify):
-                    self.assertIn(f"name: vane-testpypi-{provider}-distributions\n          path: dist", fragment)
+                    self.assertIn(f"needs.assemble-testpypi-providers.outputs.{provider}_artifact_id", fragment)
+                    self.assertIn("path: dist", fragment)
+                    self.assertNotIn("name: vane-testpypi-", fragment)
                 self.assertIn(f"--provider {provider} \\\n", verify)
                 self.assertIn("--directory dist \\\n", verify)
                 self.assertIn("--vane-source vane \\\n", verify)

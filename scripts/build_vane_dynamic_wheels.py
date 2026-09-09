@@ -19,12 +19,14 @@ from collections.abc import Iterable, Sequence
 from pathlib import Path
 
 from packaging.tags import sys_tags
+from packaging.utils import parse_wheel_filename
 
 AVRO_REVISION = "7f423d69709045e38f8431b3470e0395fce1a595"
 EXTENSION_NAMES = ("avro", "iceberg")
 SIGNING_PROFILES = {
     "ci-test": ("vane-ci-test-key", "VANE_ENABLE_TEST_EXTENSION_SIGNING_KEY"),
     "testpypi": ("astrovela/vane-testpypi", "VANE_ENABLE_TESTPYPI_EXTENSION_SIGNING_KEY"),
+    "production": ("astrovela/vane", None),
 }
 LICENSE_EXPRESSION = (
     "0BSD AND Apache-2.0 AND BSD-2-Clause AND BSD-3-Clause AND BSL-1.0 AND ISC AND MIT AND "
@@ -72,6 +74,20 @@ _MAX_SIGNING_PRIVATE_KEY_BYTES = 64 * 1024
 
 class QualificationError(RuntimeError):
     """Raised when a qualification input or artifact violates the fixed contract."""
+
+
+def _require_production_runtime(wheel: Path) -> None:
+    name, version, build, _tags = parse_wheel_filename(wheel.name)
+    if (
+        name != "vane-ai"
+        or build
+        or str(version) != wheel.name.split("-")[1]
+        or version.epoch != 0
+        or len(version.release) != 3
+        or version.local is not None
+        or version.is_devrelease
+    ):
+        raise QualificationError("production signing requires a canonical non-development vane-ai runtime")
 
 
 def _run(
@@ -231,7 +247,7 @@ def _build_environment(
     vane_vcpkg_installed: Path,
     vcpkg_toolchain: Path,
     jobs: int,
-    signing_cmake_option: str,
+    signing_cmake_option: str | None,
 ) -> dict[str, str]:
     target_triplet = "x64-linux"
     dependency_prefix = vane_vcpkg_installed / target_triplet
@@ -252,7 +268,10 @@ def _build_environment(
         "-DENABLE_EXTENSION_AUTOINSTALL=OFF",
         "-DEXTENSION_STATIC_BUILD=ON",
         "-DICEBERG_VANE_DISTRIBUTED=ON",
-        f"-D{signing_cmake_option}=ON",
+        *(
+            f"-D{option}={'ON' if option == signing_cmake_option else 'OFF'}"
+            for option in ("VANE_ENABLE_TEST_EXTENSION_SIGNING_KEY", "VANE_ENABLE_TESTPYPI_EXTENSION_SIGNING_KEY")
+        ),
         "-DVANE_LOADABLE_EXTENSIONS=avro;iceberg",
         f"-DVANE_LOADABLE_EXTENSION_OUTPUT_DIRECTORY={staged_extensions}",
         "-DVCPKG_BUILD=ON",
@@ -507,6 +526,7 @@ def _build_provider_wheel(
 
 def _parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--phase", required=True, choices=("full", "prepare"))
     parser.add_argument("--extension-root", required=True, type=Path)
     parser.add_argument("--avro-source", required=True, type=Path)
     parser.add_argument("--vane-source", required=True, type=Path)
@@ -517,7 +537,7 @@ def _parse_arguments() -> argparse.Namespace:
     parser.add_argument("--output-directory", required=True, type=Path)
     parser.add_argument("--jobs", default=8, type=int)
     parser.add_argument("--signing-profile", required=True, choices=tuple(SIGNING_PROFILES))
-    parser.add_argument("--signing-private-key", required=True, type=Path)
+    parser.add_argument("--signing-private-key", type=Path)
     parser.add_argument(
         "--consume-signing-private-key",
         action="store_true",
@@ -548,6 +568,25 @@ def _parse_arguments() -> argparse.Namespace:
 
 def main() -> int:
     arguments = _parse_arguments()
+    if arguments.phase == "prepare":
+        if arguments.signing_private_key is not None or arguments.consume_signing_private_key:
+            raise QualificationError("unsigned preparation must never receive a signing key")
+        if arguments.package_local_runtime:
+            raise QualificationError("unsigned preparation requires exact indexed runtimes")
+        return _build(arguments, None)
+    if arguments.signing_profile != "ci-test":
+        raise QualificationError("publishing keys may only be used in the isolated signer, never a build process")
+    if arguments.signing_private_key is None:
+        raise QualificationError("CI-only full mode requires its public test key")
+    contents = _read_signing_private_key(arguments.signing_private_key, consume=arguments.consume_signing_private_key)
+    try:
+        return _build(arguments, contents)
+    finally:
+        contents[:] = b"\0" * len(contents)
+        contents.clear()
+
+
+def _build(arguments: argparse.Namespace, signing_private_key_contents: bytearray | None) -> int:
     if arguments.jobs <= 0:
         raise QualificationError("--jobs must be a positive integer")
     if arguments.package_local_runtime and arguments.runtime_wheel:
@@ -562,12 +601,6 @@ def main() -> int:
     vane_source = _require_directory(arguments.vane_source, "Vane source")
     vane_vcpkg_installed = _require_directory(arguments.vane_vcpkg_installed, "Vane vcpkg installation")
     trust_identity, signing_cmake_option = SIGNING_PROFILES[arguments.signing_profile]
-    if arguments.signing_profile == "testpypi" and not arguments.consume_signing_private_key:
-        raise QualificationError("the TestPyPI signing profile requires --consume-signing-private-key")
-    signing_private_key_contents = _read_signing_private_key(
-        arguments.signing_private_key,
-        consume=arguments.consume_signing_private_key,
-    )
     indexed_runtimes: tuple[tuple[Path, Path], ...] = tuple(
         (
             _require_file(interpreter, "runtime Python interpreter"),
@@ -578,6 +611,13 @@ def main() -> int:
     for interpreter, _wheel in indexed_runtimes:
         if not os.access(interpreter, os.X_OK):
             raise QualificationError(f"runtime Python interpreter is not executable: {interpreter}")
+        if arguments.signing_profile == "production":
+            _require_production_runtime(_wheel)
+    if (
+        arguments.signing_profile == "production"
+        and len({parse_wheel_filename(w.name)[1] for _, w in indexed_runtimes}) != 1
+    ):
+        raise QualificationError("production runtime wheels must all have the same exact Vane version")
     vcpkg_toolchain = _require_vcpkg_toolchain(
         arguments.vcpkg_toolchain,
         _vcpkg_baseline(extension_root),
@@ -586,6 +626,8 @@ def main() -> int:
     output_directory = arguments.output_directory.expanduser().resolve()
     build_directory.mkdir(parents=True, exist_ok=True)
     output_directory.mkdir(parents=True, exist_ok=True)
+    if arguments.phase == "prepare" and any(output_directory.iterdir()):
+        raise QualificationError("unsigned preparation requires an empty output directory")
     existing_wheels = sorted(output_directory.glob("*.whl"))
     if existing_wheels:
         raise QualificationError(f"output directory already contains a wheel: {existing_wheels[0]}")
@@ -636,6 +678,24 @@ def main() -> int:
         )
 
         unsigned_directory = build_directory / "vane_extensions"
+        if arguments.phase == "prepare":
+            license_sets = _stage_license_files(
+                extension_root=extension_root,
+                avro_source=avro_source,
+                vane_source=vane_source,
+                build_directory=build_directory,
+            )
+            for extension_name, licenses in zip(EXTENSION_NAMES, license_sets, strict=True):
+                unsigned = _require_file(unsigned_directory / f"{extension_name}.duckdb_extension", "unsigned artifact")
+                _require_no_undefined_duckdb_symbols(unsigned)
+                artifact_directory = output_directory / "artifacts"
+                artifact_directory.mkdir(exist_ok=True)
+                shutil.copyfile(unsigned, artifact_directory / unsigned.name)
+                for source in licenses:
+                    _copy_license(source, output_directory / "licenses" / extension_name / source.name)
+            return 0
+
+        assert signing_private_key_contents is not None  # only public CI-test full mode reaches signing
         signed_directory = build_directory / "signed-vane-extensions"
         signed_directory.mkdir(parents=True, exist_ok=True)
         signed_artifacts: dict[str, Path] = {}
