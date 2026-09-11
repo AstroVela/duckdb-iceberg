@@ -17,7 +17,8 @@ limits. Avro pins the exact Vane runtime; Iceberg pins that runtime and exact Av
 
 The development manifest pins `850e04e0a957481ee081c04332255e543735ce51`,
 the bound-plan runner implementation from AstroVela/vane#806 plus the SELECT
-binding transaction fix tracked by AstroVela/vane#809. Build-only
+binding transaction and DataSource lifetime corrections in AstroVela/vane#810,
+tracked by AstroVela/vane#809. Build-only
 qualification builds its own runtime and exercises independent local-fast and
 Ray connections. This does not publish that runtime or its providers. A
 `testpypi-dev` dispatch still requires matching indexed runtime wheels; missing
@@ -35,8 +36,9 @@ end-to-end production qualification.
 Before the first production run, publish a canonical non-development Vane
 release (an alpha, beta or RC is also allowed) to PyPI. Update only the release
 manifest through review to its complete exact commit, which must contain the
-production-key commit above and the bound-plan runner implementation used by
-the integration suite. The workflow derives the version from clean, full
+production-key commit above, the bound-plan runner implementation from
+AstroVela/vane#806, and both the cleanup-before-binding and SELECT source-lifetime
+corrections in AstroVela/vane#810. The workflow derives the version from clean, full
 Git history with version overrides removed and validates it with the shared
 channel gate. All five exact runtime wheels are downloaded before native
 dependency preparation. Missing wheels fail; no alternate-index or development
