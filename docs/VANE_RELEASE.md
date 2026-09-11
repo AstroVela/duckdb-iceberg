@@ -15,7 +15,7 @@ limits. Avro pins the exact Vane runtime; Iceberg pins that runtime and exact Av
 | `testpypi-dev` | `vane-extension.toml` | TestPyPI only | `astrovela/vane-testpypi` | TestPyPI only |
 | `release` | `vane-extension-release.toml` | PyPI only | `astrovela/vane` | TestPyPI qualification, then identical wheels to PyPI |
 
-The development manifest pins `386886c28208cf8292f26fe8741ac38307da165b`,
+The development manifest pins `850e04e0a957481ee081c04332255e543735ce51`,
 the bound-plan runner implementation from AstroVela/vane#806 plus the SELECT
 binding transaction fix tracked by AstroVela/vane#809. Build-only
 qualification builds its own runtime and exercises independent local-fast and
@@ -146,7 +146,7 @@ python -I vane-extension-ci-tools/scripts/vane_provider_release.py validate \
   --vane-source ../vane \
   --ci-tools-version "$(git rev-parse HEAD:vane-extension-ci-tools)" \
   --config vane-provider-release.toml \
-  --directory dist/providers --vane-version 0.2.0.dev649 \
+  --directory dist/providers --vane-version 0.2.0.dev650 \
   --channel testpypi-dev --require-publishable-on testpypi
 ```
 
