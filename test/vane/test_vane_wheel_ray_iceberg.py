@@ -11,6 +11,7 @@ import urllib.error
 import urllib.request
 import uuid
 from collections.abc import Callable
+from contextlib import ExitStack
 from pathlib import Path
 
 TEST_DIRECTORY = Path(__file__).resolve().parent
@@ -56,6 +57,12 @@ MERGE_V2_TABLE = f"{CATALOG_NAME}.default.{MERGE_V2_NAME}"
 MERGE_V3_TABLE = f"{CATALOG_NAME}.default.{MERGE_V3_NAME}"
 MERGE_LOCAL_TABLE = f"{CATALOG_NAME}.default.{MERGE_LOCAL_NAME}"
 FAILED_CTAS_TABLE = f"{CATALOG_NAME}.default.{FAILED_CTAS_NAME}"
+SQL_API_TABLES = {
+    (runner, method, version): f"{CATALOG_NAME}.default.vane_sql_{runner.replace('-', '_')}_{method}_v{version}"
+    for runner in ("local-fast", "ray")
+    for method in ("execute", "sql")
+    for version in (2, 3)
+}
 TABLES = (
     TARGET_TABLE,
     SOURCE_TABLE,
@@ -73,6 +80,7 @@ TABLES = (
     MERGE_V3_TABLE,
     MERGE_LOCAL_TABLE,
     FAILED_CTAS_TABLE,
+    *SQL_API_TABLES.values(),
 )
 DATA_ROOT = "s3://warehouse/vane-wheel-ray-integration"
 WORKER_COUNT = 2
@@ -148,25 +156,38 @@ def configure_worker_session_environment() -> None:
     )
 
 
-def open_catalog_connection(vane: object) -> object:
-    connection = vane.connect(
-        ":memory:",
-        config={
-            "autoinstall_known_extensions": "false",
-            "autoload_known_extensions": "false",
-        },
-    )
-    load_packaged_dynamic_iceberg(connection)
-    connection.execute("LOAD httpfs")
-    configure_coordinator_s3(connection)
-    connection.execute("SET unsafe_enable_version_guessing = true")
-    connection.execute("SET TimeZone = 'UTC'")
-    connection.execute(
-        f"ATTACH '' AS {CATALOG_NAME} "
-        "(TYPE ICEBERG, CLIENT_ID 'admin', CLIENT_SECRET 'password', "
-        f"ENDPOINT '{CATALOG_ENDPOINT}', stage_create_tables true)"
-    )
-    return connection
+def open_catalog_connection(vane: object, runner_type: str = "local-fast") -> object:
+    previous_runner = os.environ.get("VANE_RUNNER")
+    os.environ["VANE_RUNNER"] = runner_type
+    try:
+        connection = vane.connect(
+            ":memory:",
+            config={
+                "allow_unsigned_extensions": "false",
+                "autoinstall_known_extensions": "false",
+                "autoload_known_extensions": "false",
+            },
+        )
+    finally:
+        if previous_runner is None:
+            os.environ.pop("VANE_RUNNER", None)
+        else:
+            os.environ["VANE_RUNNER"] = previous_runner
+    try:
+        load_packaged_dynamic_iceberg(connection)
+        connection.execute("LOAD httpfs")
+        configure_coordinator_s3(connection)
+        connection.execute("SET unsafe_enable_version_guessing = true")
+        connection.execute("SET TimeZone = 'UTC'")
+        connection.execute(
+            f"ATTACH '' AS {CATALOG_NAME} "
+            "(TYPE ICEBERG, CLIENT_ID 'admin', CLIENT_SECRET 'password', "
+            f"ENDPOINT '{CATALOG_ENDPOINT}', stage_create_tables true)"
+        )
+        return connection
+    except BaseException:
+        connection.close()
+        raise
 
 
 def create_two_worker_cluster(ray: object) -> object:
@@ -224,8 +245,9 @@ def assert_vane_worker_topology(ray: object, runner: object) -> None:
 
 
 class RayIcebergHarness:
-    def __init__(self, vane: object, connection: object, runner: object):
+    def __init__(self, vane: object, local_connection: object, connection: object, runner: object):
         self.vane = vane
+        self.local_connection = local_connection
         self.connection = connection
         self.runner = runner
         self.read_dispatch_count = 0
@@ -234,13 +256,15 @@ class RayIcebergHarness:
         self._original_run_iter_tables = runner.run_iter_tables
         self._original_run_write = runner.run_write
 
-        def record_distributed_read(*args: object, **kwargs: object) -> object:
+        def record_distributed_read(plan: object, *args: object, **kwargs: object) -> object:
+            require_true(isinstance(plan, vane.ray_cxx.PyLogicalPlan), "read runner did not receive a bound plan")
             self.read_dispatch_count += 1
-            return self._original_run_iter_tables(*args, **kwargs)
+            return self._original_run_iter_tables(plan, *args, **kwargs)
 
-        def record_distributed_write(*args: object, **kwargs: object) -> object:
+        def record_distributed_write(plan: object, *args: object, **kwargs: object) -> object:
+            require_true(isinstance(plan, vane.ray_cxx.PyLogicalPlan), "write runner did not receive a bound plan")
             self.write_dispatch_count += 1
-            return self._original_run_write(*args, **kwargs)
+            return self._original_run_write(plan, *args, **kwargs)
 
         self._record_distributed_write = record_distributed_write
         runner.run_iter_tables = record_distributed_read
@@ -253,7 +277,7 @@ class RayIcebergHarness:
         expected: list[tuple[object, ...]] | None = None,
     ) -> list[tuple[object, ...]]:
         if expected is None:
-            expected = self.connection.execute(query).fetchall()
+            expected = self.local_connection.execute(query).fetchall()
         previous_count = self.read_dispatch_count
         actual = self.connection.sql(query).fetchall()
         require_equal(self.read_dispatch_count, previous_count + 1, f"{description} Ray dispatch count")
@@ -312,14 +336,10 @@ class RayIcebergHarness:
     def capture_write_plan(self, operation: Callable[[], object]) -> object:
         captured: list[object] = []
 
-        def capture(relation: object) -> dict[str, object]:
-            captured.append(
-                self.vane.ray_cxx.PyLogicalPlan.from_duckdb_write_relation(
-                    relation,
-                    f"vane-wheel-ray-iceberg-stale-{uuid.uuid4()}",
-                )
-            )
-            return {}
+        def capture(plan: object) -> dict[str, object]:
+            require_true(isinstance(plan, self.vane.ray_cxx.PyLogicalPlan), "runner did not receive a bound plan")
+            captured.append(plan)
+            return {"copy_operation_id": plan.idx(), "rows_copied": 0}
 
         self.runner.run_write = capture
         try:
@@ -420,32 +440,22 @@ def require_concurrent_write_conflict(
 
 
 def seed_source_table_with_local_fast(harness: RayIcebergHarness) -> None:
-    connection = harness.connection
-    configured_runner = os.environ.get("VANE_RUNNER")
+    connection = harness.local_connection
     previous_write_count = harness.write_dispatch_count
 
-    # range() does not expose file-backed scan splits for a Ray extension write.
-    # Select local-fast explicitly for setup, persist four Iceberg files, and
-    # restore Ray before any distributed assertion.
-    os.environ["VANE_RUNNER"] = "local-fast"
-    try:
-        connection.execute(
-            f"CREATE TABLE {SOURCE_TABLE} (id INTEGER, payload VARCHAR) "
-            f"WITH ('format-version' = '2', 'write.data.path' = '{DATA_ROOT}/source')"
+    # Persist four independent files through the dedicated native connection.
+    connection.execute(
+        f"CREATE TABLE {SOURCE_TABLE} (id INTEGER, payload VARCHAR) "
+        f"WITH ('format-version' = '2', 'write.data.path' = '{DATA_ROOT}/source')"
+    )
+    for partition_index in range(SOURCE_PARTITIONS):
+        start = partition_index * ROWS_PER_PARTITION
+        stop = start + ROWS_PER_PARTITION
+        source_batch = connection.sql(
+            "SELECT i::INTEGER AS id, ('value-' || i::VARCHAR)::VARCHAR AS payload "
+            f"FROM range({start}, {stop}) AS source(i)"
         )
-        for partition_index in range(SOURCE_PARTITIONS):
-            start = partition_index * ROWS_PER_PARTITION
-            stop = start + ROWS_PER_PARTITION
-            source_batch = connection.sql(
-                "SELECT i::INTEGER AS id, ('value-' || i::VARCHAR)::VARCHAR AS payload "
-                f"FROM range({start}, {stop}) AS source(i)"
-            )
-            source_batch.insert_into(SOURCE_TABLE)
-    finally:
-        if configured_runner is None:
-            os.environ.pop("VANE_RUNNER", None)
-        else:
-            os.environ["VANE_RUNNER"] = configured_runner
+        source_batch.insert_into(SOURCE_TABLE)
 
     require_equal(
         harness.write_dispatch_count,
@@ -544,6 +554,7 @@ def exercise_source_target_and_topology(
     expected_nodes: set[str],
 ) -> None:
     connection = harness.connection
+    local_connection = harness.local_connection
     vane = harness.vane
 
     seed_source_table_with_local_fast(harness)
@@ -585,7 +596,7 @@ def exercise_source_target_and_topology(
         lambda: ctas_source.create(TARGET_TABLE),
         "requires an explicit 'location' or 'write.data.path' table property",
     )
-    target_exists = connection.execute(
+    target_exists = local_connection.execute(
         "SELECT count(*) FROM information_schema.tables "
         f"WHERE table_catalog = '{CATALOG_NAME}' AND table_schema = 'default' AND table_name = '{TARGET_NAME}'"
     ).fetchone()
@@ -603,7 +614,7 @@ def exercise_source_target_and_topology(
             partition_by=["partition_key"],
         ),
     )
-    target_partitions = connection.execute(
+    target_partitions = local_connection.execute(
         f"SELECT DISTINCT regexp_extract(file_path, 'partition_key=([^/]+)', 1) AS partition_value "
         f"FROM iceberg_metadata({TARGET_TABLE}) WHERE manifest_content = 'DATA' ORDER BY partition_value"
     ).fetchall()
@@ -649,8 +660,125 @@ def exercise_source_target_and_topology(
     )
 
 
+def exercise_public_sql_entrypoints(harness: RayIcebergHarness) -> None:
+    local = harness.local_connection
+    source_snapshots = local.execute(
+        f"SELECT snapshot_id FROM iceberg_snapshots({SOURCE_TABLE}) ORDER BY snapshot_id"
+    ).fetchall()
+    previous_runner = os.environ.get("VANE_RUNNER")
+    try:
+        for runner_type, connection in (("local-fast", local), ("ray", harness.connection)):
+            # Existing connections and derived Relations must retain their
+            # runner even while the process default points to the other one.
+            os.environ["VANE_RUNNER"] = "ray" if runner_type == "local-fast" else "local-fast"
+            expected_dispatch = int(runner_type == "ray")
+            for method in ("execute", "sql"):
+                query = f"SELECT id, payload FROM {SOURCE_TABLE} WHERE id >= ? AND id < ? ORDER BY id"
+                before = harness.read_dispatch_count
+                if method == "execute":
+                    rows = connection.execute(query, [2, 5]).fetchall()
+                else:
+                    rows = connection.sql(query, params=[2, 5]).fetchall()
+                require_equal(rows, [(i, f"value-{i}") for i in range(2, 5)], f"{runner_type} {method} parameters")
+                require_equal(
+                    harness.read_dispatch_count - before, expected_dispatch, f"{runner_type} {method} read dispatch"
+                )
+
+            before = harness.read_dispatch_count
+            relation = connection.table(SOURCE_TABLE).filter("id >= 2 AND id < 5").project("id, payload").order("id")
+            require_equal(relation._get_runner_type(), runner_type, "derived Iceberg Relation runner")
+            require_equal(relation.fetchall(), [(i, f"value-{i}") for i in range(2, 5)], "derived Iceberg Relation")
+            require_equal(harness.read_dispatch_count - before, expected_dispatch, "derived Relation read dispatch")
+
+            for method in ("execute", "sql"):
+                for version in (2, 3):
+                    target = SQL_API_TABLES[runner_type, method, version]
+                    label = f"{runner_type} {method} Iceberg v{version}"
+                    expected_rows = [(i, f"value-{i}") for i in range(4)]
+                    snapshot_count = 0
+
+                    def write(
+                        statement: str, parameters: list[object], description: str, snapshot_delta: int = 1
+                    ) -> None:
+                        nonlocal snapshot_count
+                        before_reads = harness.read_dispatch_count
+                        before_writes = harness.write_dispatch_count
+                        if method == "execute":
+                            connection.execute(statement, parameters)
+                        else:
+                            connection.sql(statement, params=parameters)
+                        require_equal(
+                            harness.write_dispatch_count - before_writes,
+                            expected_dispatch,
+                            f"{label} {description} write dispatch",
+                        )
+                        require_equal(harness.read_dispatch_count, before_reads, f"{label} {description} read dispatch")
+                        require_equal(
+                            local.execute(f"SELECT id, payload FROM {target} ORDER BY id").fetchall(),
+                            expected_rows,
+                            f"{label} {description} committed rows",
+                        )
+                        snapshot_count += snapshot_delta
+                        require_equal(
+                            local.execute(f"SELECT count(*) FROM iceberg_snapshots({target})").fetchone(),
+                            (snapshot_count,),
+                            f"{label} {description} snapshot count",
+                        )
+
+                    write(
+                        f"CREATE TABLE {target} WITH ('format-version' = '{version}', "
+                        f"'write.data.path' = '{DATA_ROOT}/sql-{runner_type}-{method}-v{version}') "
+                        f"AS SELECT id, payload FROM {SOURCE_TABLE} WHERE id < ?",
+                        [4],
+                        "CTAS",
+                    )
+                    expected_rows.extend((i, f"value-{i}") for i in range(4, 6))
+                    write(
+                        f"INSERT INTO {target} SELECT id, payload FROM {SOURCE_TABLE} WHERE id >= ? AND id < ?",
+                        [4, 6],
+                        "INSERT",
+                    )
+                    expected_rows[1] = (1, "updated")
+                    write(f"UPDATE {target} SET payload = ? WHERE id = ?", ["updated", 1], "UPDATE")
+                    expected_rows = [row for row in expected_rows if row[0] != 2]
+                    write(f"DELETE FROM {target} WHERE id = ?", [2], "DELETE")
+                    expected_rows[0] = (0, "merged")
+                    expected_rows.append((6, "value-6"))
+                    write(
+                        f"MERGE INTO {target} AS target USING "
+                        f"(SELECT id, payload FROM {SOURCE_TABLE} WHERE id IN (?, ?)) AS source "
+                        "ON target.id = source.id WHEN MATCHED THEN UPDATE SET payload = ? "
+                        "WHEN NOT MATCHED THEN INSERT (id, payload) VALUES (source.id, source.payload)",
+                        [0, 6, "merged"],
+                        "MERGE",
+                        # Native MERGE stages separate update/insert snapshots
+                        # in one transaction; Ray combines both in one snapshot.
+                        snapshot_delta=2 if runner_type == "local-fast" else 1,
+                    )
+                    before = harness.read_dispatch_count
+                    if method == "execute":
+                        rows = connection.execute(f"SELECT id, payload FROM {target} ORDER BY id").fetchall()
+                    else:
+                        rows = connection.sql(f"SELECT id, payload FROM {target} ORDER BY id").fetchall()
+                    require_equal(rows, expected_rows, f"{label} final read-back")
+                    require_equal(
+                        harness.read_dispatch_count - before, expected_dispatch, f"{label} read-back dispatch"
+                    )
+        require_equal(
+            local.execute(f"SELECT snapshot_id FROM iceberg_snapshots({SOURCE_TABLE}) ORDER BY snapshot_id").fetchall(),
+            source_snapshots,
+            "SQL and Relation reads preserve source snapshots",
+        )
+    finally:
+        if previous_runner is None:
+            os.environ.pop("VANE_RUNNER", None)
+        else:
+            os.environ["VANE_RUNNER"] = previous_runner
+
+
 def exercise_distributed_merge(harness: RayIcebergHarness) -> None:
     connection = harness.connection
+    local_connection = harness.local_connection
     distributed_insert_ids = tuple(range(10, SOURCE_ROW_COUNT, 16))
 
     def merge(
@@ -668,51 +796,43 @@ def exercise_distributed_merge(harness: RayIcebergHarness) -> None:
             ),
         )
 
-    connection.execute(
+    local_connection.execute(
         f"CREATE TABLE {MERGE_LOCAL_TABLE} (id INTEGER, payload VARCHAR) "
         f"WITH ('format-version' = '2', 'write.data.path' = '{DATA_ROOT}/merge-local')"
     )
-    connection.execute(f"INSERT INTO {MERGE_LOCAL_TABLE} VALUES (0, 'old')")
-    configured_runner = os.environ.get("VANE_RUNNER")
+    local_connection.execute(f"INSERT INTO {MERGE_LOCAL_TABLE} VALUES (0, 'old')")
     previous_write_count = harness.write_dispatch_count
-    os.environ["VANE_RUNNER"] = "local-fast"
-    try:
-        connection.sql(f"SELECT id, payload FROM {SOURCE_TABLE} WHERE id IN (0, 1)").merge_into(
-            MERGE_LOCAL_TABLE,
-            "target.id = source.id",
-            [
-                "WHEN MATCHED THEN UPDATE SET payload = source.payload",
-                "WHEN NOT MATCHED THEN INSERT (id, payload) VALUES (source.id, source.payload)",
-            ],
-        )
-        connection.sql(
-            f"SELECT id, filename, file_row_number, "
-            f"('self-' || id::VARCHAR)::VARCHAR AS payload FROM {MERGE_LOCAL_TABLE} WHERE id = 0"
-        ).merge_into(
-            MERGE_LOCAL_TABLE,
-            "target.id = source.id",
-            [
-                "WHEN MATCHED AND source.filename IS NOT NULL AND source.file_row_number >= 0 "
-                "THEN UPDATE SET payload = source.payload"
-            ],
-        )
-    finally:
-        if configured_runner is None:
-            os.environ.pop("VANE_RUNNER", None)
-        else:
-            os.environ["VANE_RUNNER"] = configured_runner
+    local_connection.sql(f"SELECT id, payload FROM {SOURCE_TABLE} WHERE id IN (0, 1)").merge_into(
+        MERGE_LOCAL_TABLE,
+        "target.id = source.id",
+        [
+            "WHEN MATCHED THEN UPDATE SET payload = source.payload",
+            "WHEN NOT MATCHED THEN INSERT (id, payload) VALUES (source.id, source.payload)",
+        ],
+    )
+    local_connection.sql(
+        f"SELECT id, filename, file_row_number, "
+        f"('self-' || id::VARCHAR)::VARCHAR AS payload FROM {MERGE_LOCAL_TABLE} WHERE id = 0"
+    ).merge_into(
+        MERGE_LOCAL_TABLE,
+        "target.id = source.id",
+        [
+            "WHEN MATCHED AND source.filename IS NOT NULL AND source.file_row_number >= 0 "
+            "THEN UPDATE SET payload = source.payload"
+        ],
+    )
     require_equal(
         harness.write_dispatch_count,
         previous_write_count,
         "local-fast Iceberg MERGE Ray dispatch count",
     )
     require_equal(
-        connection.execute(f"SELECT id, payload FROM {MERGE_LOCAL_TABLE} ORDER BY id").fetchall(),
+        local_connection.execute(f"SELECT id, payload FROM {MERGE_LOCAL_TABLE} ORDER BY id").fetchall(),
         [(0, "self-0"), (1, "value-1")],
         "local-fast Iceberg self-MERGE result",
     )
 
-    connection.execute(
+    local_connection.execute(
         f"CREATE TABLE {MERGE_V2_TABLE} (id INTEGER, payload VARCHAR, category VARCHAR) "
         f"WITH ('format-version' = '2', 'write.data.path' = '{DATA_ROOT}/merge-v2')"
     )
@@ -727,7 +847,7 @@ def exercise_distributed_merge(harness: RayIcebergHarness) -> None:
         ],
     )
     require_equal(
-        connection.execute(f"SELECT count(*) FROM iceberg_snapshots({MERGE_V2_TABLE})").fetchone(),
+        local_connection.execute(f"SELECT count(*) FROM iceberg_snapshots({MERGE_V2_TABLE})").fetchone(),
         (0,),
         "statically empty MERGE must not create a snapshot",
     )
@@ -740,7 +860,7 @@ def exercise_distributed_merge(harness: RayIcebergHarness) -> None:
         MERGE_V2_TABLE,
         ["WHEN NOT MATCHED THEN INSERT (id, payload, category) VALUES (source.id, source.payload, source.category)"],
     )
-    connection.execute(
+    local_connection.execute(
         f"INSERT INTO {MERGE_V2_TABLE} VALUES "
         "(0, 'old-0', 'A'), (1, 'old-1', 'A'), (2, 'old-2', 'B'), (3, 'keep-3', 'B')"
     )
@@ -816,20 +936,20 @@ def exercise_distributed_merge(harness: RayIcebergHarness) -> None:
         ],
     )
     require_equal(
-        connection.execute(
+        local_connection.execute(
             f"SELECT payload = category AND payload IS NOT NULL FROM {MERGE_V2_TABLE} WHERE id = {volatile_id}"
         ).fetchone(),
         (True,),
         "distributed MERGE reevaluated one projected volatile value",
     )
 
-    snapshot_count_before_error = connection.execute(
+    snapshot_count_before_error = local_connection.execute(
         f"SELECT count(*) FROM iceberg_snapshots({MERGE_V2_TABLE})"
     ).fetchone()
-    table_state_before_error = connection.execute(
+    table_state_before_error = local_connection.execute(
         f"SELECT count(*), sum(id), sum(length(payload)), sum(length(category)) FROM {MERGE_V2_TABLE}"
     ).fetchone()
-    artifacts_before_error = connection.execute(
+    artifacts_before_error = local_connection.execute(
         f"SELECT file FROM glob('{DATA_ROOT}/merge-v2/_vane_merge_*/**/*') ORDER BY file"
     ).fetchall()
     harness.require_rejected_write(
@@ -850,19 +970,19 @@ def exercise_distributed_merge(harness: RayIcebergHarness) -> None:
         "blocked-3",
     )
     require_equal(
-        connection.execute(f"SELECT count(*) FROM iceberg_snapshots({MERGE_V2_TABLE})").fetchone(),
+        local_connection.execute(f"SELECT count(*) FROM iceberg_snapshots({MERGE_V2_TABLE})").fetchone(),
         snapshot_count_before_error,
         "MERGE error action must not commit a snapshot",
     )
     require_equal(
-        connection.execute(
+        local_connection.execute(
             f"SELECT count(*), sum(id), sum(length(payload)), sum(length(category)) FROM {MERGE_V2_TABLE}"
         ).fetchone(),
         table_state_before_error,
         "failed distributed MERGE must not expose partial rows",
     )
     require_equal(
-        connection.execute(
+        local_connection.execute(
             f"SELECT file FROM glob('{DATA_ROOT}/merge-v2/_vane_merge_*/**/*') ORDER BY file"
         ).fetchall(),
         artifacts_before_error,
@@ -876,12 +996,12 @@ def exercise_distributed_merge(harness: RayIcebergHarness) -> None:
         ["WHEN MATCHED THEN DO NOTHING"],
     )
     require_equal(
-        connection.execute(f"SELECT count(*) FROM iceberg_snapshots({MERGE_V2_TABLE})").fetchone(),
+        local_connection.execute(f"SELECT count(*) FROM iceberg_snapshots({MERGE_V2_TABLE})").fetchone(),
         snapshot_count_before_error,
         "zero-row MERGE must not commit a snapshot",
     )
 
-    snapshot_count_before_duplicate = connection.execute(
+    snapshot_count_before_duplicate = local_connection.execute(
         f"SELECT count(*) FROM iceberg_snapshots({MERGE_V2_TABLE})"
     ).fetchone()
     harness.require_rejected_write(
@@ -894,28 +1014,28 @@ def exercise_distributed_merge(harness: RayIcebergHarness) -> None:
         "same Iceberg row was modified multiple times",
     )
     require_equal(
-        connection.execute(f"SELECT count(*) FROM iceberg_snapshots({MERGE_V2_TABLE})").fetchone(),
+        local_connection.execute(f"SELECT count(*) FROM iceberg_snapshots({MERGE_V2_TABLE})").fetchone(),
         snapshot_count_before_duplicate,
         "duplicate-match MERGE must not commit a snapshot",
     )
 
-    connection.execute(
+    local_connection.execute(
         f"CREATE TABLE {MERGE_V3_TABLE} (id INTEGER, payload VARCHAR, partition_key INTEGER) "
         "PARTITIONED BY (partition_key) "
         f"WITH ('format-version' = '3', 'write.data.path' = '{DATA_ROOT}/merge-v3')"
     )
-    connection.execute(
+    local_connection.execute(
         f"INSERT INTO {MERGE_V3_TABLE} "
         "SELECT id, ('old-' || id::VARCHAR)::VARCHAR, (id % 2)::INTEGER FROM range(6) AS source(id)"
     )
-    original_lineage = connection.execute(f"SELECT id, _row_id FROM {MERGE_V3_TABLE} ORDER BY id").fetchall()
+    original_lineage = local_connection.execute(f"SELECT id, _row_id FROM {MERGE_V3_TABLE} ORDER BY id").fetchall()
     original_row_ids = {int(row[1]) for row in original_lineage}
-    connection.execute(f"DELETE FROM {MERGE_V3_TABLE} WHERE id = 0")
-    lineage_before = connection.execute(
+    local_connection.execute(f"DELETE FROM {MERGE_V3_TABLE} WHERE id = 0")
+    lineage_before = local_connection.execute(
         f"SELECT id, _row_id, _last_updated_sequence_number FROM {MERGE_V3_TABLE} " "ORDER BY id"
     ).fetchall()
     lineage_before_by_id = {int(row[0]): row for row in lineage_before}
-    active_dvs_before = connection.execute(
+    active_dvs_before = local_connection.execute(
         f"SELECT file_path FROM iceberg_metadata({MERGE_V3_TABLE}) "
         "WHERE content = 'POSITION_DELETES' AND status != 'DELETED'"
     ).fetchall()
@@ -934,7 +1054,7 @@ def exercise_distributed_merge(harness: RayIcebergHarness) -> None:
             "VALUES (source.id, source.payload, source.partition_key)",
         ],
     )
-    latest_sequence = connection.execute(
+    latest_sequence = local_connection.execute(
         f"SELECT max(sequence_number) FROM iceberg_snapshots({MERGE_V3_TABLE})"
     ).fetchone()[0]
     lineage_after = harness.require_query(
@@ -985,7 +1105,7 @@ def exercise_distributed_merge(harness: RayIcebergHarness) -> None:
         len(lineage_after),
         "distributed v3 MERGE row IDs remain unique",
     )
-    active_dvs_after = connection.execute(
+    active_dvs_after = local_connection.execute(
         f"SELECT file_path FROM iceberg_metadata({MERGE_V3_TABLE}) "
         "WHERE content = 'POSITION_DELETES' AND status != 'DELETED'"
     ).fetchall()
@@ -995,7 +1115,7 @@ def exercise_distributed_merge(harness: RayIcebergHarness) -> None:
         "distributed v3 MERGE did not replace the existing Puffin deletion vector",
     )
     require_equal(
-        connection.execute(
+        local_connection.execute(
             f"SELECT operation FROM iceberg_snapshots({MERGE_V3_TABLE}) ORDER BY sequence_number DESC LIMIT 1"
         ).fetchone(),
         ("overwrite",),
@@ -1054,6 +1174,7 @@ def exercise_distributed_merge(harness: RayIcebergHarness) -> None:
 
 def exercise_versioned_ctas(harness: RayIcebergHarness) -> None:
     connection = harness.connection
+    local_connection = harness.local_connection
     vane = harness.vane
 
     nested_source = connection.sql(
@@ -1106,12 +1227,12 @@ def exercise_versioned_ctas(harness: RayIcebergHarness) -> None:
         ],
     )
 
-    data_file = connection.execute(
+    data_file = local_connection.execute(
         f"SELECT file_path FROM iceberg_metadata({V3_CTAS_TABLE}) "
         "WHERE manifest_content = 'DATA' ORDER BY file_path LIMIT 1"
     ).fetchone()
     require_true(data_file is not None, "distributed Iceberg v3 CTAS did not create a data file")
-    field_ids = connection.execute(
+    field_ids = local_connection.execute(
         "SELECT name, field_id FROM parquet_schema(?) "
         "WHERE name IN ('id', 'details', 'label', 'ordinal', 'scores', 'element', "
         "'attributes', 'key', 'value', 'partition_key') ORDER BY field_id",
@@ -1133,7 +1254,7 @@ def exercise_versioned_ctas(harness: RayIcebergHarness) -> None:
         ],
         "distributed Iceberg v3 CTAS nested Parquet field IDs",
     )
-    partitions = connection.execute(
+    partitions = local_connection.execute(
         f"SELECT DISTINCT regexp_extract(file_path, 'partition_key=([^/]+)', 1) AS partition_value "
         f"FROM iceberg_metadata({V3_CTAS_TABLE}) WHERE manifest_content = 'DATA' ORDER BY partition_value"
     ).fetchall()
@@ -1142,7 +1263,7 @@ def exercise_versioned_ctas(harness: RayIcebergHarness) -> None:
         [("0",), ("1",), ("2",), ("3",)],
         "distributed Iceberg v3 CTAS identity partitions",
     )
-    snapshots = connection.execute(
+    snapshots = local_connection.execute(
         f"SELECT count(*)::BIGINT, min(sequence_number), min(operation) " f"FROM iceberg_snapshots({V3_CTAS_TABLE})"
     ).fetchone()
     require_equal(
@@ -1154,17 +1275,18 @@ def exercise_versioned_ctas(harness: RayIcebergHarness) -> None:
 
 def exercise_v3_reads_and_append(harness: RayIcebergHarness) -> None:
     connection = harness.connection
+    local_connection = harness.local_connection
     timestamp_base = 1704067200000000000
     append_count = 16
     setup_write_count = harness.write_dispatch_count
 
-    connection.execute(
+    local_connection.execute(
         f"CREATE TABLE {V3_COMPAT_TABLE} ("
         "id INTEGER, category VARCHAR, event_time TIMESTAMP_NS, payload VARIANT"
         ") PARTITIONED BY (category) "
         f"WITH ('format-version' = '3', 'write.data.path' = '{DATA_ROOT}/v3-compat')"
     )
-    connection.execute(
+    local_connection.execute(
         f"INSERT INTO {V3_COMPAT_TABLE} "
         "SELECT i::INTEGER, "
         "CASE i % 4 WHEN 0 THEN 'A' WHEN 1 THEN 'B' WHEN 2 THEN 'C' ELSE 'D' END::VARCHAR, "
@@ -1172,14 +1294,14 @@ def exercise_v3_reads_and_append(harness: RayIcebergHarness) -> None:
         "{'origin': 'seed', 'source_id': i}::VARIANT "
         "FROM range(8) AS seed(i)"
     )
-    connection.execute(f"DELETE FROM {V3_COMPAT_TABLE} WHERE id IN (1, 6)")
+    local_connection.execute(f"DELETE FROM {V3_COMPAT_TABLE} WHERE id IN (1, 6)")
     require_equal(
         harness.write_dispatch_count,
         setup_write_count,
         "coordinator-side v3 seed and deletion-vector setup Ray dispatch count",
     )
 
-    puffin_paths = connection.execute(
+    puffin_paths = local_connection.execute(
         f"SELECT DISTINCT file_path FROM iceberg_metadata({V3_COMPAT_TABLE}) "
         "WHERE content = 'POSITION_DELETES' ORDER BY file_path"
     ).fetchall()
@@ -1189,7 +1311,7 @@ def exercise_v3_reads_and_append(harness: RayIcebergHarness) -> None:
         f"Iceberg v3 deletion vectors were not Puffin files: {puffin_paths!r}",
     )
     puffin_path = sql_string(puffin_paths[0][0])
-    puffin_container = connection.execute(
+    puffin_container = local_connection.execute(
         "WITH file AS ("
         f"  SELECT content AS bytes, size FROM read_blob({puffin_path})"
         "), footer_location AS ("
@@ -1275,7 +1397,7 @@ def exercise_v3_reads_and_append(harness: RayIcebergHarness) -> None:
         "v3 deletion vectors remain effective after distributed append",
         [(0,)],
     )
-    snapshots = connection.execute(
+    snapshots = local_connection.execute(
         f"SELECT sequence_number, operation FROM iceberg_snapshots({V3_COMPAT_TABLE}) ORDER BY sequence_number"
     ).fetchall()
     require_equal(
@@ -1287,6 +1409,7 @@ def exercise_v3_reads_and_append(harness: RayIcebergHarness) -> None:
 
 def exercise_v3_distributed_delete(harness: RayIcebergHarness) -> None:
     connection = harness.connection
+    local_connection = harness.local_connection
     vane = harness.vane
 
     # This partitioned table already has two native Puffin deletion vectors and
@@ -1306,7 +1429,7 @@ def exercise_v3_distributed_delete(harness: RayIcebergHarness) -> None:
         "distributed v3 DELETE result and unchanged row lineage",
         expected_lineage,
     )
-    partitioned_deletion_vectors = connection.execute(
+    partitioned_deletion_vectors = local_connection.execute(
         f"SELECT file_path FROM iceberg_metadata({V3_COMPAT_TABLE}) "
         "WHERE content = 'POSITION_DELETES' AND status != 'DELETED' ORDER BY file_path"
     ).fetchall()
@@ -1320,14 +1443,14 @@ def exercise_v3_distributed_delete(harness: RayIcebergHarness) -> None:
         f"distributed v3 DELETE produced non-Puffin artifacts: {partitioned_deletion_vectors!r}",
     )
     require_equal(
-        connection.execute(
+        local_connection.execute(
             f"SELECT sequence_number, operation FROM iceberg_snapshots({V3_COMPAT_TABLE}) ORDER BY sequence_number"
         ).fetchall(),
         [(1, "append"), (2, "delete"), (3, "append"), (4, "delete")],
         "distributed v3 DELETE snapshot history",
     )
 
-    snapshots_before_zero_match = connection.execute(
+    snapshots_before_zero_match = local_connection.execute(
         f"SELECT count(*) FROM iceberg_snapshots({V3_COMPAT_TABLE})"
     ).fetchone()
     harness.require_write(
@@ -1337,22 +1460,22 @@ def exercise_v3_distributed_delete(harness: RayIcebergHarness) -> None:
         ),
     )
     require_equal(
-        connection.execute(f"SELECT count(*) FROM iceberg_snapshots({V3_COMPAT_TABLE})").fetchone(),
+        local_connection.execute(f"SELECT count(*) FROM iceberg_snapshots({V3_COMPAT_TABLE})").fetchone(),
         snapshots_before_zero_match,
         "zero-match distributed v3 DELETE must not create a snapshot",
     )
 
     # Qualify the same replacement protocol for an unpartitioned single-file
     # table and then verify a stale source snapshot is rejected fail-closed.
-    connection.execute(
+    local_connection.execute(
         f"CREATE TABLE {V3_DELETE_TABLE} (id INTEGER, payload VARCHAR) "
         f"WITH ('format-version' = '3', 'write.data.path' = '{DATA_ROOT}/v3-delete')"
     )
-    connection.execute(
+    local_connection.execute(
         f"INSERT INTO {V3_DELETE_TABLE} "
         "SELECT i::INTEGER, ('value-' || i::VARCHAR)::VARCHAR FROM range(16) AS source(i)"
     )
-    connection.execute(f"DELETE FROM {V3_DELETE_TABLE} WHERE id IN (1, 3)")
+    local_connection.execute(f"DELETE FROM {V3_DELETE_TABLE} WHERE id IN (1, 3)")
     harness.require_write(
         "unpartitioned distributed Iceberg v3 DELETE with an existing DV",
         lambda: connection.table(V3_DELETE_TABLE).delete(condition=vane.ColumnExpression("id").isin(5, 7, 9)),
@@ -1362,7 +1485,7 @@ def exercise_v3_distributed_delete(harness: RayIcebergHarness) -> None:
         "unpartitioned distributed v3 DELETE result",
         [(row_id,) for row_id in range(16) if row_id not in {1, 3, 5, 7, 9}],
     )
-    unpartitioned_deletion_vectors = connection.execute(
+    unpartitioned_deletion_vectors = local_connection.execute(
         f"SELECT file_path FROM iceberg_metadata({V3_DELETE_TABLE}) "
         "WHERE content = 'POSITION_DELETES' AND status != 'DELETED'"
     ).fetchall()
@@ -1377,7 +1500,7 @@ def exercise_v3_distributed_delete(harness: RayIcebergHarness) -> None:
             condition=vane.ColumnExpression("id") == vane.ConstantExpression(11)
         )
     )
-    connection.execute(f"INSERT INTO {V3_DELETE_TABLE} VALUES (100, 'concurrent')")
+    local_connection.execute(f"INSERT INTO {V3_DELETE_TABLE} VALUES (100, 'concurrent')")
     client = harness.runner.query_driver_client
     if client is None:
         raise AssertionError("the Ray runner did not create a query driver client")
@@ -1395,9 +1518,12 @@ def exercise_v3_distributed_delete(harness: RayIcebergHarness) -> None:
 
 def exercise_v3_distributed_update(harness: RayIcebergHarness) -> None:
     connection = harness.connection
+    local_connection = harness.local_connection
     vane = harness.vane
 
-    variant_snapshot_count = connection.execute(f"SELECT count(*) FROM iceberg_snapshots({V3_COMPAT_TABLE})").fetchone()
+    variant_snapshot_count = local_connection.execute(
+        f"SELECT count(*) FROM iceberg_snapshots({V3_COMPAT_TABLE})"
+    ).fetchone()
     harness.require_rejected_write(
         "distributed Iceberg v3 UPDATE rejects raw VARIANT transport",
         lambda: connection.table(V3_COMPAT_TABLE).update(
@@ -1407,7 +1533,7 @@ def exercise_v3_distributed_update(harness: RayIcebergHarness) -> None:
         "Vane repartition transport cannot preserve raw VARIANT values",
     )
     require_equal(
-        connection.execute(f"SELECT count(*) FROM iceberg_snapshots({V3_COMPAT_TABLE})").fetchone(),
+        local_connection.execute(f"SELECT count(*) FROM iceberg_snapshots({V3_COMPAT_TABLE})").fetchone(),
         variant_snapshot_count,
         "rejected VARIANT UPDATE must not create an Iceberg snapshot",
     )
@@ -1422,7 +1548,7 @@ def exercise_v3_distributed_update(harness: RayIcebergHarness) -> None:
         "Vane repartition transport cannot preserve raw VARIANT values",
     )
     require_equal(
-        connection.execute(f"SELECT count(*) FROM iceberg_snapshots({V3_COMPAT_TABLE})").fetchone(),
+        local_connection.execute(f"SELECT count(*) FROM iceberg_snapshots({V3_COMPAT_TABLE})").fetchone(),
         variant_snapshot_count,
         "rejected VARIANT MERGE must not create an Iceberg snapshot",
     )
@@ -1437,7 +1563,7 @@ def exercise_v3_distributed_update(harness: RayIcebergHarness) -> None:
         "Vane repartition transport cannot preserve raw VARIANT values",
     )
     require_equal(
-        connection.execute(f"SELECT count(*) FROM iceberg_snapshots({V3_COMPAT_TABLE})").fetchone(),
+        local_connection.execute(f"SELECT count(*) FROM iceberg_snapshots({V3_COMPAT_TABLE})").fetchone(),
         variant_snapshot_count,
         "rejected predicate-only VARIANT MERGE must not create an Iceberg snapshot",
     )
@@ -1446,7 +1572,7 @@ def exercise_v3_distributed_update(harness: RayIcebergHarness) -> None:
     # and nested values that must survive the row rewrite. Seed two native DVs
     # in the affected partition, then replace them while preserving row lineage.
     setup_write_count = harness.write_dispatch_count
-    connection.execute(f"DELETE FROM {V3_CTAS_TABLE} WHERE id IN (1, 257)")
+    local_connection.execute(f"DELETE FROM {V3_CTAS_TABLE} WHERE id IN (1, 257)")
     require_equal(
         harness.write_dispatch_count,
         setup_write_count,
@@ -1457,7 +1583,7 @@ def exercise_v3_distributed_update(harness: RayIcebergHarness) -> None:
         "Iceberg v3 lineage before distributed UPDATE",
     )
     lineage_by_id = {int(row[0]): row for row in lineage_before}
-    active_dvs_before = connection.execute(
+    active_dvs_before = local_connection.execute(
         f"SELECT file_path FROM iceberg_metadata({V3_CTAS_TABLE}) "
         "WHERE content = 'POSITION_DELETES' AND status != 'DELETED' ORDER BY file_path"
     ).fetchall()
@@ -1471,7 +1597,7 @@ def exercise_v3_distributed_update(harness: RayIcebergHarness) -> None:
         ),
     )
 
-    latest_sequence = connection.execute(
+    latest_sequence = local_connection.execute(
         f"SELECT max(sequence_number) FROM iceberg_snapshots({V3_CTAS_TABLE})"
     ).fetchone()[0]
     lineage_after = harness.require_query(
@@ -1515,7 +1641,7 @@ def exercise_v3_distributed_update(harness: RayIcebergHarness) -> None:
         ],
     )
 
-    active_dvs_after = connection.execute(
+    active_dvs_after = local_connection.execute(
         f"SELECT file_path FROM iceberg_metadata({V3_CTAS_TABLE}) "
         "WHERE content = 'POSITION_DELETES' AND status != 'DELETED' ORDER BY file_path"
     ).fetchall()
@@ -1534,14 +1660,14 @@ def exercise_v3_distributed_update(harness: RayIcebergHarness) -> None:
         f"partitioned distributed v3 UPDATE produced non-Puffin artifacts: {active_dvs_after!r}",
     )
     require_equal(
-        connection.execute(
+        local_connection.execute(
             f"SELECT operation FROM iceberg_snapshots({V3_CTAS_TABLE}) " "ORDER BY sequence_number DESC LIMIT 1"
         ).fetchone(),
         ("overwrite",),
         "distributed v3 UPDATE snapshot operation",
     )
 
-    snapshots_before_zero_match = connection.execute(
+    snapshots_before_zero_match = local_connection.execute(
         f"SELECT count(*) FROM iceberg_snapshots({V3_CTAS_TABLE})"
     ).fetchone()
     harness.require_write(
@@ -1559,7 +1685,7 @@ def exercise_v3_distributed_update(harness: RayIcebergHarness) -> None:
         ),
     )
     require_equal(
-        connection.execute(f"SELECT count(*) FROM iceberg_snapshots({V3_CTAS_TABLE})").fetchone(),
+        local_connection.execute(f"SELECT count(*) FROM iceberg_snapshots({V3_CTAS_TABLE})").fetchone(),
         snapshots_before_zero_match,
         "zero-match and optimizer-empty distributed v3 UPDATEs must not create a snapshot",
     )
@@ -1571,7 +1697,7 @@ def exercise_v3_distributed_update(harness: RayIcebergHarness) -> None:
         "unpartitioned Iceberg v3 lineage before distributed UPDATE",
     )
     unpartitioned_by_id = {int(row[0]): row for row in unpartitioned_before}
-    unpartitioned_dvs_before = connection.execute(
+    unpartitioned_dvs_before = local_connection.execute(
         f"SELECT file_path FROM iceberg_metadata({V3_DELETE_TABLE}) "
         "WHERE content = 'POSITION_DELETES' AND status != 'DELETED'"
     ).fetchall()
@@ -1582,7 +1708,7 @@ def exercise_v3_distributed_update(harness: RayIcebergHarness) -> None:
             condition=vane.ColumnExpression("id").isin(11, 13),
         ),
     )
-    unpartitioned_sequence = connection.execute(
+    unpartitioned_sequence = local_connection.execute(
         f"SELECT max(sequence_number) FROM iceberg_snapshots({V3_DELETE_TABLE})"
     ).fetchone()[0]
     unpartitioned_after = harness.require_query(
@@ -1605,7 +1731,7 @@ def exercise_v3_distributed_update(harness: RayIcebergHarness) -> None:
                 unpartitioned_by_id[row_id][3],
                 f"unpartitioned v3 UPDATE unchanged-row sequence for row {row_id}",
             )
-    unpartitioned_dvs = connection.execute(
+    unpartitioned_dvs = local_connection.execute(
         f"SELECT file_path FROM iceberg_metadata({V3_DELETE_TABLE}) "
         "WHERE content = 'POSITION_DELETES' AND status != 'DELETED'"
     ).fetchall()
@@ -1625,8 +1751,8 @@ def exercise_v3_distributed_update(harness: RayIcebergHarness) -> None:
             condition=vane.ColumnExpression("id") == vane.ConstantExpression(15),
         )
     )
-    connection.execute(f"INSERT INTO {V3_DELETE_TABLE} VALUES (101, 'concurrent-update')")
-    snapshots_after_concurrent_commit = connection.execute(
+    local_connection.execute(f"INSERT INTO {V3_DELETE_TABLE} VALUES (101, 'concurrent-update')")
+    snapshots_after_concurrent_commit = local_connection.execute(
         f"SELECT count(*) FROM iceberg_snapshots({V3_DELETE_TABLE})"
     ).fetchone()
     client = harness.runner.query_driver_client
@@ -1638,7 +1764,7 @@ def exercise_v3_distributed_update(harness: RayIcebergHarness) -> None:
         "snapshot changed between the distributed UPDATE source scan and write planning",
     )
     require_equal(
-        connection.execute(f"SELECT count(*) FROM iceberg_snapshots({V3_DELETE_TABLE})").fetchone(),
+        local_connection.execute(f"SELECT count(*) FROM iceberg_snapshots({V3_DELETE_TABLE})").fetchone(),
         snapshots_after_concurrent_commit,
         "stale distributed v3 UPDATE must not create an Iceberg snapshot",
     )
@@ -1651,6 +1777,7 @@ def exercise_v3_distributed_update(harness: RayIcebergHarness) -> None:
 
 def exercise_v3_conflicts(harness: RayIcebergHarness) -> None:
     connection = harness.connection
+    local_connection = harness.local_connection
     vane = harness.vane
     conflict_tables = (
         (V3_SNAPSHOT_CONFLICT_TABLE, "v3-snapshot-conflict"),
@@ -1658,11 +1785,11 @@ def exercise_v3_conflicts(harness: RayIcebergHarness) -> None:
         (V3_SPEC_CONFLICT_TABLE, "v3-spec-conflict"),
     )
     for table, path_name in conflict_tables:
-        connection.execute(
+        local_connection.execute(
             f"CREATE TABLE {table} (id INTEGER, payload VARCHAR) "
             f"WITH ('format-version' = '3', 'write.data.path' = '{DATA_ROOT}/{path_name}')"
         )
-        connection.execute(f"INSERT INTO {table} VALUES (1, 'seed')")
+        local_connection.execute(f"INSERT INTO {table} VALUES (1, 'seed')")
 
     conflict_connection = open_catalog_connection(vane)
     try:
@@ -1726,6 +1853,7 @@ def exercise_v3_conflicts(harness: RayIcebergHarness) -> None:
 
 def exercise_ctas_failure_cleanup(harness: RayIcebergHarness) -> None:
     connection = harness.connection
+    local_connection = harness.local_connection
     failing_source = connection.sql(
         f"SELECT CASE WHEN id < 512 THEN id ELSE payload::INTEGER END AS id FROM {SOURCE_TABLE}"
     )
@@ -1740,13 +1868,13 @@ def exercise_ctas_failure_cleanup(harness: RayIcebergHarness) -> None:
         ),
         "Could not convert string",
     )
-    target_exists = connection.execute(
+    target_exists = local_connection.execute(
         "SELECT count(*) FROM information_schema.tables "
         f"WHERE table_catalog = '{CATALOG_NAME}' AND table_schema = 'default' "
         f"AND table_name = '{FAILED_CTAS_NAME}'"
     ).fetchone()
     require_equal(target_exists, (0,), "failed distributed CTAS catalog cleanup")
-    remaining_files = connection.execute(
+    remaining_files = local_connection.execute(
         f"SELECT count(*) FROM glob('{DATA_ROOT}/failed-ctas/**/*.parquet')"
     ).fetchone()
     require_equal(remaining_files, (0,), "failed distributed CTAS worker artifact cleanup")
@@ -1754,9 +1882,10 @@ def exercise_ctas_failure_cleanup(harness: RayIcebergHarness) -> None:
 
 def exercise_source_positional_deletes(harness: RayIcebergHarness) -> None:
     connection = harness.connection
+    local_connection = harness.local_connection
     vane = harness.vane
 
-    data_file_count = connection.execute(
+    data_file_count = local_connection.execute(
         f"SELECT count(DISTINCT file_path) FROM iceberg_metadata({SOURCE_TABLE}) " "WHERE manifest_content = 'DATA'"
     ).fetchone()[0]
     require_true(data_file_count >= SOURCE_PARTITIONS, "source table did not retain its multi-file write layout")
@@ -1765,7 +1894,7 @@ def exercise_source_positional_deletes(harness: RayIcebergHarness) -> None:
         "distributed multi-file positional DELETE",
         lambda: connection.table(SOURCE_TABLE).delete(condition=vane.ColumnExpression("id").isin(*deleted_ids)),
     )
-    delete_file_count = connection.execute(
+    delete_file_count = local_connection.execute(
         f"SELECT count(*) FROM iceberg_metadata({SOURCE_TABLE}) WHERE manifest_content = 'DELETE'"
     ).fetchone()[0]
     require_true(delete_file_count >= 1, "multi-file distributed DELETE did not commit delete metadata")
@@ -1783,8 +1912,9 @@ def exercise_source_positional_deletes(harness: RayIcebergHarness) -> None:
 
 def exercise_empty_and_zero_match(harness: RayIcebergHarness) -> None:
     connection = harness.connection
+    local_connection = harness.local_connection
     vane = harness.vane
-    connection.execute(
+    local_connection.execute(
         f"CREATE TABLE {EMPTY_TABLE} (id INTEGER, payload VARCHAR) "
         f"WITH ('format-version' = '2', 'write.data.path' = '{DATA_ROOT}/empty')"
     )
@@ -1796,7 +1926,7 @@ def exercise_empty_and_zero_match(harness: RayIcebergHarness) -> None:
         [(0,)],
     )
 
-    snapshot_count = connection.execute(f"SELECT count(*) FROM iceberg_snapshots({EMPTY_TABLE})").fetchone()
+    snapshot_count = local_connection.execute(f"SELECT count(*) FROM iceberg_snapshots({EMPTY_TABLE})").fetchone()
     harness.require_write(
         "zero-match distributed Iceberg UPDATE",
         lambda: connection.table(EMPTY_TABLE).update(
@@ -1811,7 +1941,7 @@ def exercise_empty_and_zero_match(harness: RayIcebergHarness) -> None:
         ),
     )
     require_equal(
-        connection.execute(f"SELECT count(*) FROM iceberg_snapshots({EMPTY_TABLE})").fetchone(),
+        local_connection.execute(f"SELECT count(*) FROM iceberg_snapshots({EMPTY_TABLE})").fetchone(),
         snapshot_count,
         "zero-match mutations must not create Iceberg snapshots",
     )
@@ -1819,8 +1949,9 @@ def exercise_empty_and_zero_match(harness: RayIcebergHarness) -> None:
 
 def exercise_partitioned_mutations(harness: RayIcebergHarness) -> None:
     connection = harness.connection
+    local_connection = harness.local_connection
     vane = harness.vane
-    connection.execute(
+    local_connection.execute(
         f"CREATE TABLE {PARTITION_TABLE} (id INTEGER, category VARCHAR, ts TIMESTAMP, payload VARCHAR) "
         f"PARTITIONED BY (category, year(ts)) "
         f"WITH ('format-version' = '2', 'write.data.path' = '{DATA_ROOT}/partitioned')"
@@ -1888,7 +2019,8 @@ def exercise_partitioned_mutations(harness: RayIcebergHarness) -> None:
 
 def exercise_schema_evolution(harness: RayIcebergHarness) -> None:
     connection = harness.connection
-    connection.execute(
+    local_connection = harness.local_connection
+    local_connection.execute(
         f"CREATE TABLE {SCHEMA_EVOLUTION_TABLE} (id INTEGER, measure INTEGER, obsolete VARCHAR) "
         f"WITH ('format-version' = '2', 'write.data.path' = '{DATA_ROOT}/schema-evolution')"
     )
@@ -1900,10 +2032,10 @@ def exercise_schema_evolution(harness: RayIcebergHarness) -> None:
         lambda: initial_values.insert_into(SCHEMA_EVOLUTION_TABLE),
     )
 
-    connection.execute(f"ALTER TABLE {SCHEMA_EVOLUTION_TABLE} RENAME measure TO metric")
-    connection.execute(f"ALTER TABLE {SCHEMA_EVOLUTION_TABLE} ALTER metric TYPE BIGINT")
-    connection.execute(f"ALTER TABLE {SCHEMA_EVOLUTION_TABLE} ADD COLUMN added VARCHAR")
-    connection.execute(f"ALTER TABLE {SCHEMA_EVOLUTION_TABLE} DROP COLUMN obsolete")
+    local_connection.execute(f"ALTER TABLE {SCHEMA_EVOLUTION_TABLE} RENAME measure TO metric")
+    local_connection.execute(f"ALTER TABLE {SCHEMA_EVOLUTION_TABLE} ALTER metric TYPE BIGINT")
+    local_connection.execute(f"ALTER TABLE {SCHEMA_EVOLUTION_TABLE} ADD COLUMN added VARCHAR")
+    local_connection.execute(f"ALTER TABLE {SCHEMA_EVOLUTION_TABLE} DROP COLUMN obsolete")
 
     evolved_values = connection.sql(
         f"SELECT id + 1 AS id, 9223372036854770000::BIGINT AS metric, 'new'::VARCHAR AS added "
@@ -1924,8 +2056,9 @@ def exercise_schema_evolution(harness: RayIcebergHarness) -> None:
 
 def exercise_conflicts_and_fail_closed_writes(harness: RayIcebergHarness) -> None:
     connection = harness.connection
+    local_connection = harness.local_connection
     vane = harness.vane
-    connection.execute(
+    local_connection.execute(
         f"CREATE TABLE {CONFLICT_TABLE} (id INTEGER, category VARCHAR) PARTITIONED BY (category) "
         f"WITH ('format-version' = '2', 'write.data.path' = '{DATA_ROOT}/conflict')"
     )
@@ -1940,8 +2073,8 @@ def exercise_conflicts_and_fail_closed_writes(harness: RayIcebergHarness) -> Non
     )
     # This direct SQL write is coordinator-side conflict setup. The stale
     # operation under test remains the captured Relation UPDATE submitted to Ray.
-    connection.execute(f"INSERT INTO {CONFLICT_TABLE} VALUES (2, 'B')")
-    snapshots_after_concurrent_commit = connection.execute(
+    local_connection.execute(f"INSERT INTO {CONFLICT_TABLE} VALUES (2, 'B')")
+    snapshots_after_concurrent_commit = local_connection.execute(
         f"SELECT count(*) FROM iceberg_snapshots({CONFLICT_TABLE})"
     ).fetchone()
     client = harness.runner.query_driver_client
@@ -1953,13 +2086,13 @@ def exercise_conflicts_and_fail_closed_writes(harness: RayIcebergHarness) -> Non
         "snapshot changed between the distributed UPDATE source scan and write planning",
     )
     require_equal(
-        connection.execute(f"SELECT count(*) FROM iceberg_snapshots({CONFLICT_TABLE})").fetchone(),
+        local_connection.execute(f"SELECT count(*) FROM iceberg_snapshots({CONFLICT_TABLE})").fetchone(),
         snapshots_after_concurrent_commit,
         "stale distributed UPDATE must not create an Iceberg snapshot",
     )
 
-    connection.execute(f"ALTER TABLE {CONFLICT_TABLE} RESET PARTITIONED BY")
-    snapshots_before_unpartitioned_insert = connection.execute(
+    local_connection.execute(f"ALTER TABLE {CONFLICT_TABLE} RESET PARTITIONED BY")
+    snapshots_before_unpartitioned_insert = local_connection.execute(
         f"SELECT count(*) FROM iceberg_snapshots({CONFLICT_TABLE})"
     ).fetchone()
     unpartitioned_values = connection.sql(
@@ -1970,7 +2103,7 @@ def exercise_conflicts_and_fail_closed_writes(harness: RayIcebergHarness) -> Non
         lambda: unpartitioned_values.insert_into(CONFLICT_TABLE),
     )
     require_equal(
-        connection.execute(f"SELECT count(*) FROM iceberg_snapshots({CONFLICT_TABLE})").fetchone(),
+        local_connection.execute(f"SELECT count(*) FROM iceberg_snapshots({CONFLICT_TABLE})").fetchone(),
         (snapshots_before_unpartitioned_insert[0] + 1,),
         "unpartitioned distributed INSERT snapshot count",
     )
@@ -2005,79 +2138,66 @@ def main() -> None:
     if ray.is_initialized():
         raise RuntimeError("the Ray wheel integration test must own its Ray cluster")
 
-    cluster = create_two_worker_cluster(ray)
-    connection = None
+    cluster = None
     try:
-        expected_nodes = execution_node_ids(ray)
-        vane.set_runner_ray(noop_if_initialized=True)
-        runner = runners.get_or_create_runner()
-        require_equal(getattr(runner, "name", None), "ray", "configured Vane runner")
+        with ExitStack() as connections:
+            local_connection = connections.enter_context(open_catalog_connection(vane, "local-fast"))
+            connection = connections.enter_context(open_catalog_connection(vane, "ray"))
+            require_true(not ray.is_initialized(), "opening Iceberg connections eagerly initialized Ray")
+            require_equal(local_connection.sql("SELECT 1")._get_runner_type(), "local-fast", "reference runner")
+            require_equal(connection.sql("SELECT 1")._get_runner_type(), "ray", "distributed runner")
 
-        connection = vane.connect(
-            ":memory:",
-            config={
-                "autoinstall_known_extensions": "false",
-                "autoload_known_extensions": "false",
-            },
-        )
-        for setting in ("autoinstall_known_extensions", "autoload_known_extensions"):
-            value = connection.execute(f"SELECT current_setting('{setting}')").fetchone()
-            require_equal(str(value[0]).lower(), "false", f"{setting} setting")
+            cluster = create_two_worker_cluster(ray)
+            expected_nodes = execution_node_ids(ray)
+            vane.set_runner_ray(noop_if_initialized=True)
+            runner = runners.get_or_create_runner()
+            require_equal(getattr(runner, "name", None), "ray", "configured Vane runner")
+            local_connection.execute(f"CREATE SCHEMA IF NOT EXISTS {CATALOG_NAME}.default")
+            drop_test_tables(local_connection)
 
-        load_packaged_dynamic_iceberg(connection)
-        connection.execute("LOAD httpfs")
-        configure_coordinator_s3(connection)
-        connection.execute("SET unsafe_enable_version_guessing = true")
-        connection.execute("SET TimeZone = 'UTC'")
-        connection.execute(
-            f"ATTACH '' AS {CATALOG_NAME} "
-            "(TYPE ICEBERG, CLIENT_ID 'admin', CLIENT_SECRET 'password', "
-            f"ENDPOINT '{CATALOG_ENDPOINT}', stage_create_tables true)"
-        )
-        connection.execute(f"CREATE SCHEMA IF NOT EXISTS {CATALOG_NAME}.default")
-        drop_test_tables(connection)
+            harness = RayIcebergHarness(vane, local_connection, connection, runner)
+            try:
+                run_scenario("persistent distributed reads", lambda: exercise_persistent_distributed_reads(harness))
+                run_scenario(
+                    "source/target writes and worker topology",
+                    lambda: exercise_source_target_and_topology(harness, ray, expected_nodes),
+                )
+                run_scenario("public SQL entrypoints", lambda: exercise_public_sql_entrypoints(harness))
+                run_scenario("distributed MERGE", lambda: exercise_distributed_merge(harness))
+                run_scenario("version-aware distributed CTAS", lambda: exercise_versioned_ctas(harness))
+                run_scenario("v3 distributed reads and append", lambda: exercise_v3_reads_and_append(harness))
+                run_scenario("v3 distributed DELETE", lambda: exercise_v3_distributed_delete(harness))
+                run_scenario("v3 distributed UPDATE", lambda: exercise_v3_distributed_update(harness))
+                run_scenario("v3 fail-closed write conflicts", lambda: exercise_v3_conflicts(harness))
+                run_scenario("distributed CTAS failure cleanup", lambda: exercise_ctas_failure_cleanup(harness))
+                run_scenario("source positional deletes", lambda: exercise_source_positional_deletes(harness))
+                run_scenario("empty and zero-match operations", lambda: exercise_empty_and_zero_match(harness))
+                run_scenario("partitioned mutations", lambda: exercise_partitioned_mutations(harness))
+                run_scenario("schema evolution", lambda: exercise_schema_evolution(harness))
+                run_scenario(
+                    "conflicts and fail-closed writes",
+                    lambda: exercise_conflicts_and_fail_closed_writes(harness),
+                )
+                require_true(harness.read_dispatch_count >= 29, "comprehensive suite did not exercise enough Ray reads")
+                require_true(
+                    harness.write_dispatch_count >= 37, "comprehensive suite did not exercise enough Ray writes"
+                )
 
-        harness = RayIcebergHarness(vane, connection, runner)
-        run_scenario("persistent distributed reads", lambda: exercise_persistent_distributed_reads(harness))
-        run_scenario(
-            "source/target writes and worker topology",
-            lambda: exercise_source_target_and_topology(harness, ray, expected_nodes),
-        )
-        run_scenario("distributed MERGE", lambda: exercise_distributed_merge(harness))
-        run_scenario("version-aware distributed CTAS", lambda: exercise_versioned_ctas(harness))
-        run_scenario("v3 distributed reads and append", lambda: exercise_v3_reads_and_append(harness))
-        run_scenario("v3 distributed DELETE", lambda: exercise_v3_distributed_delete(harness))
-        run_scenario("v3 distributed UPDATE", lambda: exercise_v3_distributed_update(harness))
-        run_scenario("v3 fail-closed write conflicts", lambda: exercise_v3_conflicts(harness))
-        run_scenario("distributed CTAS failure cleanup", lambda: exercise_ctas_failure_cleanup(harness))
-        run_scenario("source positional deletes", lambda: exercise_source_positional_deletes(harness))
-        run_scenario("empty and zero-match operations", lambda: exercise_empty_and_zero_match(harness))
-        run_scenario("partitioned mutations", lambda: exercise_partitioned_mutations(harness))
-        run_scenario("schema evolution", lambda: exercise_schema_evolution(harness))
-        run_scenario(
-            "conflicts and fail-closed writes",
-            lambda: exercise_conflicts_and_fail_closed_writes(harness),
-        )
-        require_true(harness.read_dispatch_count >= 29, "comprehensive suite did not exercise enough Ray reads")
-        require_true(harness.write_dispatch_count >= 37, "comprehensive suite did not exercise enough Ray writes")
-
-        drop_test_tables(connection)
-    finally:
-        try:
-            if connection is not None:
+                drop_test_tables(local_connection)
+            finally:
                 try:
-                    drop_test_tables(connection)
+                    drop_test_tables(local_connection)
                 except Exception:
                     # Preserve the primary test failure; the fixture volume is
                     # destroyed by the workflow's unconditional cleanup step.
                     pass
-                connection.close()
+    finally:
+        try:
+            vane.teardown_runner()
         finally:
-            try:
-                vane.teardown_runner()
-            finally:
-                if ray.is_initialized():
-                    ray.shutdown()
+            if ray.is_initialized():
+                ray.shutdown()
+            if cluster is not None:
                 cluster.shutdown()
 
 

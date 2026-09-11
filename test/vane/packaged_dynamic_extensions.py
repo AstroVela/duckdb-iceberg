@@ -5,10 +5,12 @@ from __future__ import annotations
 import os
 from importlib import import_module
 from importlib.metadata import entry_points
+from pathlib import Path
 
 
 def load_packaged_dynamic_iceberg(connection: object) -> None:
     """Load the exact installed Avro -> Iceberg descriptor graph."""
+    import vane
     from vane.extensions import DynamicExtensionDescriptor, DynamicExtensionResolver, LocalExtensionProvider
 
     trust_identity = os.environ.get("VANE_EXPECTED_EXTENSION_TRUST_IDENTITY")
@@ -48,28 +50,25 @@ def load_packaged_dynamic_iceberg(connection: object) -> None:
     if tuple(dependency.identity for dependency in iceberg.dependencies) != (avro.identity,):
         raise AssertionError("the Iceberg wheel must declare the exact Avro wheel as its sole dynamic dependency")
 
-    security = connection.execute(
-        """
-        SELECT
-            CAST(current_setting('allow_unsigned_extensions') AS BOOLEAN),
-            CAST(current_setting('autoinstall_known_extensions') AS BOOLEAN),
-            CAST(current_setting('autoload_known_extensions') AS BOOLEAN)
-        """
-    ).fetchone()
-    if security != (False, False, False):
-        raise AssertionError(f"dynamic extension security settings are not fail-closed: {security!r}")
+    # The caller supplies a fresh connection with explicit security options.
+    # Inspect its captured bootstrap without dispatching client-state SQL to Ray.
+    plan = vane.ray_cxx.PyLogicalPlan.from_duckdb_relation(connection.sql("SELECT 1"), None)
+    bootstrap = plan.__getstate__()[3]["bootstrap"]["config"]
+    for setting in ("allow_unsigned_extensions", "autoinstall_known_extensions", "autoload_known_extensions"):
+        if str(bootstrap[setting]).lower() != "false":
+            raise AssertionError(f"dynamic extension bootstrap must disable {setting}")
 
+    def require_no_native_install() -> None:
+        directory = Path(vane._native._dynamic_extension_directory(connection=connection))
+        for name in ("avro", "iceberg"):
+            if os.path.lexists(directory / f"{name}.duckdb_extension"):
+                raise AssertionError(f"{name!r} has a native installed artifact outside the provider graph")
+
+    require_no_native_install()
     for extension_name in ("avro", "iceberg"):
-        state = connection.execute(
-            "SELECT loaded, installed, install_mode FROM duckdb_extensions() WHERE extension_name = ?",
-            [extension_name],
-        ).fetchone()
-        if state is None:
-            raise AssertionError(f"DuckDB does not expose extension state for {extension_name!r}")
-        if state != (False, False, "NOT_INSTALLED"):
-            raise AssertionError(
-                f"{extension_name!r} was already installed or linked before resolver loading: {state!r}"
-            )
+        state = vane._native._loaded_dynamic_extension(extension_name, connection=connection)
+        if state is not None:
+            raise AssertionError(f"{extension_name!r} was already loaded before resolver loading: {state!r}")
 
     resolved = DynamicExtensionResolver(
         trusted_identities={trust_identity},
@@ -78,12 +77,16 @@ def load_packaged_dynamic_iceberg(connection: object) -> None:
     if resolved.descriptor != iceberg:
         raise AssertionError("resolver did not return the exact Iceberg descriptor")
 
+    require_no_native_install()
     for extension_name in ("avro", "iceberg"):
-        state = connection.execute(
-            "SELECT loaded, installed, install_mode FROM duckdb_extensions() WHERE extension_name = ?",
-            [extension_name],
-        ).fetchone()
-        if state != (True, False, "NOT_INSTALLED"):
+        state = vane._native._loaded_dynamic_extension(extension_name, connection=connection)
+        if (
+            state is None
+            or state["canonical_name"] != extension_name
+            or state["install_mode"] != "NOT_INSTALLED"
+            or state["extension_version"] != descriptors[extension_name].extension_version
+            or not state["full_path"]
+        ):
             raise AssertionError(f"{extension_name!r} did not load dynamically from its provider wheel: {state!r}")
 
 

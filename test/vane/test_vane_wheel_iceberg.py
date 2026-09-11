@@ -57,6 +57,7 @@ def main() -> None:
     connection = vane.connect(
         ":memory:",
         config={
+            "allow_unsigned_extensions": "false",
             "autoinstall_known_extensions": "false",
             "autoload_known_extensions": "false",
         },
