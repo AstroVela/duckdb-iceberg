@@ -75,6 +75,14 @@ source.create(
 )
 ```
 
+The packaged integration suite uses independent `local-fast` and Ray
+connections. It compares parameterized `execute()` and `sql()` reads with
+derived Relations, and checks SQL CTAS, INSERT, UPDATE, DELETE and MERGE for
+Iceberg v2 and v3. Each mutation verifies committed rows and snapshot counts
+through the local connection, while dispatch assertions prove which runner
+executed it. Changing the process runner default leaves both existing
+connections and their Relations on their original execution paths.
+
 The worker COPY schema is derived from the requested format version before any
 files are written. The two-worker Ray integration lane covers partitioned v2
 CTAS and v3 CTAS, reads and writes spec-compliant Puffin deletion vectors,

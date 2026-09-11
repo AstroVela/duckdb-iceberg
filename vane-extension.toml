@@ -6,7 +6,7 @@ native_test_selection = "test/sql/local/iceberg_scans/iceberg_v1_existing_manife
 
 [vane]
 repository = "AstroVela/vane"
-revision = "472df75ab51fd3eac2642f6646545075549e5921"
+revision = "386886c28208cf8292f26fe8741ac38307da165b"
 
 [vcpkg]
 repository = "microsoft/vcpkg"
