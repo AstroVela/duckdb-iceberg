@@ -1397,7 +1397,9 @@ jobs:
           exit 1
 
       - name: Exercise the indexed providers through two Ray workers
-        run: .venv-vane-testpypi-ray/bin/python -I test/vane/test_vane_wheel_ray_iceberg.py
+        run: |
+          .venv-vane-testpypi-ray/bin/python -I test/vane/test_vane_wheel_ray_iceberg.py
+          .venv-vane-testpypi-ray/bin/python -I test/vane/test_vane_wheel_ray_metadata.py
 
       - name: Stop local Iceberg fixture
         if: always()
@@ -1759,6 +1761,7 @@ jobs:
           python -m pip install --disable-pip-version-check \
             "${base_wheels[0]}" "${avro_wheels[0]}" "${iceberg_wheels[0]}"
           python -I test/vane/test_vane_wheel_ray_iceberg.py
+          python -I test/vane/test_vane_wheel_ray_metadata.py
 
       - name: Stop local Iceberg fixture
         if: always()
