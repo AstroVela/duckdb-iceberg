@@ -174,7 +174,7 @@ def check_files(harness: MetadataHarness) -> None:
     ]
     harness.query(f"SELECT * FROM {metadata_source(LINEITEM)} ORDER BY status", expected)
     harness.query(
-        f"SELECT file_format, sum(record_count) FROM {metadata_source(LINEITEM)} WHERE status='ADDED' GROUP BY file_format",
+        f"SELECT file_format, sum(record_count)::BIGINT FROM {metadata_source(LINEITEM)} WHERE status='ADDED' GROUP BY file_format",
         [("PARQUET", 51793)],
     )
     harness.query(
@@ -226,7 +226,7 @@ def check_bound_version(harness: MetadataHarness, root: Path) -> None:
     hint = table / "metadata/version-hint.text"
     for function, expected, projection in (
         ("iceberg_snapshots", [(1,)], "count(*)"),
-        ("iceberg_metadata", [(60175,)], "sum(record_count)"),
+        ("iceberg_metadata", [(60175,)], "sum(record_count)::BIGINT"),
     ):
         hint.write_text("1")
         suffix = ", allow_moved_paths=true" if function == "iceberg_metadata" else ""
@@ -250,7 +250,7 @@ def check_many_snapshots(harness: MetadataHarness, root: Path) -> None:
         "SELECT * FROM iceberg_snapshots(?) ORDER BY sequence_number", snapshot_rows(metadata), params=[str(path)]
     )
     harness.query(
-        "SELECT count(*), count(DISTINCT snapshot_id), sum(sequence_number) FROM iceberg_snapshots(?)",
+        "SELECT count(*), count(DISTINCT snapshot_id), sum(sequence_number)::BIGINT FROM iceberg_snapshots(?)",
         [(4101, 4101, 4101 * 4102 // 2)],
         params=[str(path)],
     )
@@ -287,19 +287,19 @@ def check_catalog(harness: MetadataHarness, writer: object, format_version: int)
             snapshot_rows(rest_metadata(name)),
         )
         harness.query(
-            f"SELECT sum(record_count) FROM iceberg_metadata({sql_string(table)})",
+            f"SELECT sum(record_count)::BIGINT FROM iceberg_metadata({sql_string(table)})",
             [(2,)],
             before_dispatch=lambda: writer.sql("SELECT 3::INTEGER AS id").insert_into(table),
         )
-        harness.query(f"SELECT sum(record_count) FROM iceberg_metadata({sql_string(table)})", [(3,)])
+        harness.query(f"SELECT sum(record_count)::BIGINT FROM iceberg_metadata({sql_string(table)})", [(3,)])
         harness.query(
-            f"SELECT sum(record_count) FROM iceberg_metadata({sql_string(table)}, snapshot_from_id={first['current-snapshot-id']})",
+            f"SELECT sum(record_count)::BIGINT FROM iceberg_metadata({sql_string(table)}, snapshot_from_id={first['current-snapshot-id']})",
             [(1,)],
         )
         # Latest lookup uses the current schema, while time travel uses the
         # snapshot schema. Preserve both after schema-only catalog commits.
         writer.execute(f"ALTER TABLE {table} ADD COLUMN added VARCHAR")
-        harness.query(f"SELECT sum(record_count) FROM iceberg_metadata({sql_string(table)})", [(3,)])
+        harness.query(f"SELECT sum(record_count)::BIGINT FROM iceberg_metadata({sql_string(table)})", [(3,)])
     finally:
         writer.execute(f"DROP TABLE IF EXISTS {table}")
 
