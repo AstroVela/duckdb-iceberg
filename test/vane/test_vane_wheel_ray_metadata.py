@@ -98,20 +98,24 @@ def open_connection(vane: object) -> object:
 
 class MetadataHarness:
     def __init__(self, connection: object, runner: object):
+        from vane._ray_cxx import require_ray_cxx_attr
+
         self.connection = connection
         self.runner = runner
+        self.plan_type = require_ray_cxx_attr("PyLogicalPlan")
         self.original_read = runner.run_iter_tables
         self.reads = 0
         self.before_dispatch = None
         runner.run_iter_tables = self.dispatch
 
-    def dispatch(self, *args: object, **kwargs: object) -> object:
+    def dispatch(self, logical_plan: object) -> object:
+        require_equal(isinstance(logical_plan, self.plan_type), True, "already-bound plan at Ray dispatch")
         self.reads += 1
         hook, self.before_dispatch = self.before_dispatch, None
         if hook is not None:
             # Vane has already bound and copied the native plan at this point.
             hook()
-        return self.original_read(*args, **kwargs)
+        return self.original_read(logical_plan)
 
     def query(self, sql: str, expected: list[tuple], *, params: list | None = None, before_dispatch=None) -> None:
         before = self.reads
