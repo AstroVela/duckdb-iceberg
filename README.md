@@ -93,6 +93,7 @@ is not part of this lane.
 | Distributed capability | Iceberg v2 | Iceberg v3 |
 | --- | --- | --- |
 | Data scans | Supported, including positional and equality deletes | Supported, including Puffin deletion vectors |
+| `iceberg_snapshots()` and `iceberg_metadata()` | Supported through a single Ray scan task | Supported through a single Ray scan task |
 | `INSERT` into an existing table | Supported | Supported, with row-ID and sequence-number assignment |
 | `CREATE TABLE AS` | Supported with an explicit worker data path and staged catalog creation | Supported under the same constraints, including initial row lineage |
 | `VARIANT` and `TIMESTAMP_NS` | Not Iceberg v2 types | Supported; legacy Parquet VARIANT decoding remains rejected |
@@ -108,6 +109,15 @@ is used.
 
 Scan splits materialize the coordinator's selected files and delete state,
 including transaction-local changes visible when the plan is created.
+
+`iceberg_snapshots()` and `iceberg_metadata()` resolve the catalog entry or
+version hint during binding and carry the immutable metadata file path to one
+Ray task. `iceberg_metadata()` also pins the selected snapshot and schema,
+including historical ID/timestamp lookups. Workers read that metadata file and
+its manifests through their own filesystem session; the files and storage
+authorization must remain available on the workers. Later catalog commits or
+version-hint changes do not change an already bound query. Manifest entries and
+scan cursors stay in execution state instead of being serialized into the plan.
 
 Workers produce immutable data/delete artifacts. Coordinator finalization
 validates the selected artifacts and adds them to the ordinary Iceberg catalog

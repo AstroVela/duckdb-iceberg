@@ -20,6 +20,12 @@
 #include "duckdb/common/file_opener.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/string.hpp"
+#include "duckdb/common/serializer/deserializer.hpp"
+#include "duckdb/common/serializer/serializer.hpp"
+
+#ifdef ICEBERG_VANE_DISTRIBUTED
+#include "duckdb/function/distributed_table_function.hpp"
+#endif
 
 #include "function/iceberg_functions.hpp"
 #include "common/iceberg_utils.hpp"
@@ -66,19 +72,81 @@ static vector<string> IcebergManifestNames() {
 }
 
 struct IcebergMetaDataBindData : public TableFunctionData {
-	unique_ptr<IcebergManifestList> iceberg_table;
+	string filename;
+	string metadata_path;
+	string metadata_compression_codec;
+	bool allow_moved_paths = false;
+	bool has_snapshot = false;
+	int64_t snapshot_id = 0;
+	int32_t schema_id = 0;
+
+	unique_ptr<FunctionData> Copy() const override {
+		auto result = make_uniq<IcebergMetaDataBindData>();
+		result->filename = filename;
+		result->metadata_path = metadata_path;
+		result->metadata_compression_codec = metadata_compression_codec;
+		result->allow_moved_paths = allow_moved_paths;
+		result->has_snapshot = has_snapshot;
+		result->snapshot_id = snapshot_id;
+		result->schema_id = schema_id;
+		return std::move(result);
+	}
+
+	bool Equals(const FunctionData &other_p) const override {
+		auto &other = other_p.Cast<IcebergMetaDataBindData>();
+		return filename == other.filename && metadata_path == other.metadata_path &&
+		       metadata_compression_codec == other.metadata_compression_codec &&
+		       allow_moved_paths == other.allow_moved_paths && has_snapshot == other.has_snapshot &&
+		       snapshot_id == other.snapshot_id && schema_id == other.schema_id;
+	}
+
+	static void Serialize(Serializer &serializer, const optional_ptr<FunctionData> bind_data, const TableFunction &) {
+		auto &data = bind_data->Cast<IcebergMetaDataBindData>();
+		serializer.WriteProperty(100, "filename", data.filename);
+		serializer.WriteProperty(101, "metadata_path", data.metadata_path);
+		serializer.WriteProperty(102, "metadata_compression_codec", data.metadata_compression_codec);
+		serializer.WriteProperty(103, "allow_moved_paths", data.allow_moved_paths);
+		serializer.WriteProperty(104, "has_snapshot", data.has_snapshot);
+		serializer.WriteProperty(105, "snapshot_id", data.snapshot_id);
+		serializer.WriteProperty(106, "schema_id", data.schema_id);
+	}
+
+	static unique_ptr<FunctionData> Deserialize(Deserializer &deserializer, TableFunction &) {
+		auto result = make_uniq<IcebergMetaDataBindData>();
+		result->filename = deserializer.ReadProperty<string>(100, "filename");
+		result->metadata_path = deserializer.ReadProperty<string>(101, "metadata_path");
+		result->metadata_compression_codec = deserializer.ReadProperty<string>(102, "metadata_compression_codec");
+		result->allow_moved_paths = deserializer.ReadProperty<bool>(103, "allow_moved_paths");
+		result->has_snapshot = deserializer.ReadProperty<bool>(104, "has_snapshot");
+		result->snapshot_id = deserializer.ReadProperty<int64_t>(105, "snapshot_id");
+		result->schema_id = deserializer.ReadProperty<int32_t>(106, "schema_id");
+		return std::move(result);
+	}
 };
 
 struct IcebergMetaDataGlobalTableFunctionState : public GlobalTableFunctionState {
 public:
-	IcebergMetaDataGlobalTableFunctionState() {
-
-	};
-
 	static unique_ptr<GlobalTableFunctionState> Init(ClientContext &context, TableFunctionInitInput &input) {
-		return make_uniq<IcebergMetaDataGlobalTableFunctionState>();
+		auto result = make_uniq<IcebergMetaDataGlobalTableFunctionState>();
+		auto &bind_data = input.bind_data->Cast<IcebergMetaDataBindData>();
+		if (!bind_data.has_snapshot) {
+			return std::move(result);
+		}
+		auto &fs = FileSystem::GetFileSystem(context);
+		auto caching_fs = make_shared_ptr<CachingFileSystemWrapper>(fs, *context.db);
+		auto table_metadata =
+		    IcebergTableMetadata::Parse(bind_data.metadata_path, *caching_fs, bind_data.metadata_compression_codec);
+		auto metadata = IcebergTableMetadata::FromTableMetadata(table_metadata);
+		IcebergOptions options;
+		options.allow_moved_paths = bind_data.allow_moved_paths;
+		IcebergSnapshotScanInfo snapshot;
+		snapshot.snapshot = metadata.GetSnapshotById(bind_data.snapshot_id);
+		snapshot.schema_id = bind_data.schema_id;
+		result->iceberg_table = IcebergManifestList::Load(bind_data.filename, metadata, snapshot, context, options);
+		return std::move(result);
 	}
 
+	unique_ptr<IcebergManifestList> iceberg_table;
 	idx_t current_manifest_idx = 0;
 	idx_t current_manifest_entry_idx = 0;
 };
@@ -109,37 +177,44 @@ static unique_ptr<FunctionData> IcebergMetaDataBind(ClientContext &context, Tabl
 			auto value = StringValue::Get(kv.second);
 			auto string_substitutions = IcebergUtils::CountOccurrences(value, "%s");
 			if (string_substitutions != 2) {
-				throw InvalidInputException(
-				    "'version_name_format' has to contain two occurrences of '%%s' in it, found %d",
-				    string_substitutions);
+				throw InvalidInputException("'version_name_format' has to contain two "
+				                            "occurrences of '%%s' in it, found %d",
+				                            string_substitutions);
 			}
 			options.version_name_format = value;
 		} else if (loption == "snapshot_from_id") {
 			if (snapshot_lookup.GetSource() != SnapshotSource::LATEST) {
-				throw InvalidInputException(
-				    "Can't use 'snapshot_from_id' in combination with 'snapshot_from_timestamp'");
+				throw InvalidInputException("Can't use 'snapshot_from_id' in combination with "
+				                            "'snapshot_from_timestamp'");
 			}
 			snapshot_lookup.SetSource(SnapshotSource::FROM_ID);
 			snapshot_lookup.snapshot_id = val.GetValue<uint64_t>();
 		} else if (loption == "snapshot_from_timestamp") {
 			if (snapshot_lookup.GetSource() != SnapshotSource::LATEST) {
-				throw InvalidInputException(
-				    "Can't use 'snapshot_from_id' in combination with 'snapshot_from_timestamp'");
+				throw InvalidInputException("Can't use 'snapshot_from_id' in combination with "
+				                            "'snapshot_from_timestamp'");
 			}
 			snapshot_lookup.SetSource(SnapshotSource::FROM_TIMESTAMP);
 			snapshot_lookup.snapshot_timestamp = val.GetValue<timestamp_t>();
 		}
 	}
 
-	auto iceberg_meta_path = IcebergTableMetadata::GetMetaDataPath(context, filename, fs, options);
+	//! Keep the immutable metadata file and selected snapshot, never a catalog
+	//! lookup or mutable version hint.
+	ret->filename = filename;
+	ret->metadata_path = IcebergTableMetadata::GetMetaDataPath(context, filename, fs, options);
+	ret->metadata_compression_codec = options.metadata_compression_codec;
+	ret->allow_moved_paths = options.allow_moved_paths;
 	auto table_metadata =
-	    IcebergTableMetadata::Parse(iceberg_meta_path, *caching_fs, options.metadata_compression_codec);
+	    IcebergTableMetadata::Parse(ret->metadata_path, *caching_fs, options.metadata_compression_codec);
 	auto metadata = IcebergTableMetadata::FromTableMetadata(table_metadata);
 
 	auto snapshot_to_scan = metadata.GetSnapshot(options.snapshot_lookup);
 
 	if (snapshot_to_scan.snapshot) {
-		ret->iceberg_table = IcebergManifestList::Load(filename, metadata, snapshot_to_scan, context, options);
+		ret->has_snapshot = true;
+		ret->snapshot_id = snapshot_to_scan.snapshot->snapshot_id;
+		ret->schema_id = snapshot_to_scan.schema_id;
 	}
 
 	auto manifest_types = IcebergManifestTypes();
@@ -162,16 +237,15 @@ static void AddString(Vector &vec, idx_t index, string_t &&str) {
 }
 
 static void IcebergMetaDataFunction(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
-	auto &bind_data = data.bind_data->Cast<IcebergMetaDataBindData>();
 	auto &global_state = data.global_state->Cast<IcebergMetaDataGlobalTableFunctionState>();
 
-	if (!bind_data.iceberg_table) {
+	if (!global_state.iceberg_table) {
 		//! Table is empty
 		return;
 	}
 
 	idx_t out = 0;
-	auto &table_entries = bind_data.iceberg_table->GetManifestFilesConst();
+	auto &table_entries = global_state.iceberg_table->GetManifestFilesConst();
 	for (; global_state.current_manifest_idx < table_entries.size(); global_state.current_manifest_idx++) {
 		auto &table_entry = table_entries[global_state.current_manifest_idx];
 		auto &entries = table_entry.manifest_entries;
@@ -219,6 +293,11 @@ TableFunctionSet IcebergFunctions::GetIcebergMetadataFunction() {
 	fun.named_parameters["version_name_format"] = LogicalType::VARCHAR;
 	fun.named_parameters["snapshot_from_timestamp"] = LogicalType::TIMESTAMP;
 	fun.named_parameters["snapshot_from_id"] = LogicalType::UBIGINT;
+	fun.serialize = IcebergMetaDataBindData::Serialize;
+	fun.deserialize = IcebergMetaDataBindData::Deserialize;
+#ifdef ICEBERG_VANE_DISTRIBUTED
+	fun.SetDistributedScanCallbacks(MakeDistributedSingletonSourceCallbacks());
+#endif
 	function_set.AddFunction(fun);
 
 	return function_set;

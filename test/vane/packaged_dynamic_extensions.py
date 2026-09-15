@@ -51,21 +51,27 @@ def load_packaged_dynamic_iceberg(connection: object) -> None:
     security = connection.execute(
         """
         SELECT
-            CAST(current_setting('allow_unsigned_extensions') AS BOOLEAN),
-            CAST(current_setting('autoinstall_known_extensions') AS BOOLEAN),
-            CAST(current_setting('autoload_known_extensions') AS BOOLEAN)
+            current_setting('allow_unsigned_extensions'),
+            current_setting('autoinstall_known_extensions'),
+            current_setting('autoload_known_extensions')
         """
     ).fetchone()
     if security != (False, False, False):
         raise AssertionError(f"dynamic extension security settings are not fail-closed: {security!r}")
 
+    def extension_state(extension_name: str) -> tuple:
+        # Direct system-table reads are connection metadata operations. Apply
+        # filtering in Python to stay inside Vane's native read allowlist.
+        rows = connection.execute(
+            "SELECT extension_name, loaded, installed, install_mode FROM duckdb_extensions()"
+        ).fetchall()
+        matches = [row[1:] for row in rows if row[0] == extension_name]
+        if len(matches) != 1:
+            raise AssertionError(f"expected one extension state for {extension_name!r}, got {matches!r}")
+        return matches[0]
+
     for extension_name in ("avro", "iceberg"):
-        state = connection.execute(
-            "SELECT loaded, installed, install_mode FROM duckdb_extensions() WHERE extension_name = ?",
-            [extension_name],
-        ).fetchone()
-        if state is None:
-            raise AssertionError(f"DuckDB does not expose extension state for {extension_name!r}")
+        state = extension_state(extension_name)
         if state != (False, False, "NOT_INSTALLED"):
             raise AssertionError(
                 f"{extension_name!r} was already installed or linked before resolver loading: {state!r}"
@@ -79,10 +85,7 @@ def load_packaged_dynamic_iceberg(connection: object) -> None:
         raise AssertionError("resolver did not return the exact Iceberg descriptor")
 
     for extension_name in ("avro", "iceberg"):
-        state = connection.execute(
-            "SELECT loaded, installed, install_mode FROM duckdb_extensions() WHERE extension_name = ?",
-            [extension_name],
-        ).fetchone()
+        state = extension_state(extension_name)
         if state != (True, False, "NOT_INSTALLED"):
             raise AssertionError(f"{extension_name!r} did not load dynamically from its provider wheel: {state!r}")
 

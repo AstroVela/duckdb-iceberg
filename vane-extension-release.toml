@@ -8,7 +8,8 @@ native_test_selection = "test/sql/local/iceberg_scans/iceberg_v1_existing_manife
 
 [vane]
 repository = "AstroVela/vane"
-revision = "033b549afcb498633fd6669b26c054c00363004e"
+# Keep publication qualification on the runtime exercised by regular CI.
+revision = "88b5b75a6bfd51b03998ca457083db6dbbe51bb8"
 
 [vcpkg]
 repository = "microsoft/vcpkg"
