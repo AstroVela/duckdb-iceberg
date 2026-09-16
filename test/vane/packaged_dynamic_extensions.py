@@ -60,15 +60,13 @@ def load_packaged_dynamic_iceberg(connection: object) -> None:
         raise AssertionError(f"dynamic extension security settings are not fail-closed: {security!r}")
 
     def extension_state(extension_name: str) -> tuple:
-        # Direct system-table reads are connection metadata operations. Apply
-        # filtering in Python to stay inside Vane's native read allowlist.
         rows = connection.execute(
-            "SELECT extension_name, loaded, installed, install_mode FROM duckdb_extensions()"
+            "SELECT loaded, installed, install_mode FROM duckdb_extensions() WHERE extension_name = ?",
+            [extension_name],
         ).fetchall()
-        matches = [row[1:] for row in rows if row[0] == extension_name]
-        if len(matches) != 1:
-            raise AssertionError(f"expected one extension state for {extension_name!r}, got {matches!r}")
-        return matches[0]
+        if len(rows) != 1:
+            raise AssertionError(f"expected one extension state for {extension_name!r}, got {rows!r}")
+        return rows[0]
 
     for extension_name in ("avro", "iceberg"):
         state = extension_state(extension_name)
