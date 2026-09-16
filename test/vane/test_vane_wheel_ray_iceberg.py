@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
@@ -57,6 +58,11 @@ MERGE_V2_TABLE = f"{CATALOG_NAME}.default.{MERGE_V2_NAME}"
 MERGE_V3_TABLE = f"{CATALOG_NAME}.default.{MERGE_V3_NAME}"
 MERGE_SELF_TABLE = f"{CATALOG_NAME}.default.{MERGE_SELF_NAME}"
 FAILED_CTAS_TABLE = f"{CATALOG_NAME}.default.{FAILED_CTAS_NAME}"
+SQL_API_TABLES = {
+    (method, version): f"{CATALOG_NAME}.default.vane_wheel_ray_sql_{method}_v{version}"
+    for method in ("execute", "sql")
+    for version in (2, 3)
+}
 TABLES = (
     TARGET_TABLE,
     SOURCE_TABLE,
@@ -74,6 +80,7 @@ TABLES = (
     MERGE_V3_TABLE,
     MERGE_SELF_TABLE,
     FAILED_CTAS_TABLE,
+    *SQL_API_TABLES.values(),
 )
 DATA_ROOT = "s3://warehouse/vane-wheel-ray-integration"
 WORKER_COUNT = 2
@@ -235,13 +242,15 @@ class RayIcebergHarness:
         self._original_run_iter_tables = runner.run_iter_tables
         self._original_run_write = runner.run_write
 
-        def record_distributed_read(*args: object, **kwargs: object) -> object:
+        def record_distributed_read(logical_plan: object) -> object:
+            require_true(isinstance(logical_plan, vane.ray_cxx.PyLogicalPlan), "Ray read requires a bound plan")
             self.read_dispatch_count += 1
-            return self._original_run_iter_tables(*args, **kwargs)
+            return self._original_run_iter_tables(logical_plan)
 
-        def record_distributed_write(*args: object, **kwargs: object) -> object:
+        def record_distributed_write(logical_plan: object) -> object:
+            require_true(isinstance(logical_plan, vane.ray_cxx.PyLogicalPlan), "Ray write requires a bound plan")
             self.write_dispatch_count += 1
-            return self._original_run_write(*args, **kwargs)
+            return self._original_run_write(logical_plan)
 
         self._record_distributed_write = record_distributed_write
         runner.run_iter_tables = record_distributed_read
@@ -657,6 +666,87 @@ def exercise_source_target_and_topology(
         "distributed Iceberg UPDATE row count",
         [(SOURCE_ROW_COUNT // 64,)],
     )
+
+
+def exercise_public_sql_entrypoints(harness: RayIcebergHarness) -> None:
+    connection = harness.connection
+
+    def snapshots(table: str) -> list[dict]:
+        name = table.rsplit(".", 1)[1]
+        with urllib.request.urlopen(f"{CATALOG_ENDPOINT}/v1/namespaces/default/tables/{name}", timeout=10) as response:
+            return json.load(response)["metadata"]["snapshots"]
+
+    source_snapshots = snapshots(SOURCE_TABLE)
+    for method in ("execute", "sql"):
+        invoke = getattr(connection, method)
+        parameter_name = "parameters" if method == "execute" else "params"
+        query = f"SELECT id, payload FROM {SOURCE_TABLE} WHERE id >= ? AND id < ? ORDER BY id"
+        before = harness.read_dispatch_count
+        rows = invoke(query, **{parameter_name: [2, 5]}).fetchall()
+        require_equal(rows, [(i, f"value-{i}") for i in range(2, 5)], f"{method} SELECT parameters")
+        require_equal(harness.read_dispatch_count, before + 1, f"{method} SELECT Ray dispatch")
+
+        for version in (2, 3):
+            target = SQL_API_TABLES[method, version]
+            label = f"Ray {method} Iceberg v{version}"
+            expected_rows = [(i, f"value-{i}") for i in range(4)]
+            snapshot_count = 0
+
+            def write(statement: str, parameters: list[object], description: str) -> None:
+                nonlocal snapshot_count
+                before_reads = harness.read_dispatch_count
+                before_writes = harness.write_dispatch_count
+                invoke(statement, **{parameter_name: parameters})
+                require_equal(
+                    harness.write_dispatch_count, before_writes + 1, f"{label} {description} Ray write dispatch"
+                )
+                require_equal(harness.read_dispatch_count, before_reads, f"{label} {description} read dispatch")
+                # Read committed rows through the other public SQL API;
+                # Python supplies the expected data, REST the snapshots.
+                read_back = connection.sql if method == "execute" else connection.execute
+                require_equal(
+                    read_back(f"SELECT id, payload FROM {target} ORDER BY id").fetchall(),
+                    expected_rows,
+                    f"{label} {description} committed rows",
+                )
+                require_equal(harness.read_dispatch_count, before_reads + 1, f"{label} read-back Ray dispatch")
+                snapshot_count += 1
+                require_equal(len(snapshots(target)), snapshot_count, f"{label} {description} snapshot count")
+
+            write(
+                f"CREATE TABLE {target} WITH ('format-version' = '{version}', "
+                f"'write.data.path' = '{DATA_ROOT}/sql-{method}-v{version}') "
+                f"AS SELECT id, payload FROM {SOURCE_TABLE} WHERE id < ?",
+                [4],
+                "CTAS",
+            )
+            expected_rows.extend((i, f"value-{i}") for i in range(4, 6))
+            write(
+                f"INSERT INTO {target} SELECT id, payload FROM {SOURCE_TABLE} WHERE id >= ? AND id < ?",
+                [4, 6],
+                "INSERT",
+            )
+            expected_rows[1] = (1, "updated")
+            write(f"UPDATE {target} SET payload = ? WHERE id = ?", ["updated", 1], "UPDATE")
+            expected_rows = [row for row in expected_rows if row[0] != 2]
+            write(f"DELETE FROM {target} WHERE id = ?", [2], "DELETE")
+            expected_rows[0] = (0, "merged")
+            expected_rows.append((6, "value-6"))
+            write(
+                f"MERGE INTO {target} AS target USING "
+                f"(SELECT id, payload FROM {SOURCE_TABLE} WHERE id IN (?, ?)) AS source "
+                "ON target.id = source.id WHEN MATCHED THEN UPDATE SET payload = ? "
+                "WHEN NOT MATCHED THEN INSERT (id, payload) VALUES (source.id, source.payload)",
+                [0, 6, "merged"],
+                "MERGE",
+            )
+
+    before = harness.read_dispatch_count
+    relation = connection.table(SOURCE_TABLE).filter("id >= 2 AND id < 5").project("id, payload").order("id")
+    require_equal(relation._get_runner_type(), "ray", "derived Iceberg Relation runner")
+    require_equal(relation.fetchall(), [(i, f"value-{i}") for i in range(2, 5)], "derived Iceberg Relation")
+    require_equal(harness.read_dispatch_count, before + 1, "derived Relation Ray dispatch")
+    require_equal(snapshots(SOURCE_TABLE), source_snapshots, "SQL and Relation reads preserve source snapshots")
 
 
 def exercise_distributed_merge(harness: RayIcebergHarness) -> None:
@@ -2083,6 +2173,7 @@ def main() -> None:
             "source/target writes and worker topology",
             lambda: exercise_source_target_and_topology(harness, ray, expected_nodes),
         )
+        run_scenario("public SQL entrypoints", lambda: exercise_public_sql_entrypoints(harness))
         run_scenario("distributed MERGE", lambda: exercise_distributed_merge(harness))
         run_scenario("version-aware distributed CTAS", lambda: exercise_versioned_ctas(harness))
         run_scenario("v3 distributed reads and append", lambda: exercise_v3_reads_and_append(harness))

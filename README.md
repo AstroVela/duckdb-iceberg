@@ -143,6 +143,13 @@ The current reusable Vane CI lane builds the extension and runs a native
 sqllogictest against Vane's DuckDB fork. Ray integration tests require a full
 Vane wheel and catalog services and remain an explicit integration lane.
 
+Both dynamic-wheel and indexed-provider Ray lanes exercise parameterized
+`execute()` and `sql()` SELECT, CTAS, INSERT, UPDATE, DELETE and MERGE for
+Iceberg v2/v3. They check already-bound Ray plans, complete committed rows,
+exact snapshot deltas through the REST catalog, and source-snapshot preservation.
+All data setup, reads and writes in this suite use Ray; Python supplies expected
+rows for the SQL matrix.
+
 See [Vane provider releases](docs/VANE_RELEASE.md) for the shared Avro/Iceberg
 release matrix, exact dependencies, and ordered TestPyPI publication gates.
 
