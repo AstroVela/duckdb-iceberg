@@ -15,23 +15,27 @@ limits. Avro pins the exact Vane runtime; Iceberg pins that runtime and exact Av
 | `testpypi-dev` | `vane-extension.toml` | TestPyPI only | `astrovela/vane-testpypi` | TestPyPI only |
 | `release` | `vane-extension-release.toml` | PyPI only | `astrovela/vane` | TestPyPI qualification, then identical wheels to PyPI |
 
-The development manifest remains pinned to `vane-ai==0.2.0.dev612`. Its
-dependencies and signing key are unchanged. Neither schema version nor loading
-behavior changes. Publishing requires a manual dispatch in
+The development manifest pins Vane commit
+`3c9ed18e29c586e9d5448c74440e8ea55469a749` (`vane-ai==0.2.0.dev657`).
+It includes bound-plan SQL/Relation dispatch, the SELECT source-lifetime fix,
+and client metadata routing from Vane #823. A Ray connection can inspect
+`duckdb_extensions()` with SQL filters and parameters without starting Ray;
+external Iceberg reads and writes still execute through Ray.
+The signing key and manifest schema are unchanged. Publishing requires a manual dispatch in
 `AstroVela/duckdb-iceberg` on the protected default branch
 `v1.5-variegata_vane`. No provider-repository tag is required or created.
 
 The production manifest currently pins
-`033b549afcb498633fd6669b26c054c00363004e`, which adds Vane's production public
-key but **is not a released runtime**. The `release` preflight deliberately
+the same commit, which contains Vane's production public key but
+**is not a released runtime**. The `release` preflight deliberately
 fails for this development version before opening the signing environment or
 building native code. This prepares a channel; it does not publish or claim
 end-to-end production qualification.
 
 Before the first production run, publish a canonical non-development Vane
 release (an alpha, beta or RC is also allowed) to PyPI. Update only the release
-manifest through review to its complete exact commit, which must contain the
-production-key commit above. The workflow derives the version from clean, full
+manifest through review to its complete exact commit, retaining the production
+key and the qualified runner fixes above. The workflow derives the version from clean, full
 Git history with version overrides removed and validates it with the shared
 channel gate. All five exact runtime wheels are downloaded before native
 dependency preparation. Missing wheels fail; no alternate-index or development
@@ -141,7 +145,7 @@ python -I vane-extension-ci-tools/scripts/vane_provider_release.py validate \
   --vane-source ../vane \
   --ci-tools-version "$(git rev-parse HEAD:vane-extension-ci-tools)" \
   --config vane-provider-release.toml \
-  --directory dist/providers --vane-version 0.2.0.dev612 \
+  --directory dist/providers --vane-version 0.2.0.dev657 \
   --channel testpypi-dev --require-publishable-on testpypi
 ```
 
