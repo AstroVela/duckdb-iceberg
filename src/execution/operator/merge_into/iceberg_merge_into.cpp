@@ -156,6 +156,11 @@ static bool CollectDistributedMergeInsertPartitionIndexes(const PhysicalOperator
 }
 
 struct DistributedMergeTargetScanColumn {
+	DistributedMergeTargetScanColumn() = default;
+	DistributedMergeTargetScanColumn(optional_ptr<PhysicalTableScan> scan_p, idx_t output_index_p)
+	    : scan(scan_p), output_index(output_index_p) {
+	}
+
 	optional_ptr<PhysicalTableScan> scan;
 	idx_t output_index = 0;
 };
