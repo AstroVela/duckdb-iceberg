@@ -1,214 +1,61 @@
-> **Disclaimer:** This extension is currently in an experimental state. Feel free to try it out, but be aware that things may not work as expected
+# Apache Iceberg for Vane and DuckDB
 
-# DuckDB extension for Apache Iceberg 
+This repository integrates [Apache Iceberg](https://iceberg.apache.org/) with
+**Vane** and **DuckDB**. It supports reading Iceberg tables, inspecting their
+metadata, and using Iceberg REST catalogs for table creation and mutations.
+The Vane build adds distributed scans and writes through Ray.
 
-This repository contains a DuckDB extension that adds support for [Apache Iceberg](https://iceberg.apache.org/). In its current state, the extension offers some basics features that allow listing snapshots and reading specific snapshots
-of an iceberg tables.
+The extension is experimental; support depends on the runtime, Iceberg format
+version, and catalog. Choose the guide for the runtime you are using:
 
-## Documentation
-
-See the [Iceberg page in the DuckDB documentation](https://duckdb.org/docs/extensions/iceberg).
-
-## Developer guide
-
-### Dependencies
-
-This extension has several dependencies. Currently, the main way to install them is through vcpkg. To install vcpkg, 
-check out the docs [here](https://vcpkg.io/en/getting-started.html). Note that this extension contains a custom vcpkg port
-that overrides the existing 'avro-cpp' port of vcpkg. The reason for this is that the other versions of avro-cpp have
-some issue that seems to cause issues with the avro files produced by the spark iceberg extension.
-
-### Test data generation
-
-To generate test data, the script in 'scripts/test_data_generator' is used to have spark generate some test data. This is 
-based on pyspark 3.5, which you can install through pip. 
-
-### Building the extension
-
-To build the extension with vcpkg, you can build this extension using:
-
-```shell
-VCPKG_TOOLCHAIN_PATH='<path_to_your_vcpkg_repo>/scripts/buildsystems/vcpkg.cmake' make
-```
-
-This will build both the separate loadable extension and a duckdb binary with the extension pre-loaded:
-```shell
-./build/release/duckdb
-./build/release/extension/iceberg/iceberg.duckdb_extension
-```
-
-### Optional Vane build
-
-The default targets continue to build against the upstream `duckdb/`
-submodule. Distributed execution is an explicit second build mode and does not
-change the upstream DuckDB extension binary.
-
-`vane-extension-ci-tools/` checks out the exact Vane revision pinned in
-`vane-extension.toml`, then builds this extension against Vane's
-`external/duckdb`. The Vane-only configuration enables
-`ICEBERG_VANE_DISTRIBUTED`; Vane headers, scan callbacks, and write-provider
-code are excluded from the default build.
-
-```shell
-git submodule update --init --recursive
-export VCPKG_TOOLCHAIN_PATH=/path/to/vcpkg/scripts/buildsystems/vcpkg.cmake
-make vane_validate
-make vane_ci
-```
-
-The Vane build supports distributed Iceberg scans and auto-commit `INSERT`.
-`CREATE TABLE AS` additionally requires an explicit `location` or
-`write.data.path` table property and does not support `IF NOT EXISTS` or
-`OR REPLACE`. The catalog must also enable staged table creation
-(`stage_create_tables=true`) so the new table remains transactional until its
-initial snapshot commit. Vane's generic Relation API passes these options and
-partition expressions without adding an Iceberg-specific Python API:
-
-```python
-source.create(
-    "catalog.schema.events",
-    properties={
-        "format-version": 2,
-        "write.data.path": "s3://warehouse/events/data",
-    },
-    partition_by=["bucket(16, id)"],
-)
-```
-
-The worker COPY schema is derived from the requested format version before any
-files are written. The two-worker Ray integration lane covers partitioned v2
-CTAS and v3 CTAS, reads and writes spec-compliant Puffin deletion vectors,
-checks v3 partition and projection pruning, reads and appends `VARIANT` and
-`TIMESTAMP_NS`, and verifies row-lineage metadata across an append to an
-existing v3 table. V3 distributed `DELETE` and `UPDATE` consolidate the source
-scan's frozen delete state with the newly affected row positions and replace
-any existing deletion vector for the affected data file. UPDATE replacement
-data files preserve `_row_id`; their new data sequence supplies
-`_last_updated_sequence_number`. Distributed UPDATE rejects schemas containing
-`VARIANT` before worker execution because the current Vane repartition transport
-cannot preserve raw VARIANT vectors; distributed reads and appends remain
-supported. Geometry is not qualified because the optional geometry dependency
-is not part of this lane.
-
-| Distributed capability | Iceberg v2 | Iceberg v3 |
+| Runtime | Guide | Execution and installation |
 | --- | --- | --- |
-| Data scans | Supported, including positional and equality deletes | Supported, including Puffin deletion vectors |
-| `iceberg_snapshots()` and `iceberg_metadata()` | Supported through a single Ray scan task | Supported through a single Ray scan task |
-| `INSERT` into an existing table | Supported | Supported, with row-ID and sequence-number assignment |
-| `CREATE TABLE AS` | Supported with an explicit worker data path and staged catalog creation | Supported under the same constraints, including initial row lineage |
-| `VARIANT` and `TIMESTAMP_NS` | Not Iceberg v2 types | Supported; legacy Parquet VARIANT decoding remains rejected |
-| `DELETE` | Supported through positional-delete files | Supported through consolidated Puffin deletion vectors |
-| `UPDATE` | Supported through positional-delete files and replacement data files | Supported through consolidated Puffin deletion vectors and row-lineage-preserving replacement data files |
+| Vane | [VANE_README.md](VANE_README.md) | SQL and Relation APIs with the default Ray runner; matching Vane, Avro, and Iceberg provider wheels |
+| DuckDB | [DUCKDB_README.md](DUCKDB_README.md) | Native DuckDB extension, source builds, and catalog-backed development tests |
 
-Distributed writes reject a current partition spec containing a `VOID`
-transform. A distributed row-delta operation also fails if any selected source
-file uses a partition spec other than the current default. V3 scan, append,
-DELETE, and UPDATE plans fail closed when their target snapshot, schema, or
-partition spec changes before catalog finalization; no local execution fallback
-is used.
+Vane and DuckDB use separate build paths and compatible artifacts must be
+selected for each runtime. The default Make targets use the upstream DuckDB
+submodule; Vane targets use the exact runtime pinned in
+[vane-extension.toml](vane-extension.toml).
 
-Scan splits materialize the coordinator's selected files and delete state,
-including transaction-local changes visible when the plan is created.
+## Start here
 
-`iceberg_snapshots()` and `iceberg_metadata()` resolve the catalog entry or
-version hint during binding and carry the immutable metadata file path to one
-Ray task. `iceberg_metadata()` also pins the selected snapshot and schema,
-including historical ID/timestamp lookups. Workers read that metadata file and
-its manifests through their own filesystem session; the files and storage
-authorization must remain available on the workers. Later catalog commits or
-version-hint changes do not change an already bound query. Manifest entries and
-scan cursors stay in execution state instead of being serialized into the plan.
+- [Install Iceberg for Vane](VANE_README.md#installation), then follow the
+  [CTAS, insert, update/delete, merge, and query walkthrough](VANE_README.md#create-modify-and-query-a-table).
+- [Use the Vane Relation API](VANE_README.md#use-the-relation-api) for filtering,
+  projection, aggregation, and supported distributed writes.
+- [Read an existing table without a catalog](VANE_README.md#read-an-existing-iceberg-table)
+  from an explicit Iceberg metadata file.
+- [Build the DuckDB extension](DUCKDB_README.md#building-the-extension) and use
+  the [DuckDB Iceberg documentation](https://duckdb.org/docs/extensions/iceberg)
+  for its SQL interface.
 
-Workers produce immutable data/delete artifacts. Coordinator finalization
-validates the selected artifacts and adds them to the ordinary Iceberg catalog
-transaction in Vane's single, non-retried finalization call. Iceberg remains
-the only transaction authority: this extension adds no durable operation ID,
-reconciliation, or separate exactly-once layer. Once catalog finalization
-starts, rollback conservatively retains selected artifacts because a lost
-catalog response can leave the commit outcome unknown; catalog garbage
-collection remains responsible for true orphans. Iceberg extension payloads
-do not capture or replay persistent SecretManager entries. Storage
-authorization for the explicit data path must be available to both the
-coordinator and every worker connection; any transport of explicit session
-settings is governed by Vane's connection-snapshot policy. Worker scan binds carry only the schema and partition metadata
-required by the selected scan, plus the Iceberg name mapping; Parquet
-encryption keys, explicit cardinality overrides, and legacy VARIANT decoding
-are rejected instead of being serialized with incomplete semantics.
+## Capabilities
 
-In Vane's Ray mode these mutations use the distributed provider or fail; there
-is no local fallback. `VANE_RUNNER=local-fast` selects the independent native
-DuckDB execution path.
+The extension reads Iceberg data and metadata, applies snapshot delete state,
+and supports catalog-backed writes. Vane's distributed integration includes:
 
-The current reusable Vane CI lane builds the extension and runs a native
-sqllogictest against Vane's DuckDB fork. Ray integration tests require a full
-Vane wheel and catalog services and remain an explicit integration lane.
+- File scans with projection and filter pruning, including Iceberg delete files.
+- CTAS and INSERT with worker-written data files and catalog finalization.
+- UPDATE, DELETE, and MERGE through the Relation API.
+- Iceberg v3 deletion vectors and row lineage, with version-specific type support.
 
-Both dynamic-wheel and indexed-provider Ray lanes exercise parameterized
-`execute()` and `sql()` SELECT, CTAS, INSERT, UPDATE, DELETE and MERGE for
-Iceberg v2/v3. They check already-bound Ray plans, complete committed rows,
-exact snapshot deltas through the REST catalog, and source-snapshot preservation.
-All data setup, reads and writes in this suite use Ray; Python supplies expected
-rows for the SQL matrix.
+Distributed CTAS needs staged catalog creation and an explicit shared data
+path. Connection initialization and catalog/schema setup still use the native
+connection API. See [Vane capabilities and limits](VANE_README.md#distributed-capabilities-and-limits)
+for execution boundaries and supported cases.
 
-See [Vane provider releases](docs/VANE_RELEASE.md) for the shared Avro/Iceberg
-release matrix, exact dependencies, and ordered TestPyPI publication gates.
+## Development
 
-### Running tests
-
-#### Generating test data
-
-To generate the test data, run: 
-```shell
-make data
-```
-
-**Note** that the script requires python3, pyspark and duckdb-python to be installed. Make sure that the correct versions for pyspark (3.5.0), java and scala (2.12) are installed.
-
-running `python3 -m pip install duckdb "pyspark[sql]==3.5.0"` should do the trick.
-
-#### Running unit tests
-
-```shell
-make test 
-```
-
-#### Running the local S3 test server
-
-Running the S3 test cases requires the minio test server to be running and populated with `scripts/upload_iceberg_to_s3_test_server.sh`.
-Note that this requires to have run `make data` before and also to have the aws cli and docker compose installed.
-
-### Local catalog setup
-
-The Makefile provides targets to spin up local Iceberg catalogs for development and testing. Each target clones the catalog repo (if needed) and starts the service:
-
-```shell
-make fixture      # Apache Iceberg REST Fixture (Docker)
-make nessie       # Nessie catalog (Docker)
-make lakekeeper   # Lakekeeper catalog (Docker)
-make polaris      # Apache Polaris catalog (Gradle/local)
-```
-
-For starting the service AND generating data (to run tests that need it):
-
-```shell
-make fixture-data   
-make nessie-data    
-make lakekeeper-data
-make polaris-data   
-```
-
-Should you need to generate data for only one test (a test found under *scripts/data_generators/tests*), you can pass the test name as an argument, like so: `TEST=all_types_table make fixture-data`. The script will now only generate the needed data for that single test, which is faster.
-
-**Prerequisites:** Docker and Docker Compose are required for Fixture, Nessie, and Lakekeeper. Polaris requires Java/Gradle and builds from source — the build is skipped automatically if it has already completed. To force a clean rebuild of Polaris, run `make polaris-rebuild`.
-
-Fixture also has a local variant that generates data for local file-based testing instead of REST:
-
-```shell
-make fixture-data-local
-```
+- [DuckDB development and tests](DUCKDB_README.md#developer-guide)
+- [Vane build and test integration](VANE_README.md#build-and-test-the-vane-integration)
+- [Local REST catalogs](DUCKDB_README.md#local-catalog-setup)
+- [Test data generation](scripts/data_generators/README.md)
+- [Vane provider releases](docs/VANE_RELEASE.md)
 
 ## Acknowledgements
 
-This extension was initially developed as part of a customer project for [RelationalAI](https://relational.ai/),
-who have agreed to open source the extension. We would like to thank RelationalAI for their support
-and their commitment to open source enabling us to share this extension with the community.
+This extension was initially developed as part of a customer project for
+[RelationalAI](https://relational.ai/), who agreed to open source it. We thank
+RelationalAI for supporting open source development and enabling the extension
+to be shared with the community.
