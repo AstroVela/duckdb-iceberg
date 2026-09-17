@@ -16,15 +16,15 @@ provider, and both providers require the same exact Vane version. Install this
 complete package set in the application's environment and on every Ray node.
 
 The branch's provider release lane targets Linux x86-64, with CPython 3.10
-through 3.14 wheels. Python 3.12 is a suitable starting point. The current
-release configuration uses `vane-ai==0.2.0.dev657`; select the corresponding
-Avro and Iceberg versions from the same qualified release. Provider version
-numbers include an artifact identity and are different from the Vane version.
+through 3.14 wheels. Python 3.12 is a suitable starting point. Select the exact
+Vane version required by the Avro and Iceberg providers from the same qualified
+release. Provider version numbers include an artifact identity and are different
+from the Vane version.
 See [provider releases](docs/VANE_RELEASE.md) for the version and dependency
 contract. The examples below describe this branch; older provider artifacts
 may not include all of its write capabilities.
 
-For a TestPyPI release, replace the two provider-version placeholders below.
+For a TestPyPI release, replace all three version placeholders below.
 Use a fresh wheel directory for each package set:
 
 ```bash
@@ -32,7 +32,7 @@ python3.12 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 
-VANE_VERSION='0.2.0.dev657'
+VANE_VERSION='<matching-vane-version>'
 AVRO_VERSION='<matching-avro-provider-version>'
 ICEBERG_VERSION='<matching-iceberg-provider-version>'
 
@@ -64,16 +64,10 @@ these examples.
 
 ### Ray execution
 
-Leave the runner unset to use Vane's default Ray runner. The walkthrough uses
-`.show()` to display results; use `.fetchall()` when application code needs
-Python rows. A query or write needs enough independent work to occupy multiple
-workers, so a small example can execute on fewer workers than the cluster has.
-
-To connect to an existing Ray cluster, configure it before the first relation:
-
-```python
-vane.set_runner_ray(address="auto")
-```
+`vane.connect()` uses Ray by default. Vane starts Ray automatically when needed;
+the examples need no runner or cluster-address configuration. The walkthrough uses
+`print(...fetchall())` to display the returned Python rows. A query or write
+needs enough independent work to occupy multiple workers, so a small example can execute on fewer workers than the cluster has.
 
 The connection setup below prepares the calling process's native connection.
 `ATTACH`, `SET`, and schema DDL passed to `execute()` currently do not dispatch
@@ -102,13 +96,16 @@ URL style, and TLS settings for your deployment; the repository's
 corresponding local fixture configuration.
 
 ```python
-connection.execute("""
+connection.execute(
+    """
     SET s3_region = 'us-east-1';
     SET s3_access_key_id = 'your-access-key';
     SET s3_secret_access_key = 'your-secret-key';
-""")
+"""
+)
 
-connection.execute("""
+connection.execute(
+    """
     ATTACH '' AS lake (
         TYPE ICEBERG,
         ENDPOINT 'https://catalog.example.com',
@@ -116,7 +113,8 @@ connection.execute("""
         CLIENT_SECRET 'your-client-secret',
         stage_create_tables true
     )
-""")
+"""
+)
 connection.execute("CREATE SCHEMA IF NOT EXISTS lake.demo")
 ```
 
@@ -138,12 +136,14 @@ initial rows. Vane's `.create()` method expresses CTAS through the Relation API.
 Replace the S3 path before running this block:
 
 ```python
-connection.sql("""
+connection.sql(
+    """
     SELECT
         i::BIGINT AS id,
         ('value-' || i::VARCHAR)::VARCHAR AS payload
     FROM range(1000) AS source(i)
-""").create(
+"""
+).create(
     "lake.demo.events",
     properties={
         "format-version": 2,
@@ -175,12 +175,14 @@ The distributed writer also assigns the initial v3 row-lineage metadata.
 ### 2. Insert rows
 
 ```python
-connection.sql("""
+connection.sql(
+    """
     SELECT
         i::BIGINT AS id,
         ('value-' || i::VARCHAR)::VARCHAR AS payload
     FROM range(1000, 1010) AS source(i)
-""").insert_into("lake.demo.events")
+"""
+).insert_into("lake.demo.events")
 ```
 
 The table now contains 1,010 rows. `insert_into()` appends to the table created
@@ -208,13 +210,15 @@ the Iceberg catalog.
 `WHEN` clauses. This example updates ID 0 and inserts ID 1010:
 
 ```python
-connection.sql("""
+connection.sql(
+    """
     SELECT * FROM (
         VALUES
             (0::BIGINT, 'merged-0'),
             (1010::BIGINT, 'new-1010')
     ) AS changes(id, payload)
-""").merge_into(
+"""
+).merge_into(
     "lake.demo.events",
     "target.id = source.id",
     [
@@ -231,23 +235,31 @@ the same target row cause the distributed merge to fail.
 
 ### 5. Query the results
 
-Use `sql()` to construct a SELECT relation and `.show()` to execute it:
+Use `sql()` to construct a SELECT relation and `.fetchall()` to execute it:
 
 ```python
-connection.sql("""
+print(
+    connection.sql(
+        """
     SELECT
         count(*)::BIGINT AS rows,
         sum(id)::BIGINT AS id_sum,
         max(id) AS max_id
     FROM lake.demo.events
-""").show()
+"""
+    ).fetchall()
+)
 # rows = 1006, id_sum = 505520, max_id = 1010
 
-connection.sql("""
+print(
+    connection.sql(
+        """
     SELECT id, payload
     FROM lake.demo.events
     WHERE id < 5
-""").show()
+"""
+    ).fetchall()
+)
 # ID 0 has payload 'merged-0'; IDs 1–4 have payload 'updated'.
 ```
 
@@ -259,25 +271,25 @@ sum to `BIGINT` so the result uses a standard Arrow integer type.
 ```python
 events = connection.table("lake.demo.events")
 filtered = events.filter(col("id") >= 100).select(col("id"), col("payload"))
-filtered.limit(5).show()
+print(filtered.sort(col("id").asc()).limit(5).fetchall())
 
-filtered.aggregate(
-    "count(*) AS rows, sum(id)::BIGINT AS id_sum"
-).show()
+print(filtered.aggregate("count(*) AS rows, sum(id)::BIGINT AS id_sum").fetchall())
 # rows = 906, id_sum = 500570
 ```
 
-The limited preview is a separate relation; `filtered` still represents all
-906 matching rows. Grouping uses the `group_expr` argument:
+The ordered five-row preview is a separate relation; `filtered` still represents
+all 906 matching rows. Grouping uses the `group_expr` argument:
 
 ```python
-(
-    events.select((col("id") % 2).alias("bucket"), col("id"))
-    .aggregate(
-        "bucket, count(*) AS rows, sum(id)::BIGINT AS id_sum",
-        group_expr="bucket",
+print(
+    (
+        events.select((col("id") % 2).alias("bucket"), col("id"))
+        .aggregate(
+            "bucket, count(*) AS rows, sum(id)::BIGINT AS id_sum",
+            group_expr="bucket",
+        )
+        .fetchall()
     )
-    .show()
 )
 ```
 
@@ -291,13 +303,17 @@ An explicit metadata-file path can be scanned without a REST catalog or
 repository root against a committed test fixture:
 
 ```python
-connection.sql("""
+print(
+    connection.sql(
+        """
     SELECT id, league, ats_qty
     FROM iceberg_scan(
         'data/persistent/iceberg_v1_repro/repro/merch_v1/metadata/'
         '00003-8d01e4aa-d143-49c9-898e-b5e477577b70.metadata.json'
     )
-""").show()
+"""
+    ).fetchall()
+)
 ```
 
 It returns four rows with IDs 2, 3, 4, and 6, in unspecified order. The same

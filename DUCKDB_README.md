@@ -1,10 +1,9 @@
-[Overview](README.md) | [Vane guide](VANE_README.md)
-
 > **Disclaimer:** This extension is currently in an experimental state. Feel free to try it out, but be aware that things may not work as expected
 
-# Apache Iceberg for DuckDB
+# DuckDB extension for Apache Iceberg 
 
-This repository contains a DuckDB extension for [Apache Iceberg](https://iceberg.apache.org/). It supports reading and writing Iceberg tables, inspecting snapshots and manifests, and attaching Iceberg REST catalogs.
+This repository contains a DuckDB extension that adds support for [Apache Iceberg](https://iceberg.apache.org/). In its current state, the extension offers some basics features that allow listing snapshots and reading specific snapshots
+of an iceberg tables.
 
 ## Documentation
 
@@ -14,92 +13,53 @@ See the [Iceberg page in the DuckDB documentation](https://duckdb.org/docs/exten
 
 ### Dependencies
 
-Building requires a C++ toolchain, CMake, and
-[vcpkg](https://vcpkg.io/en/getting-started.html). The repository's
-[vcpkg manifest](vcpkg.json) pins the native dependencies, including `avro-c`,
-and its custom ports. The separate Avro extension is pinned in
-[extension_config.cmake](extension_config.cmake).
+This extension has several dependencies. Currently, the main way to install them is through vcpkg. To install vcpkg, 
+check out the docs [here](https://vcpkg.io/en/getting-started.html). Note that this extension contains a custom vcpkg port
+that overrides the existing 'avro-cpp' port of vcpkg. The reason for this is that the other versions of avro-cpp have
+some issue that seems to cause issues with the avro files produced by the spark iceberg extension.
 
 ### Test data generation
 
-The generators in [scripts/data_generators/](scripts/data_generators/README.md)
-use PySpark and the pinned packages in [scripts/requirements.txt](scripts/requirements.txt).
-The catalog data targets create `.venv-spark4` and install these requirements.
+To generate test data, the script in 'scripts/test_data_generator' is used to have spark generate some test data. This is 
+based on pyspark 3.5, which you can install through pip. 
 
 ### Building the extension
 
-Clone this branch with its submodules:
-
-```shell
-git clone --branch v1.5-variegata_vane --recurse-submodules \
-  https://github.com/AstroVela/duckdb-iceberg.git
-cd duckdb-iceberg
-```
-
-To build the extension with vcpkg:
+To build the extension with vcpkg, you can build this extension using:
 
 ```shell
 VCPKG_TOOLCHAIN_PATH='<path_to_your_vcpkg_repo>/scripts/buildsystems/vcpkg.cmake' make
 ```
 
-This produces a DuckDB shell with the extension linked in and a separate
-loadable extension artifact:
-
-```text
-build/release/duckdb
-build/release/extension/iceberg/iceberg.duckdb_extension
+This will build both the separate loadable extension and a duckdb binary with the extension pre-loaded:
+```shell
+./build/release/duckdb
+./build/release/extension/iceberg/iceberg.duckdb_extension
 ```
-
-Start the shell with `./build/release/duckdb`. A loadable `.duckdb_extension`
-file is loaded by a compatible DuckDB runtime; it is not a shell executable.
-
-### Vane build
-
-For Vane installation, distributed execution, and provider wheels, see
-[VANE_README.md](VANE_README.md). The default build described here targets the
-upstream `duckdb/` submodule.
 
 ### Running tests
 
 #### Generating test data
 
-Generate data for REST-catalog tests or local file scans with the corresponding
-target:
-
+To generate the test data, run: 
 ```shell
-make fixture-data
-# Or, for local file-based tests:
-make fixture-data-local
+make data
 ```
 
-These targets start the fixture, install the pinned Python requirements, and
-generate data. They require Docker Compose and a Java runtime compatible with
-the pinned PySpark version. See the [data generator guide](scripts/data_generators/README.md)
-for individual cases and catalog profiles.
+**Note** that the script requires python3, pyspark and duckdb-python to be installed. Make sure that the correct versions for pyspark (3.5.0), java and scala (2.12) are installed.
+
+running `python3 -m pip install duckdb "pyspark[sql]==3.5.0"` should do the trick.
 
 #### Running unit tests
 
-Build the matching configuration before testing:
-
 ```shell
-make release
-make test
+make test 
 ```
-
-For a focused test that uses a fixture already committed to the repository:
-
-```shell
-./build/release/test/unittest \
-  test/sql/local/iceberg_scans/iceberg_v1_existing_manifest_entry.test
-```
-
-Run catalog-backed tests serially unless their catalogs, tables, storage paths,
-and services have been verified to be independent.
 
 #### Running the local S3 test server
 
 Running the S3 test cases requires the minio test server to be running and populated with `scripts/upload_iceberg_to_s3_test_server.sh`.
-Note that this requires the relevant test data to have been generated first and also to have the aws cli and docker compose installed.
+Note that this requires to have run `make data` before and also to have the aws cli and docker compose installed.
 
 ### Local catalog setup
 
@@ -109,27 +69,21 @@ The Makefile provides targets to spin up local Iceberg catalogs for development 
 make fixture      # Apache Iceberg REST Fixture (Docker)
 make nessie       # Nessie catalog (Docker)
 make lakekeeper   # Lakekeeper catalog (Docker)
-make polaris      # Apache Polaris MinIO quickstart (Docker)
+make polaris      # Apache Polaris catalog (Gradle/local)
 ```
 
 For starting the service AND generating data (to run tests that need it):
 
 ```shell
-make fixture-data
-make nessie-data
+make fixture-data   
+make nessie-data    
 make lakekeeper-data
-make polaris-data
+make polaris-data   
 ```
 
 Should you need to generate data for only one test (a test found under *scripts/data_generators/tests*), you can pass the test name as an argument, like so: `TEST=all_types_table make fixture-data`. The script will now only generate the needed data for that single test, which is faster.
 
-All four service targets require Docker and Docker Compose. Polaris uses the
-`release/1.4.x` branch's MinIO quickstart. Data generation additionally requires
-Python and a Java runtime compatible with the pinned PySpark version.
-
-Starting a catalog stops the active catalog recorded in
-`.catalogs/.active_catalog`. Start and data-generation targets can remove
-existing fixture data; use them in a dedicated development environment.
+**Prerequisites:** Docker and Docker Compose are required for Fixture, Nessie, and Lakekeeper. Polaris requires Java/Gradle and builds from source — the build is skipped automatically if it has already completed. To force a clean rebuild of Polaris, run `make polaris-rebuild`.
 
 Fixture also has a local variant that generates data for local file-based testing instead of REST:
 
