@@ -1585,7 +1585,7 @@ void ConfigureIcebergDistributedScan(TableFunction &function) {
 	TableFunctionDistributedScanCallbacks callbacks;
 	callbacks.protocol_version = ICEBERG_DISTRIBUTED_SCAN_PROTOCOL_VERSION;
 	callbacks.split_codec = {ICEBERG_DISTRIBUTED_SCAN_SPLIT_CODEC, ICEBERG_DISTRIBUTED_SCAN_PROTOCOL_VERSION};
-	callbacks.bind_data_mode = TableFunctionDistributedBindDataMode::REQUIRED;
+	callbacks.bind_data_mode = TableFunctionDistributedBindDataMode::BIND_DATA_REQUIRED;
 	callbacks.plan_splits = IcebergPlanDistributedScanSplits;
 	callbacks.create_worker_bind = IcebergCreateDistributedWorkerBind;
 	callbacks.apply_splits = IcebergApplyDistributedScanSplits;
