@@ -2282,7 +2282,7 @@ IcebergDistributedRowDeltaResult DecodeIcebergDistributedRowDeltaResults(
     const DistributedExtensionWriteInfo &info, const vector<DistributedWriteTaskResult> &results,
     IcebergDistributedRowDeltaKind expected_kind, int32_t expected_iceberg_version) {
 	info.Validate();
-	if (info.mode != DistributedWriteMode::CALLBACK ||
+	if (info.mode != DistributedWriteMode::CALLBACK_SINK ||
 	    info.fragment_codec !=
 	        DistributedPayloadCodec {ICEBERG_ROW_DELTA_FRAGMENT_CODEC, ICEBERG_ROW_DELTA_PROTOCOL_VERSION}) {
 		throw InvalidInputException("Iceberg distributed row-delta coordinator resolved the wrong worker protocol");
@@ -2426,7 +2426,7 @@ IcebergDistributedMergeResult DecodeIcebergDistributedMergeResults(ClientContext
                                                                    int32_t expected_iceberg_version,
                                                                    bool worker_plan_is_statically_empty) {
 	info.Validate();
-	if (info.mode != DistributedWriteMode::CALLBACK ||
+	if (info.mode != DistributedWriteMode::CALLBACK_SINK ||
 	    info.fragment_codec != DistributedPayloadCodec {ICEBERG_MERGE_FRAGMENT_CODEC, ICEBERG_MERGE_PROTOCOL_VERSION}) {
 		throw InvalidInputException("Iceberg distributed MERGE coordinator resolved the wrong worker protocol");
 	}
@@ -2653,7 +2653,7 @@ void RegisterIcebergDistributedWrites(ExtensionLoader &loader) {
 		DistributedWriteOperatorExtension extension;
 		extension.name = name;
 		extension.protocol_version = ICEBERG_ROW_DELTA_PROTOCOL_VERSION;
-		extension.mode = DistributedWriteMode::CALLBACK;
+		extension.mode = DistributedWriteMode::CALLBACK_SINK;
 		extension.fragment_codec = {ICEBERG_ROW_DELTA_FRAGMENT_CODEC, ICEBERG_ROW_DELTA_PROTOCOL_VERSION};
 		extension.callbacks = IcebergDistributedRowDeltaCallbacks();
 		DistributedWriteOperatorExtension::Register(loader, std::move(extension));
@@ -2664,7 +2664,7 @@ void RegisterIcebergDistributedWrites(ExtensionLoader &loader) {
 	DistributedWriteOperatorExtension merge;
 	merge.name = "merge";
 	merge.protocol_version = ICEBERG_MERGE_PROTOCOL_VERSION;
-	merge.mode = DistributedWriteMode::CALLBACK;
+	merge.mode = DistributedWriteMode::CALLBACK_SINK;
 	merge.fragment_codec = {ICEBERG_MERGE_FRAGMENT_CODEC, ICEBERG_MERGE_PROTOCOL_VERSION};
 	merge.callbacks = IcebergDistributedMergeCallbacks();
 	DistributedWriteOperatorExtension::Register(loader, std::move(merge));

@@ -16,8 +16,9 @@ limits. Avro pins the exact Vane runtime; Iceberg pins that runtime and exact Av
 | `release` | `vane-extension-release.toml` | PyPI only | `astrovela/vane` | TestPyPI qualification, then identical wheels to PyPI |
 
 The development manifest pins Vane commit
-`3c9ed18e29c586e9d5448c74440e8ea55469a749` (`vane-ai==0.2.0.dev657`).
-It includes bound-plan SQL/Relation dispatch, the SELECT source-lifetime fix,
+`d1460a580455f01485e2e508e05d0049cb18a105` (`vane-ai==0.2.0.dev662`).
+It includes the Windows-safe distributed callback enum names from Vane #724,
+bound-plan SQL/Relation dispatch, the SELECT source-lifetime fix,
 and client metadata routing from Vane #823. A Ray connection can inspect
 `duckdb_extensions()` with SQL filters and parameters without starting Ray;
 external Iceberg reads and writes still execute through Ray.
@@ -145,7 +146,7 @@ python -I vane-extension-ci-tools/scripts/vane_provider_release.py validate \
   --vane-source ../vane \
   --ci-tools-version "$(git rev-parse HEAD:vane-extension-ci-tools)" \
   --config vane-provider-release.toml \
-  --directory dist/providers --vane-version 0.2.0.dev657 \
+  --directory dist/providers --vane-version 0.2.0.dev662 \
   --channel testpypi-dev --require-publishable-on testpypi
 ```
 
