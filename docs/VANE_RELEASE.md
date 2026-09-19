@@ -20,8 +20,7 @@ Both manifests pin Vane `v0.2.0`, commit
 on PyPI. Build-only CI compiles the same source with the public CI test key
 enabled and packages a matching runtime, Avro and Iceberg set. These are test
 artifacts, even though the runtime reports version `0.2.0`; they must not be
-mixed with the PyPI runtime or published. See the
-[development workflow](VANE_DEVELOPMENT.md) for PR checks and local reproduction.
+mixed with the PyPI runtime or published.
 
 The signing keys and manifest schema are unchanged. Publishing requires a manual dispatch in
 `AstroVela/duckdb-iceberg` on the protected default branch

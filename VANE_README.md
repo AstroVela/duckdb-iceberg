@@ -1,6 +1,6 @@
 # Apache Iceberg for Vane
 
-[Overview](README.md) | [DuckDB guide](DUCKDB_README.md) | [Development workflow](docs/VANE_DEVELOPMENT.md)
+[Overview](README.md) | [DuckDB guide](DUCKDB_README.md)
 
 Use Apache Iceberg tables from Vane's SQL and Relation APIs, with Ray executing
 supported scans and writes. The Vane build adds distributed execution to this
