@@ -6,8 +6,8 @@ native_test_selection = "test/sql/local/iceberg_scans/iceberg_v1_existing_manife
 
 [vane]
 repository = "AstroVela/vane"
-# Qualified against the Windows-safe distributed callback enums (Vane #724).
-revision = "d1460a580455f01485e2e508e05d0049cb18a105"
+# Vane v0.2.0; build-only CI adds the public test signing key to its runtime.
+revision = "79049f382ba6ee79d035c09cc8b5d3538e5bbe6a"
 
 [vcpkg]
 repository = "microsoft/vcpkg"

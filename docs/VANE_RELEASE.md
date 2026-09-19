@@ -15,28 +15,30 @@ limits. Avro pins the exact Vane runtime; Iceberg pins that runtime and exact Av
 | `testpypi-dev` | `vane-extension.toml` | TestPyPI only | `astrovela/vane-testpypi` | TestPyPI only |
 | `release` | `vane-extension-release.toml` | PyPI only | `astrovela/vane` | TestPyPI qualification, then identical wheels to PyPI |
 
-The development manifest pins Vane commit
-`d1460a580455f01485e2e508e05d0049cb18a105` (`vane-ai==0.2.0.dev662`).
-It includes the Windows-safe distributed callback enum names from Vane #724,
-bound-plan SQL/Relation dispatch, the SELECT source-lifetime fix,
-and client metadata routing from Vane #823. A Ray connection can inspect
-`duckdb_extensions()` with SQL filters and parameters without starting Ray;
-external Iceberg reads and writes still execute through Ray.
-The signing key and manifest schema are unchanged. Publishing requires a manual dispatch in
+Both manifests pin Vane `v0.2.0`, commit
+`79049f382ba6ee79d035c09cc8b5d3538e5bbe6a`. The released runtime is available
+on PyPI. Build-only CI compiles the same source with the public CI test key
+enabled and packages a matching runtime, Avro and Iceberg set. These are test
+artifacts, even though the runtime reports version `0.2.0`; they must not be
+mixed with the PyPI runtime or published. See the
+[development workflow](VANE_DEVELOPMENT.md) for PR checks and local reproduction.
+
+The signing keys and manifest schema are unchanged. Publishing requires a manual dispatch in
 `AstroVela/duckdb-iceberg` on the protected default branch
 `v1.5-variegata_vane`. No provider-repository tag is required or created.
 
-The production manifest currently pins
-the same commit, which contains Vane's production public key but
-**is not a released runtime**. The `release` preflight deliberately
-fails for this development version before opening the signing environment or
-building native code. This prepares a channel; it does not publish or claim
-end-to-end production qualification.
+With this stable pin, use `build-only` for development and `release` for
+production qualification. `testpypi-dev` requires a canonical development
+runtime and deliberately rejects `0.2.0`; it is not needed for PR testing.
+A future development publication needs a separately reviewed pin to its exact
+TestPyPI runtime. Ordinary TestPyPI candidate runtimes trust the dedicated
+TestPyPI key, not the public CI fixture key.
 
-Before the first production run, publish a canonical non-development Vane
-release (an alpha, beta or RC is also allowed) to PyPI. Update only the release
-manifest through review to its complete exact commit, retaining the production
-key and the qualified runner fixes above. The workflow derives the version from clean, full
+The production lane uses the exact PyPI `0.2.0` wheels and the production signer;
+it never substitutes the build-only runtime. Updating the pin does not publish
+the providers or establish production qualification. The first provider release
+still requires the complete protected signing, testing and promotion workflow.
+The workflow derives the version from clean, full
 Git history with version overrides removed and validates it with the shared
 channel gate. All five exact runtime wheels are downloaded before native
 dependency preparation. Missing wheels fail; no alternate-index or development
@@ -138,21 +140,19 @@ python -I test/vane/test_vane_provider_release.py
 python -I test/vane/test_vane_production_release.py
 ```
 
-Validate a development candidate with the exact clean Vane checkout:
+Validate a production candidate with the exact clean Vane `v0.2.0` checkout:
 
 ```sh
 python -I vane-extension-ci-tools/scripts/vane_provider_release.py validate \
-  --manifest vane-extension.toml --extension-root . \
+  --manifest vane-extension-release.toml --extension-root . \
   --vane-source ../vane \
   --ci-tools-version "$(git rev-parse HEAD:vane-extension-ci-tools)" \
   --config vane-provider-release.toml \
-  --directory dist/providers --vane-version 0.2.0.dev662 \
-  --channel testpypi-dev --require-publishable-on testpypi
+  --directory dist/providers --vane-version 0.2.0 \
+  --channel release --require-publishable-on testpypi --require-publishable-on pypi
 ```
 
-For production select the release manifest, exact non-development version,
-`--channel release`, and both `--require-publishable-on testpypi` and
-`--require-publishable-on pypi`. After staging, `verify-promotion` uses the full
+After staging, `verify-promotion` uses the full
 ten-wheel directory, the same source/configuration flags and `--vane-version`.
 Per-provider `verify-index` uses `--index testpypi` or `--index pypi`, the
 directory containing that provider's five wheels, `--provider avro` or
