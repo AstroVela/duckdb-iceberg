@@ -24,30 +24,20 @@ See [provider releases](docs/VANE_RELEASE.md) for the version and dependency
 contract. The examples below describe this branch; older provider artifacts
 may not include all of its write capabilities.
 
-For a TestPyPI release, replace all three version placeholders below.
-Use a fresh wheel directory for each package set:
+For a PyPI release, install the provider package directly. `pip` resolves
+the exact matching `vane-ai` and `vane-extension-avro` from package metadata:
 
 ```bash
 python3.12 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 
-VANE_VERSION='<matching-vane-version>'
-AVRO_VERSION='<matching-avro-provider-version>'
-ICEBERG_VERSION='<matching-iceberg-provider-version>'
-
-python -m pip download --no-deps --only-binary=:all: \
-  --index-url https://test.pypi.org/simple/ --dest iceberg-wheels \
-  "vane-ai==$VANE_VERSION" \
-  "vane-extension-avro==$AVRO_VERSION" \
-  "vane-extension-iceberg==$ICEBERG_VERSION"
-python -m pip install --index-url https://pypi.org/simple/ \
-  iceberg-wheels/*.whl grpcio
+python -m pip install vane-extension-iceberg grpcio
 python -m pip check
 ```
 
-This downloads the exact runtime and providers from TestPyPI, then resolves
-ordinary Python dependencies from PyPI. Initialize the installed provider in
+Pin exact versions (for example `"vane-extension-iceberg==<version>"`) for
+reproducible deployments. Initialize the installed provider in
 Python:
 
 ```python
