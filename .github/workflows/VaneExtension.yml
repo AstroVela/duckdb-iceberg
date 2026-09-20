@@ -146,7 +146,7 @@ jobs:
       VANE_VCPKG_INSTALLED_DIR: ${{ github.workspace }}/vane/vcpkg_installed
       VANE_BUILD_JOBS: 12
       VANE_CMAKE_COMPILER_LAUNCHER: ccache
-      VCPKG_TARGET_TRIPLET: x64-linux
+      VCPKG_TARGET_TRIPLET: x64-linux-release
       CCACHE_DIR: ${{ github.workspace }}/.cache/vane-dynamic-wheel-ccache
       CCACHE_MAXSIZE: 750M
       CCACHE_COMPILERCHECK: content
@@ -422,7 +422,7 @@ jobs:
       VANE_PYTHON: /opt/python/cp312-cp312/bin/python
       VANE_BUILD_JOBS: 16
       VANE_CMAKE_COMPILER_LAUNCHER: ccache
-      VCPKG_TARGET_TRIPLET: x64-linux
+      VCPKG_TARGET_TRIPLET: x64-linux-release
       VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/.cache/vcpkg-archives
       CCACHE_DIR: ${{ github.workspace }}/.cache/vane-testpypi-wheel-ccache
       CCACHE_MAXSIZE: 1G
