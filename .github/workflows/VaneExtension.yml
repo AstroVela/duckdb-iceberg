@@ -92,9 +92,9 @@ jobs:
   vane-native:
     if: inputs.operation != 'testpypi-dev' && inputs.operation != 'release'
     # The called workflow verifies its exact SHA from GitHub job metadata.
-    uses: AstroVela/vane-extension-ci-tools/.github/workflows/_vane_extension_ci.yml@d7316f29add0cc893c5fd126a971ffb78cc39c78
+    uses: AstroVela/vane-extension-ci-tools/.github/workflows/_vane_extension_ci.yml@f0077479fb1f34e6e9a662b91ceb3abab7a48e58
     with:
-      ci_tools_version: d7316f29add0cc893c5fd126a971ffb78cc39c78
+      ci_tools_version: f0077479fb1f34e6e9a662b91ceb3abab7a48e58
       manifest: vane-extension.toml
       build_jobs: 12
       run_native_tests: true
@@ -195,7 +195,7 @@ jobs:
       - name: Validate exact Vane and CI-tools identities
         shell: bash
         env:
-          VANE_CI_TOOLS_VERSION: d7316f29add0cc893c5fd126a971ffb78cc39c78
+          VANE_CI_TOOLS_VERSION: f0077479fb1f34e6e9a662b91ceb3abab7a48e58
         run: |
           set -euo pipefail
           actual_ci_tools="$(git -C extension/vane-extension-ci-tools rev-parse HEAD)"
@@ -534,7 +534,7 @@ jobs:
       - name: Validate exact Vane and CI-tools identities
         shell: bash
         env:
-          VANE_CI_TOOLS_VERSION: d7316f29add0cc893c5fd126a971ffb78cc39c78
+          VANE_CI_TOOLS_VERSION: f0077479fb1f34e6e9a662b91ceb3abab7a48e58
         run: |
           set -euo pipefail
           actual_ci_tools="$(git -C extension/vane-extension-ci-tools rev-parse HEAD)"
