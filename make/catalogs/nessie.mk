@@ -10,12 +10,13 @@ nessie-clone:
 
 nessie-stop:
 	@echo "Stopping Nessie catalog..."
-	(cd .catalogs/nessie/docker/catalog-auth-s3 && docker compose down -v)
+	(cd .catalogs/nessie/docker/catalog-auth-s3 && docker compose -f docker-compose.yml -f "$(CURDIR)/scripts/nessie-minio.yml" down -v)
 
 nessie: nessie-clone nessie-stop
 	$(call stop_active_catalog)
 	@echo "Starting Nessie catalog..."
-	(cd .catalogs/nessie/docker/catalog-auth-s3 && docker compose up -d)
+	./scripts/build_minio_test_images.sh
+	(cd .catalogs/nessie/docker/catalog-auth-s3 && docker compose -f docker-compose.yml -f "$(CURDIR)/scripts/nessie-minio.yml" up -d)
 	$(call set_active_catalog,nessie)
 
 nessie-data-only:

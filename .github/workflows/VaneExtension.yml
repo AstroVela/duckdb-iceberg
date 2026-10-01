@@ -361,6 +361,7 @@ jobs:
           set -euo pipefail
           mkdir -p data/generated/iceberg/spark-rest data/generated/intermediates
           docker compose -f scripts/docker-compose.yml down -v
+          ./scripts/build_minio_test_images.sh
           docker compose -f scripts/docker-compose.yml up -d
 
       - name: Wait for fixture initialization
@@ -1260,6 +1261,7 @@ jobs:
           set -euo pipefail
           mkdir -p data/generated/iceberg/spark-rest data/generated/intermediates
           docker compose -f scripts/docker-compose.yml down -v
+          ./scripts/build_minio_test_images.sh
           docker compose -f scripts/docker-compose.yml up -d
 
       - name: Wait for fixture initialization
@@ -1380,6 +1382,7 @@ jobs:
           set -euo pipefail
           mkdir -p data/generated/iceberg/spark-rest data/generated/intermediates
           docker compose -f scripts/docker-compose.yml down -v
+          ./scripts/build_minio_test_images.sh
           docker compose -f scripts/docker-compose.yml up -d
 
       - name: Wait for fixture initialization
@@ -1730,6 +1733,7 @@ jobs:
           set -euo pipefail
           mkdir -p data/generated/iceberg/spark-rest data/generated/intermediates
           docker compose -f scripts/docker-compose.yml down -v
+          ./scripts/build_minio_test_images.sh
           docker compose -f scripts/docker-compose.yml up -d
 
       - name: Wait for fixture initialization
