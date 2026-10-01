@@ -92,9 +92,9 @@ jobs:
   vane-native:
     if: inputs.operation != 'testpypi-dev' && inputs.operation != 'release'
     # The called workflow verifies its exact SHA from GitHub job metadata.
-    uses: AstroVela/vane-extension-ci-tools/.github/workflows/_vane_extension_ci.yml@d7316f29add0cc893c5fd126a971ffb78cc39c78
+    uses: AstroVela/vane-extension-ci-tools/.github/workflows/_vane_extension_ci.yml@9de078021e3cb0ee09d50568aca114e58f2c2014
     with:
-      ci_tools_version: d7316f29add0cc893c5fd126a971ffb78cc39c78
+      ci_tools_version: 9de078021e3cb0ee09d50568aca114e58f2c2014
       manifest: vane-extension.toml
       build_jobs: 12
       run_native_tests: true
@@ -146,7 +146,7 @@ jobs:
       VANE_VCPKG_INSTALLED_DIR: ${{ github.workspace }}/vane/vcpkg_installed
       VANE_BUILD_JOBS: 12
       VANE_CMAKE_COMPILER_LAUNCHER: ccache
-      VCPKG_TARGET_TRIPLET: x64-linux
+      VCPKG_TARGET_TRIPLET: x64-linux-release
       CCACHE_DIR: ${{ github.workspace }}/.cache/vane-dynamic-wheel-ccache
       CCACHE_MAXSIZE: 750M
       CCACHE_COMPILERCHECK: content
@@ -195,7 +195,7 @@ jobs:
       - name: Validate exact Vane and CI-tools identities
         shell: bash
         env:
-          VANE_CI_TOOLS_VERSION: d7316f29add0cc893c5fd126a971ffb78cc39c78
+          VANE_CI_TOOLS_VERSION: 9de078021e3cb0ee09d50568aca114e58f2c2014
         run: |
           set -euo pipefail
           actual_ci_tools="$(git -C extension/vane-extension-ci-tools rev-parse HEAD)"
@@ -422,7 +422,7 @@ jobs:
       VANE_PYTHON: /opt/python/cp312-cp312/bin/python
       VANE_BUILD_JOBS: 16
       VANE_CMAKE_COMPILER_LAUNCHER: ccache
-      VCPKG_TARGET_TRIPLET: x64-linux
+      VCPKG_TARGET_TRIPLET: x64-linux-release
       VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/.cache/vcpkg-archives
       CCACHE_DIR: ${{ github.workspace }}/.cache/vane-testpypi-wheel-ccache
       CCACHE_MAXSIZE: 1G
@@ -534,7 +534,7 @@ jobs:
       - name: Validate exact Vane and CI-tools identities
         shell: bash
         env:
-          VANE_CI_TOOLS_VERSION: d7316f29add0cc893c5fd126a971ffb78cc39c78
+          VANE_CI_TOOLS_VERSION: 9de078021e3cb0ee09d50568aca114e58f2c2014
         run: |
           set -euo pipefail
           actual_ci_tools="$(git -C extension/vane-extension-ci-tools rev-parse HEAD)"

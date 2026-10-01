@@ -249,7 +249,7 @@ def _build_environment(
     jobs: int,
     signing_cmake_option: str | None,
 ) -> dict[str, str]:
-    target_triplet = "x64-linux"
+    target_triplet = "x64-linux-release"
     dependency_prefix = vane_vcpkg_installed / target_triplet
     for relative in ("share/arrow/ArrowConfig.cmake", "share/arrowflight/ArrowFlightConfig.cmake"):
         _require_file(dependency_prefix / relative, "Vane native dependency configuration")
@@ -435,7 +435,7 @@ def _stage_license_files(
     dependency_bundle.write_text(
         _render_vcpkg_license_bundle(
             extension_root,
-            build_directory / "vcpkg_installed/x64-linux/share",
+            build_directory / "vcpkg_installed/x64-linux-release/share",
         ),
         encoding="utf-8",
     )
