@@ -9,6 +9,7 @@ fixture: fixture-stop
 	@echo "Starting apache/iceberg-rest-fixture catalog..."
 	mkdir -p data/generated/iceberg/spark-rest
 	mkdir -p data/generated/intermediates
+	./scripts/build_minio_test_images.sh
 	(cd scripts && docker compose up -d)
 	$(call set_active_catalog,fixture)
 

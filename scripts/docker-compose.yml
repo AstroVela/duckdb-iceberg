@@ -14,7 +14,8 @@ services:
       - CATALOG_IO__IMPL=org.apache.iceberg.aws.s3.S3FileIO
       - CATALOG_S3_ENDPOINT=http://minio:9000
   minio:
-    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
+    image: astrovela-minio-test:RELEASE.2025-09-07T16-13-09Z
+    pull_policy: never
     container_name: minio
     environment:
       - MINIO_ROOT_USER=admin
@@ -35,7 +36,8 @@ services:
   mc:
     depends_on:
       - minio
-    image: quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727
+    image: astrovela-mc-test:RELEASE.2025-08-13T08-35-41Z
+    pull_policy: never
     container_name: mc
     networks:
       iceberg_net:

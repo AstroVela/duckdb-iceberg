@@ -11,16 +11,17 @@ lakekeeper-clone:
 
 lakekeeper-stop:
 	@echo "Stopping Lakekeeper catalog..."
-	(cd .catalogs/lakekeeper/examples/access-control-simple && docker compose down -v)
+	(cd .catalogs/lakekeeper/examples/access-control-simple && docker compose -f docker-compose.yaml -f "$(CURDIR)/scripts/lakekeeper-minio.yml" down -v)
 
 lakekeeper: lakekeeper-clone lakekeeper-stop
 	$(call stop_active_catalog)
 	@echo "Starting Lakekeeper catalog..."
 	@grep -q '127.0.0.1 minio' /etc/hosts || (echo "Adding minio host entry..." && echo "127.0.0.1 minio" | sudo tee -a /etc/hosts)
-	(cd .catalogs/lakekeeper/examples/access-control-simple && docker compose up -d)
+	./scripts/build_minio_test_images.sh RELEASE.2025-07-23T15-54-02Z
+	(cd .catalogs/lakekeeper/examples/access-control-simple && docker compose -f docker-compose.yaml -f "$(CURDIR)/scripts/lakekeeper-minio.yml" up -d)
 	@echo "Bootstrapping Lakekeeper..."
 	cd .catalogs/lakekeeper/examples/access-control-simple && \
-	docker compose exec jupyter start.sh bash -lc "\
+	docker compose -f docker-compose.yaml -f "$(CURDIR)/scripts/lakekeeper-minio.yml" exec jupyter start.sh bash -lc "\
 		jupyter nbconvert --to notebook --execute --output-dir=/tmp /home/jovyan/examples/01-Bootstrap.ipynb && \
 		jupyter nbconvert --to notebook --execute --output-dir=/tmp /home/jovyan/examples/02-Create-Warehouse.ipynb && \
 		jupyter nbconvert --to notebook --execute --output-dir=/tmp /home/jovyan/examples/03-01-Spark.ipynb"

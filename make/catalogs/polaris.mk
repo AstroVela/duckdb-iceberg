@@ -12,7 +12,7 @@ polaris-clone:
 polaris-stop:
 	@echo "Stopping Polaris catalog..."
 	@if [ -d ".catalogs/polaris/site/content/guides/minio" ]; then \
-		(cd .catalogs/polaris/site/content/guides/minio && docker compose down -v); \
+		(cd .catalogs/polaris/site/content/guides/minio && docker compose -f docker-compose.yml -f "$(CURDIR)/scripts/polaris-minio.yml" down -v); \
 	else \
 		echo "Polaris minio directory not found, skipping stop."; \
 	fi
@@ -20,7 +20,8 @@ polaris-stop:
 polaris: polaris-clone polaris-stop
 	$(call stop_active_catalog)
 	@echo "Starting Polaris catalog..."
-	(cd .catalogs/polaris/site/content/guides/minio && docker compose up -d)
+	./scripts/build_minio_test_images.sh
+	(cd .catalogs/polaris/site/content/guides/minio && docker compose -f docker-compose.yml -f "$(CURDIR)/scripts/polaris-minio.yml" up -d)
 	$(call set_active_catalog,polaris)
 
 polaris-data: polaris
