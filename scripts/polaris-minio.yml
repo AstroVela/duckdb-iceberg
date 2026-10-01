@@ -3,7 +3,7 @@ services:
     image: astrovela-minio-test:RELEASE.2025-09-07T16-13-09Z
     pull_policy: never
     healthcheck:
-      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9000/minio/health/live"]
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9000/minio/health/ready"]
   setup_bucket:
     image: astrovela-mc-test:RELEASE.2025-08-13T08-35-41Z
     pull_policy: never
