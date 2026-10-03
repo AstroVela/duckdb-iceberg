@@ -92,9 +92,9 @@ jobs:
   vane-native:
     if: inputs.operation != 'testpypi-dev' && inputs.operation != 'release'
     # The called workflow verifies its exact SHA from GitHub job metadata.
-    uses: AstroVela/vane-extension-ci-tools/.github/workflows/_vane_extension_ci.yml@9de078021e3cb0ee09d50568aca114e58f2c2014
+    uses: AstroVela/vane-extension-ci-tools/.github/workflows/_vane_extension_ci.yml@1852af617031f24feca6724f41e946887fb6df6b
     with:
-      ci_tools_version: 9de078021e3cb0ee09d50568aca114e58f2c2014
+      ci_tools_version: 1852af617031f24feca6724f41e946887fb6df6b
       manifest: vane-extension.toml
       build_jobs: 12
       run_native_tests: true
@@ -137,6 +137,7 @@ jobs:
     permissions:
       contents: read
     env:
+      VANE_PROVIDER_PACKAGING_SOURCE: ${{ github.workspace }}/provider-packaging
       VANE_EXTENSION_ROOT: ${{ github.workspace }}/extension
       VANE_MANIFEST: ${{ github.workspace }}/extension/vane-extension.toml
       VANE_SOURCE_DIR: ${{ github.workspace }}/vane
@@ -195,7 +196,7 @@ jobs:
       - name: Validate exact Vane and CI-tools identities
         shell: bash
         env:
-          VANE_CI_TOOLS_VERSION: 9de078021e3cb0ee09d50568aca114e58f2c2014
+          VANE_CI_TOOLS_VERSION: 1852af617031f24feca6724f41e946887fb6df6b
         run: |
           set -euo pipefail
           actual_ci_tools="$(git -C extension/vane-extension-ci-tools rev-parse HEAD)"
@@ -285,6 +286,26 @@ jobs:
             VANE_VCPKG_ROOT="$VANE_VCPKG_ROOT" \
             VANE_VCPKG_INSTALLED_DIR="$VANE_VCPKG_INSTALLED_DIR" \
             VANE_BUILD_JOBS="$VANE_BUILD_JOBS"
+
+      - name: Read exact provider packaging tools pin
+        id: provider_packaging
+        run: |
+          python - <<'PY'
+          import os, tomllib
+          from pathlib import Path
+          with Path("extension/vane-provider-release.toml").open("rb") as source:
+              revision = tomllib.load(source)["packaging"]["revision"]
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"revision={revision}\n")
+          PY
+
+      - name: Checkout exact provider packaging tools
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: AstroVela/vane
+          ref: ${{ steps.provider_packaging.outputs.revision }}
+          path: provider-packaging
+          persist-credentials: false
 
       - name: Build and verify dynamic provider wheels
         env:
@@ -535,7 +556,7 @@ jobs:
       - name: Validate exact Vane and CI-tools identities
         shell: bash
         env:
-          VANE_CI_TOOLS_VERSION: 9de078021e3cb0ee09d50568aca114e58f2c2014
+          VANE_CI_TOOLS_VERSION: 1852af617031f24feca6724f41e946887fb6df6b
         run: |
           set -euo pipefail
           actual_ci_tools="$(git -C extension/vane-extension-ci-tools rev-parse HEAD)"
@@ -728,6 +749,7 @@ jobs:
       iceberg_version: ${{ steps.release.outputs.iceberg_version }}
       artifact_id: ${{ steps.wheels.outputs.artifact-id }}
     env:
+      VANE_PROVIDER_PACKAGING_SOURCE: ${{ github.workspace }}/provider-packaging
       VANE_EXTENSION_ROOT: ${{ github.workspace }}/extension
       VANE_MANIFEST: ${{ github.workspace }}/extension/${{ inputs.operation == 'release' && 'vane-extension-release.toml' || 'vane-extension.toml' }}
       VANE_SOURCE_DIR: ${{ github.workspace }}/vane
@@ -809,6 +831,26 @@ jobs:
           merge-multiple: true
           digest-mismatch: error
           path: signed
+      - name: Read exact provider packaging tools pin
+        id: provider_packaging
+        run: |
+          python - <<'PY'
+          import os, tomllib
+          from pathlib import Path
+          with Path("extension/vane-provider-release.toml").open("rb") as source:
+              revision = tomllib.load(source)["packaging"]["revision"]
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"revision={revision}\n")
+          PY
+
+      - name: Checkout exact provider packaging tools
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: AstroVela/vane
+          ref: ${{ steps.provider_packaging.outputs.revision }}
+          path: provider-packaging
+          persist-credentials: false
+
       - name: Package and qualify the full provider matrix
         shell: bash
         run: |

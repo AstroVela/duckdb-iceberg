@@ -5,9 +5,16 @@ platforms = ["manylinux_2_28_x86_64"]
 max_wheel_bytes = 100000000
 
 [providers.avro]
+release_number = 1
 distribution = "vane-extension-avro"
 dependencies = []
 
 [providers.iceberg]
+release_number = 1
 distribution = "vane-extension-iceberg"
 dependencies = ["avro"]
+
+# Packaging tools are pinned independently of the exact Vane runtime.
+[packaging]
+repository = "AstroVela/vane"
+revision = "a4ecb3bd7c444bd6bbf5872efedb218534ae4073"
