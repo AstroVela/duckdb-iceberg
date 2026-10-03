@@ -368,7 +368,9 @@ class PackagingTests(unittest.TestCase):
                 if options["extension_name"] == "iceberg":
                     self.assertTrue(options["dependency_wheel"].name.startswith("vane_extension_avro-"))
             for call in run.call_args_list:
-                self.assertIn(str(root / "vane/scripts/verify_extension_wheel.py"), call.args[0])
+                self.assertIn(str(ROOT / "vane-extension-ci-tools/scripts/vane_provider_build.py"), call.args[0])
+                self.assertEqual(call.args[0][call.args[0].index("--operation") + 1], "verify")
+                self.assertEqual(call.args[0][call.args[0].index("--vane-source") + 1], str(root / "vane"))
                 self.assertIn("--base-wheel", call.args[0])
                 self.assertIn("--dependency-wheel", call.args[0])
 

@@ -24,7 +24,7 @@ from unittest import mock
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_PATH = REPOSITORY_ROOT / "vane-provider-release.toml"
 VANE_VERSION = "0.2.0.dev612"
-VERSIONS = {"avro": "0.2.0.0.612.1", "iceberg": "0.2.0.0.612.2"}
+VERSIONS = {"avro": "0.2.0.1.dev612", "iceberg": "0.2.0.1.dev612"}
 INTERPRETERS = ("cp310", "cp311", "cp312", "cp313", "cp314")
 PLATFORM = "manylinux_2_28_x86_64"
 
@@ -44,10 +44,13 @@ def write_wheels(
     directory: Path, provider: str, *, avro_requirement: str | None = None, vane_version: str = VANE_VERSION
 ) -> list[Path]:
     distribution = f"vane_extension_{provider}"
-    version = VERSIONS[provider]
+    version = VERSIONS[provider].removesuffix(".dev612") if vane_version == "0.2.0" else VERSIONS[provider]
+    dependency_version = VERSIONS["avro"]
+    if vane_version == "0.2.0":
+        dependency_version = dependency_version.removesuffix(".dev612")
     requirements = [f"vane-ai==={vane_version}"]
     if provider == "iceberg":
-        requirements.append(avro_requirement or f"vane-extension-avro==={VERSIONS['avro']}")
+        requirements.append(avro_requirement or f"vane-extension-avro==={dependency_version}")
     metadata = (
         "Metadata-Version: 2.4\n"
         f"Name: vane-extension-{provider}\n"
@@ -127,7 +130,7 @@ class ProviderReleaseTest(unittest.TestCase):
             verify.assert_called_once_with(
                 REPOSITORY_ROOT / "vane-extension.toml", REPOSITORY_ROOT, directory / "vane", "a" * 40
             )
-            self.assertEqual(query.call_count, 2)
+            self.assertEqual(query.call_count, 4)
             expected = {
                 "vane_version": VANE_VERSION,
                 **{f"{name}_version": version for name, version in VERSIONS.items()},
@@ -225,7 +228,7 @@ class ProviderReleaseTest(unittest.TestCase):
                 redirect_stdout(io.StringIO()),
             ):
                 self.assertEqual(self.validator.main(command), 0)
-                self.assertEqual(request.call_count, 4)
+                self.assertEqual(request.call_count, 6)
                 indexed["avro"]["urls"][0]["digests"]["sha256"] = "0" * 64
                 with redirect_stderr(io.StringIO()):
                     self.assertEqual(self.validator.main(command), 2)

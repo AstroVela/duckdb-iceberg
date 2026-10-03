@@ -491,7 +491,13 @@ def _build_provider_wheel(
     command = [
         str(python),
         "-I",
-        str(vane_source / "scripts/build_extension_wheel.py"),
+        str(Path(__file__).resolve().parents[1] / "vane-extension-ci-tools/scripts/vane_provider_build.py"),
+        "--extension-root",
+        str(Path(__file__).resolve().parents[1]),
+        "--vane-source",
+        str(vane_source),
+        "--operation",
+        "build",
         "--artifact",
         str(artifact),
         "--extension-name",
@@ -804,7 +810,16 @@ def _build(arguments: argparse.Namespace, signing_private_key_contents: bytearra
                         (
                             str(builder_python),
                             "-I",
-                            str(vane_source / "scripts/verify_extension_wheel.py"),
+                            str(
+                                Path(__file__).resolve().parents[1]
+                                / "vane-extension-ci-tools/scripts/vane_provider_build.py"
+                            ),
+                            "--extension-root",
+                            str(Path(__file__).resolve().parents[1]),
+                            "--vane-source",
+                            str(vane_source),
+                            "--operation",
+                            "verify",
                             "--base-wheel",
                             str(runtime_wheel),
                             "--dependency-wheel",
