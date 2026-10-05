@@ -10,6 +10,8 @@
 
 #include "common/iceberg_utils.hpp"
 #include "execution/operator/iceberg_insert.hpp"
+#include "planning/metadata_io/avro/avro_scan.hpp"
+#include "planning/metadata_io/manifest_list/iceberg_manifest_list_reader.hpp"
 
 namespace duckdb {
 
@@ -253,8 +255,30 @@ struct VortexCopyGlobal : public GlobalFunctionData {
 	optional_ptr<CopyFunctionFileStatistics> statistics;
 };
 
+static void ValidateAppend(ClientContext &context, const IcebergTableMetadata &metadata) {
+	auto snapshot = metadata.GetLatestSnapshot();
+	if (!snapshot) {
+		return;
+	}
+	IcebergSnapshotScanInfo snapshot_info;
+	snapshot_info.snapshot = snapshot;
+	snapshot_info.schema_id = metadata.GetCurrentSchemaId();
+	vector<IcebergManifestListEntry> manifests;
+	auto scan = AvroScan::ScanManifestList(snapshot_info, metadata, context, snapshot->manifest_list, manifests);
+	manifest_list::ManifestListReader reader(*scan);
+	while (!reader.Finished()) {
+		reader.Read();
+	}
+	for (const auto &manifest : manifests) {
+		if (manifest.file.content == IcebergManifestContentType::DELETE) {
+			throw NotImplementedException("Vortex Iceberg appends do not yet support delete files");
+		}
+	}
+}
+
 IcebergCopyOptions IcebergVortex::CopyOptions(ClientContext &context, const IcebergCopyInput &input) {
 	ValidateTable(input.table_metadata);
+	ValidateAppend(context, input.table_metadata);
 	if (input.virtual_columns != IcebergInsertVirtualColumns::NONE) {
 		throw NotImplementedException("Vortex Iceberg writes currently support append only");
 	}

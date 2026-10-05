@@ -95,6 +95,9 @@ TableFunctionSet IcebergFunctions::GetIcebergScanFunction(ExtensionLoader &loade
 		function.get_multi_file_reader = IcebergMultiFileReader::CreateInstance;
 #ifdef ICEBERG_ENABLE_VORTEX
 		function.bind = IcebergVortex::BindScan;
+		// Parquet accepts arbitrary expressions, but Vortex cannot evaluate all of them.
+		// Keep generic expression filters in DuckDB for scans that may include either format.
+		function.pushdown_expression = nullptr;
 #endif
 		function.late_materialization = false;
 

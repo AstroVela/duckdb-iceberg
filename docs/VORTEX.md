@@ -59,7 +59,15 @@ acceptance of the custom file format must be tested for that catalog.
 Delete files, UPDATE, DELETE, MERGE, virtual row columns, and distributed Vane
 Vortex scans/writes are not supported by this first implementation. Remote
 Vortex data paths are rejected until object-store credentials are integrated.
-Parquet functionality uses the existing implementation.
+Vortex appends are rejected before creating files if the current snapshot
+contains delete manifests, including deletes made while the table still used
+Parquet. A format change through `set_iceberg_table_properties` takes effect at
+commit; inserts in that transaction continue to use the previously committed format.
+
+With Vortex enabled, generic expression filters are evaluated by DuckDB so that
+predicates unsupported by the Vortex reader are preserved. This also applies to
+Parquet-only Iceberg scans in an enabled build. Simple table filters and Iceberg
+metadata pruning remain enabled; default builds retain Parquet expression pushdown.
 
 The adapter stores field IDs in physical names of the form
 `__iceberg_vortex_v1_field_<id>`. Iceberg supplies the logical column names.
@@ -70,17 +78,20 @@ data files. This convention does not change the Vortex binary file format.
 ## Validation
 
 ```sh
-ICEBERG_TEST_VORTEX=1 ./build/release/test/unittest '*test/sql/local/vortex/vortex_copy.test'
+ICEBERG_TEST_VORTEX=1 ./build/release/test/unittest '*test/sql/local/vortex/*'
 python3 test/vortex/test_local_catalog.py --duckdb build/release/duckdb
 ```
 
 Set `ICEBERG_TEST_VORTEX=1` only for builds with the feature enabled. Default
-builds skip this test even if a standalone Vortex extension is installed.
+builds skip these tests even if a standalone Vortex extension is installed.
 
-The SQL test covers NULLs, primitive types, filters, projections, empty tables,
-manifest row counts, and the default Parquet writer. The Python test starts an
-isolated loopback REST catalog stub and verifies Vortex appends, mixed-format
-snapshots, actual file sizes, old snapshot readability, required fields, and
-unsupported-operation rejection. It requires no Docker, Spark, or shared catalog
-resources. It tests the extension's REST commit path, not compatibility with a
-production catalog.
+The SQL tests cover NULLs, primitive types, expression filters (including NaN),
+projections, empty tables, manifest row counts, and the default Parquet writer.
+The Python test starts an isolated loopback REST catalog stub and verifies
+Vortex appends, mixed-format snapshots, actual file sizes, old snapshot
+readability, required fields, and unsupported-operation rejection. It also
+verifies that Vortex appends to tables
+with delete manifests are rejected before any file or new snapshot is written,
+including after a transaction that deletes rows and changes the write format.
+It requires no Docker, Spark, or shared catalog resources. It tests the
+extension's REST commit path, not compatibility with a production catalog.

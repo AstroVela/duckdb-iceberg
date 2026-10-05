@@ -3,12 +3,13 @@
 Run with a shell built with ICEBERG_ENABLE_VORTEX=ON:
     python3 test/vortex/test_local_catalog.py --duckdb build/vortex/duckdb
 
-The test catalog implements only load-table and append commits. It is not a
-substitute for qualifying a production catalog's acceptance of Vortex files.
+The test catalog implements only load-table, snapshot and property commits.
+It is not a substitute for qualifying a production catalog's acceptance of Vortex files.
 """
 
 import argparse
 import copy
+from contextlib import contextmanager
 import json
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -62,6 +63,8 @@ class AppendCatalog(HTTPServer):
                     "snapshot-id": update["snapshot-id"],
                     "type": "branch",
                 }
+            elif action == "set-properties":
+                metadata["properties"].update(update["updates"])
             else:
                 raise AssertionError(f"Unexpected commit update: {update}")
         metadata.setdefault("snapshot-log", []).append(
@@ -159,6 +162,24 @@ def run_sql(shell, sql, error=None):
     return rows
 
 
+@contextmanager
+def local_catalog(metadata_path):
+    server = AppendCatalog(metadata_path)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    endpoint = f"http://127.0.0.1:{server.server_port}"
+    attach = (
+        f"ATTACH '' AS lake (TYPE iceberg, ENDPOINT {quote(endpoint)}, "
+        "AUTHORIZATION_TYPE 'none', ACCESS_DELEGATION_MODE 'none', DEFAULT_SCHEMA 'main'); "
+    )
+    try:
+        yield server, attach
+    finally:
+        server.shutdown()
+        thread.join()
+        server.server_close()
+
+
 def check_append(shell, root, initial_format):
     table = root / initial_format
     run_sql(
@@ -168,15 +189,7 @@ def check_append(shell, root, initial_format):
     )
     original_path = next((table / "metadata").glob("*.metadata.json"))
     original_contents = original_path.read_bytes()
-    server = AppendCatalog(original_path)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    endpoint = f"http://127.0.0.1:{server.server_port}"
-    attach = (
-        f"ATTACH '' AS lake (TYPE iceberg, ENDPOINT {quote(endpoint)}, "
-        "AUTHORIZATION_TYPE 'none', ACCESS_DELEGATION_MODE 'none', DEFAULT_SCHEMA 'main'); "
-    )
-    try:
+    with local_catalog(original_path) as (server, attach):
         assert run_sql(shell, attach + "SELECT count(*) n, sum(id)::BIGINT s FROM lake.main.items;") == [
             {"n": 3, "s": 3}
         ]
@@ -186,6 +199,9 @@ def check_append(shell, root, initial_format):
         assert run_sql(
             shell, attach + "SELECT count(*) n, sum(id)::BIGINT s, count(payload) p FROM lake.main.items;"
         ) == [{"n": 5, "s": 10, "p": 4}]
+        assert run_sql(
+            shell, attach + "SELECT id FROM lake.main.items WHERE md5(payload) = md5('row-2') ORDER BY id;"
+        ) == [{"id": 2}]
         assert run_sql(shell, f"SELECT count(*) n, sum(id)::BIGINT s FROM iceberg_scan({quote(original_path)});") == [
             {"n": 3, "s": 3}
         ]
@@ -217,10 +233,55 @@ def check_append(shell, root, initial_format):
         run_sql(shell, attach + "SELECT payload FROM lake.main.items ORDER BY id;", error="fixed schema")
         assert len(server.commits) == 1
         assert not server.errors, server.errors
-    finally:
-        server.shutdown()
-        thread.join()
-        server.server_close()
+
+
+def check_append_after_deletes(shell, root, same_transaction):
+    table = root / ("transaction_deletes" if same_transaction else "committed_deletes")
+    run_sql(
+        shell,
+        f"COPY (SELECT i::BIGINT id, 'row-' || i payload FROM range(3) t(i)) TO {quote(table)} (FORMAT iceberg);",
+    )
+    original_path = next((table / "metadata").glob("*.metadata.json"))
+    with local_catalog(original_path) as (server, attach):
+        server.metadata["properties"]["write.format.default"] = "parquet"
+        if same_transaction:
+            # Property updates take effect at commit, so this insert still writes Parquet.
+            assert run_sql(
+                shell,
+                attach + "BEGIN; DELETE FROM lake.main.items WHERE id = 1; "
+                "CALL set_iceberg_table_properties(lake.main.items, {'write.format.default': 'vortex'}); "
+                "INSERT INTO lake.main.items VALUES (3, 'row-3'); "
+                "SELECT value FROM iceberg_table_properties(lake.main.items) WHERE key = 'write.format.default'; "
+                "COMMIT;",
+            ) == [{"value": "parquet"}]
+            assert server.metadata["properties"]["write.format.default"] == "vortex"
+            assert not list((table / "data").glob("*.vortex"))
+            expected_ids = [{"id": 0}, {"id": 2}, {"id": 3}]
+        else:
+            run_sql(shell, attach + "DELETE FROM lake.main.items WHERE id = 1;")
+            server.metadata["properties"]["write.format.default"] = "vortex"
+            expected_ids = [{"id": 0}, {"id": 2}]
+        assert len(server.commits) == 1
+        manifest_list = server.metadata["snapshots"][-1]["manifest-list"]
+        assert run_sql(shell, f"SELECT count(*) n FROM read_avro({quote(manifest_list)}) WHERE content = 1;") == [
+            {"n": 1}
+        ]
+        before_metadata = copy.deepcopy(server.metadata)
+        before_files = set(table.rglob("*"))
+        run_sql(
+            shell,
+            attach + "INSERT INTO lake.main.items VALUES (4, 'row-4');",
+            error="Vortex Iceberg appends do not yet support delete files",
+        )
+        assert len(server.commits) == 1
+        assert server.metadata == before_metadata
+        assert set(table.rglob("*")) == before_files
+        assert run_sql(shell, attach + "SELECT id FROM lake.main.items ORDER BY id;") == expected_ids
+        server.metadata["properties"]["write.format.default"] = "parquet"
+        run_sql(shell, attach + "INSERT INTO lake.main.items VALUES (4, 'row-4');")
+        assert len(server.commits) == 2
+        assert run_sql(shell, attach + "SELECT id FROM lake.main.items ORDER BY id;") == expected_ids + [{"id": 4}]
+        assert not server.errors, server.errors
 
 
 def main():
@@ -231,7 +292,9 @@ def main():
     with tempfile.TemporaryDirectory(prefix="iceberg-vortex-") as directory:
         for initial_format in ("vortex", "parquet"):
             check_append(shell, Path(directory), initial_format)
-    print("Vortex and mixed-format catalog appends passed; old snapshots remained readable.")
+        for same_transaction in (False, True):
+            check_append_after_deletes(shell, Path(directory), same_transaction)
+    print("Vortex and mixed-format appends and filters passed; appends after deletes were rejected before writing.")
 
 
 if __name__ == "__main__":
