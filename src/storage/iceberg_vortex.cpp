@@ -3,6 +3,7 @@
 #include "duckdb/catalog/catalog_entry/copy_function_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp"
 #include "duckdb/common/multi_file/multi_file_function.hpp"
+#include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/execution/execution_context.hpp"
 #include "duckdb/parallel/thread_context.hpp"
@@ -276,6 +277,38 @@ static void ValidateAppend(ClientContext &context, const IcebergTableMetadata &m
 	}
 }
 
+static void ValidateTimestamps(DataChunk &chunk) {
+	for (auto &column : chunk.data) {
+		int64_t minimum;
+		int64_t maximum;
+		switch (column.GetType().id()) {
+		case LogicalTypeId::TIMESTAMP:
+		case LogicalTypeId::TIMESTAMP_TZ:
+			// The pinned Vortex writer validates scalars with jiff::Timestamp. Its
+			// bounds are narrower than DuckDB's, and constructing a large Span can panic.
+			minimum = -377705023201000000LL;
+			maximum = 253402207200999999LL;
+			break;
+		case LogicalTypeId::TIMESTAMP_NS:
+			// Exclude DuckDB's infinities and i64::MIN, which Jiff spans cannot represent.
+			minimum = -NumericLimits<int64_t>::Maximum() + 1;
+			maximum = NumericLimits<int64_t>::Maximum() - 1;
+			break;
+		default:
+			continue;
+		}
+		UnifiedVectorFormat format;
+		column.ToUnifiedFormat(chunk.size(), format);
+		auto values = UnifiedVectorFormat::GetData<timestamp_t>(format);
+		for (idx_t row = 0; row < chunk.size(); row++) {
+			auto index = format.sel->get_index(row);
+			if (format.validity.RowIsValid(index) && (values[index].value < minimum || values[index].value > maximum)) {
+				throw InvalidInputException("Vortex Iceberg timestamp value is outside the supported range");
+			}
+		}
+	}
+}
+
 IcebergCopyOptions IcebergVortex::CopyOptions(ClientContext &context, const IcebergCopyInput &input) {
 	ValidateTable(input.table_metadata);
 	ValidateAppend(context, input.table_metadata);
@@ -332,6 +365,7 @@ IcebergCopyOptions IcebergVortex::CopyOptions(ClientContext &context, const Iceb
 				throw ConstraintException("NOT NULL constraint failed: %s", column.second);
 			}
 		}
+		ValidateTimestamps(chunk);
 		bind.function.copy_to_sink(context, *bind.inner, *state.inner, local, chunk);
 		state.row_count += chunk.size();
 	};

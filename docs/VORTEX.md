@@ -64,10 +64,22 @@ contains delete manifests, including deletes made while the table still used
 Parquet. A format change through `set_iceberg_table_properties` takes effect at
 commit; inserts in that transaction continue to use the previously committed format.
 
-With Vortex enabled, generic expression filters are evaluated by DuckDB so that
-predicates unsupported by the Vortex reader are preserved. This also applies to
-Parquet-only Iceberg scans in an enabled build. Simple table filters and Iceberg
-metadata pruning remain enabled; default builds retain Parquet expression pushdown.
+With Vortex enabled, all row filters are evaluated by DuckDB. The pinned Vortex
+reader distinguishes positive and negative zero, so even simple comparisons
+and dynamic JOIN filters must not be delegated to it. This also disables row
+filter pushdown for Parquet-only Iceberg scans in an enabled build, with a
+possible performance cost. Iceberg metadata pruning remains enabled; default
+builds retain the original Parquet filter pushdown.
+
+The pinned Vortex writer also has a narrower timestamp range than DuckDB. Each
+batch is checked before entering the writer: infinite or out-of-range values
+raise a SQL error instead of terminating the process. `TIMESTAMP` and
+`TIMESTAMPTZ` accept epoch microseconds from `-377705023201000000` through
+`253402207200999999` (inclusive), the Jiff timestamp limits. This corresponds to
+`10000-01-02 (BC) 01:59:59` through `9999-12-30 22:00:00.999999` in UTC.
+`TIMESTAMP_NS` accepts finite values from `-9223372036854775806` through
+`9223372036854775806` epoch nanoseconds. NULLs remain supported. In particular,
+year 30000 is rejected by the Vortex writer; the Parquet writer is unchanged.
 
 The adapter stores field IDs in physical names of the form
 `__iceberg_vortex_v1_field_<id>`. Iceberg supplies the logical column names.
@@ -85,13 +97,15 @@ python3 test/vortex/test_local_catalog.py --duckdb build/release/duckdb
 Set `ICEBERG_TEST_VORTEX=1` only for builds with the feature enabled. Default
 builds skip these tests even if a standalone Vortex extension is installed.
 
-The SQL tests cover NULLs, primitive types, expression filters (including NaN),
-projections, empty tables, manifest row counts, and the default Parquet writer.
+The SQL tests cover NULLs, primitive types, filters (including NaN, signed zero,
+infinity and JOINs), timestamp limits, projections, empty tables, manifest row
+counts, and the default Parquet writer.
 The Python test starts an isolated loopback REST catalog stub and verifies
 Vortex appends, mixed-format snapshots, actual file sizes, old snapshot
 readability, required fields, and unsupported-operation rejection. It also
 verifies that Vortex appends to tables
 with delete manifests are rejected before any file or new snapshot is written,
 including after a transaction that deletes rows and changes the write format.
+Invalid timestamp appends leave the committed snapshot readable and unchanged.
 It requires no Docker, Spark, or shared catalog resources. It tests the
 extension's REST commit path, not compatibility with a production catalog.

@@ -147,7 +147,7 @@ def run_sql(shell, sql, error=None):
         timeout=120,
     )
     if error is not None:
-        assert result.returncode != 0, result.stdout
+        assert result.returncode > 0, f"Exit {result.returncode}: {result.stderr}\n{result.stdout}"
         assert error in result.stderr, result.stderr
         return None
     assert result.returncode == 0, f"Exit {result.returncode}: {result.stderr}\n{result.stdout}\nSQL: {sql}"
@@ -284,6 +284,49 @@ def check_append_after_deletes(shell, root, same_transaction):
         assert not server.errors, server.errors
 
 
+def check_float_filters(shell, root):
+    table = root / "mixed_floats"
+    run_sql(
+        shell,
+        f"COPY (SELECT 1::BIGINT id, '0.0'::FLOAT x, '0.0'::DOUBLE y) TO {quote(table)} (FORMAT iceberg);",
+    )
+    with local_catalog(next((table / "metadata").glob("*.metadata.json"))) as (server, attach):
+        run_sql(shell, attach + "INSERT INTO lake.main.items VALUES (2, '-0.0', '-0.0'), (3, NULL, NULL);")
+        for column in ("x", "y"):
+            assert run_sql(shell, attach + f"SELECT id FROM lake.main.items WHERE {column} = 0 ORDER BY id;") == [
+                {"id": 1},
+                {"id": 2},
+            ]
+            assert run_sql(shell, attach + f"SELECT count(*) n FROM lake.main.items WHERE {column} < 0;") == [{"n": 0}]
+        assert len(server.commits) == 1
+        assert not server.errors, server.errors
+
+
+def check_timestamp_appends(shell, root, dtype):
+    table = root / f"timestamps_{dtype}"
+    run_sql(
+        shell,
+        f"COPY (SELECT 0::BIGINT id, '2000-01-01'::{dtype} t) TO {quote(table)} (FORMAT iceberg);",
+    )
+    with local_catalog(next((table / "metadata").glob("*.metadata.json"))) as (server, attach):
+        before_metadata = copy.deepcopy(server.metadata)
+        for value in ("-infinity", "infinity", "30000-01-01"):
+            run_sql(
+                shell,
+                attach + f"INSERT INTO lake.main.items VALUES (1, {quote(value)}::{dtype});",
+                error="Vortex Iceberg timestamp value is outside the supported range",
+            )
+            assert not server.commits
+            assert server.metadata == before_metadata
+        assert run_sql(shell, attach + "SELECT id FROM lake.main.items;") == [{"id": 0}]
+        run_sql(shell, attach + f"INSERT INTO lake.main.items VALUES (1, '2001-01-01'::{dtype}), (2, NULL);")
+        assert run_sql(shell, attach + "SELECT count(*) n, count(t) timestamps FROM lake.main.items;") == [
+            {"n": 3, "timestamps": 2}
+        ]
+        assert len(server.commits) == 1
+        assert not server.errors, server.errors
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--duckdb", required=True, type=Path)
@@ -294,7 +337,10 @@ def main():
             check_append(shell, Path(directory), initial_format)
         for same_transaction in (False, True):
             check_append_after_deletes(shell, Path(directory), same_transaction)
-    print("Vortex and mixed-format appends and filters passed; appends after deletes were rejected before writing.")
+        check_float_filters(shell, Path(directory))
+        for dtype in ("TIMESTAMP", "TIMESTAMPTZ"):
+            check_timestamp_appends(shell, Path(directory), dtype)
+    print("Vortex catalog append, filter, delete and timestamp regressions passed.")
 
 
 if __name__ == "__main__":
