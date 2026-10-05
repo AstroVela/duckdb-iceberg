@@ -1,4 +1,7 @@
 #include "execution/operator/iceberg_delete.hpp"
+#ifdef ICEBERG_ENABLE_VORTEX
+#include "storage/iceberg_vortex.hpp"
+#endif
 
 #include "iceberg_logging.hpp"
 #ifdef ICEBERG_VANE_DISTRIBUTED
@@ -897,6 +900,11 @@ PhysicalOperator &IcebergCatalog::PlanDelete(ClientContext &context, PhysicalPla
 	}
 	auto &table_entry = op.table.Cast<IcebergTableEntry>();
 	table_entry.PrepareIcebergScanFromEntry(context);
+#ifdef ICEBERG_ENABLE_VORTEX
+	if (IcebergVortex::WriteFormat(table_entry.table_info.table_metadata) == "vortex") {
+		throw NotImplementedException("Vortex Iceberg writes currently support append only");
+	}
+#endif
 
 	auto &irc_transaction = IcebergTransaction::Get(context, *this);
 	auto &alter = irc_transaction.GetOrCreateAlter();

@@ -25,6 +25,9 @@
 #include "planning/iceberg_multi_file_reader.hpp"
 #include "function/iceberg_functions.hpp"
 #include "catalog/rest/catalog_entry/table/iceberg_table_entry.hpp"
+#ifdef ICEBERG_ENABLE_VORTEX
+#include "storage/iceberg_vortex.hpp"
+#endif
 #ifdef ICEBERG_VANE_DISTRIBUTED
 #include "function/scan/iceberg_distributed_scan.hpp"
 #endif
@@ -90,6 +93,9 @@ TableFunctionSet IcebergFunctions::GetIcebergScanFunction(ExtensionLoader &loade
 	for (auto &function : parquet_scan_copy.functions) {
 		// Register the MultiFileReader as the driver for reads
 		function.get_multi_file_reader = IcebergMultiFileReader::CreateInstance;
+#ifdef ICEBERG_ENABLE_VORTEX
+		function.bind = IcebergVortex::BindScan;
+#endif
 		function.late_materialization = false;
 
 		// Unset all of these: they are either broken, very inefficient.

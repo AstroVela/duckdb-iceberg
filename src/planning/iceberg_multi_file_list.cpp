@@ -1,4 +1,7 @@
 #include "planning/iceberg_multi_file_list.hpp"
+#ifdef ICEBERG_ENABLE_VORTEX
+#include "storage/iceberg_vortex.hpp"
+#endif
 
 #include "duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp"
 #include "duckdb/common/exception.hpp"
@@ -1011,10 +1014,23 @@ OpenFileInfo IcebergMultiFileList::GetFileInternal(idx_t file_id, lock_guard<mut
 	auto &data_file = manifest_entry.data_file;
 	const auto &path = data_file.file_path;
 
+#ifdef ICEBERG_ENABLE_VORTEX
+	auto is_vortex = StringUtil::CIEquals(data_file.file_format, "vortex");
+	if (is_vortex) {
+		IcebergVortex::ValidateTable(GetMetadata());
+		if (!delete_manifests.empty()) {
+			throw NotImplementedException("Vortex Iceberg scans do not yet support delete files");
+		}
+	} else if (!StringUtil::CIEquals(data_file.file_format, "parquet")) {
+		throw NotImplementedException("File format '%s' not supported, only supports 'parquet' and 'vortex' currently",
+		                              data_file.file_format);
+	}
+#else
 	if (!StringUtil::CIEquals(data_file.file_format, "parquet")) {
 		throw NotImplementedException("File format '%s' not supported, only supports 'parquet' currently",
 		                              data_file.file_format);
 	}
+#endif
 
 	string file_path = path;
 	if (options.allow_moved_paths) {
@@ -1024,6 +1040,9 @@ OpenFileInfo IcebergMultiFileList::GetFileInternal(idx_t file_id, lock_guard<mut
 	}
 	OpenFileInfo res(file_path);
 	auto extended_info = make_shared_ptr<ExtendedOpenFileInfo>();
+#ifdef ICEBERG_ENABLE_VORTEX
+	extended_info->options["iceberg_file_format"] = Value(is_vortex ? "vortex" : "parquet");
+#endif
 	extended_info->options["file_size"] = Value::UBIGINT(data_file.file_size_in_bytes);
 	// files managed by Iceberg are never modified - we can keep them cached
 	extended_info->options["validate_external_file_cache"] = Value::BOOLEAN(false);

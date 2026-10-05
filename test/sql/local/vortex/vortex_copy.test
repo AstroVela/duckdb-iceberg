@@ -1,0 +1,103 @@
+# name: test/sql/local/vortex/vortex_copy.test
+# group: [vortex]
+
+require-env ICEBERG_TEST_VORTEX 1
+
+require avro
+
+require parquet
+
+require iceberg
+
+require vortex
+
+statement ok
+SET threads = 4;
+
+statement ok
+COPY (
+    SELECT i::BIGINT AS id, CASE WHEN i % 3 = 0 THEN NULL ELSE 'row-' || i END AS payload
+    FROM range(10000) t(i)
+) TO '__TEST_DIR__/iceberg_vortex' (FORMAT iceberg, DATA_FORMAT vortex);
+
+query III
+SELECT count(*), sum(id), count(payload) FROM iceberg_scan('__TEST_DIR__/iceberg_vortex');
+----
+10000	49995000	6666
+
+query TI
+SELECT payload, id FROM iceberg_scan('__TEST_DIR__/iceberg_vortex') WHERE id BETWEEN 7 AND 8 ORDER BY id;
+----
+row-7	7
+row-8	8
+
+query T
+SELECT payload FROM iceberg_scan('__TEST_DIR__/iceberg_vortex') WHERE id = 8;
+----
+row-8
+
+query I
+SELECT count(*) FROM iceberg_scan('__TEST_DIR__/iceberg_vortex') WHERE id BETWEEN 2046 AND 2050;
+----
+5
+
+query I
+SELECT count(*) FROM iceberg_scan('__TEST_DIR__/iceberg_vortex') WHERE payload IS NULL;
+----
+3334
+
+query T
+SELECT DISTINCT file_format FROM iceberg_metadata('__TEST_DIR__/iceberg_vortex');
+----
+vortex
+
+query I
+SELECT sum(record_count) FROM iceberg_metadata('__TEST_DIR__/iceberg_vortex');
+----
+10000
+
+statement ok
+CREATE TABLE vortex_types AS
+SELECT i::INTEGER id, i % 2 = 0 flag, (i / 3)::DOUBLE AS fraction,
+       (i / 10)::DECIMAL(12, 2) amount, DATE '2025-01-01' + i::INTEGER AS day,
+       TIMESTAMP '2025-01-01' + i * INTERVAL '1 second' instant,
+       CASE WHEN i % 2 = 0 THEN NULL ELSE 'hello' END AS "column with spaces"
+FROM range(4099) t(i);
+
+statement ok
+COPY vortex_types TO '__TEST_DIR__/iceberg_vortex_types' (FORMAT iceberg, DATA_FORMAT vortex);
+
+query I
+SELECT count(*) FROM (
+    (FROM vortex_types EXCEPT ALL FROM iceberg_scan('__TEST_DIR__/iceberg_vortex_types'))
+    UNION ALL
+    (FROM iceberg_scan('__TEST_DIR__/iceberg_vortex_types') EXCEPT ALL FROM vortex_types)
+);
+----
+0
+
+statement ok
+COPY (SELECT 42::BIGINT AS id) TO '__TEST_DIR__/iceberg_parquet' (FORMAT iceberg);
+
+query I
+SELECT id FROM iceberg_scan('__TEST_DIR__/iceberg_parquet');
+----
+42
+
+statement ok
+COPY (SELECT 1::BIGINT AS id WHERE false) TO '__TEST_DIR__/iceberg_vortex_empty' (FORMAT iceberg, DATA_FORMAT vortex);
+
+query I
+SELECT count(*) FROM iceberg_scan('__TEST_DIR__/iceberg_vortex_empty');
+----
+0
+
+statement error
+COPY (SELECT [1, 2] AS items) TO '__TEST_DIR__/iceberg_vortex_nested' (FORMAT iceberg, DATA_FORMAT vortex);
+----
+Vortex Iceberg data files currently require primitive columns
+
+statement error
+COPY (SELECT 1 AS id) TO '__TEST_DIR__/iceberg_bad_format' (FORMAT iceberg, DATA_FORMAT unknown);
+----
+Unsupported Iceberg data format

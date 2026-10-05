@@ -5,6 +5,9 @@
 
 #include "execution/operator/copy/iceberg_copy.hpp"
 #include "catalog/rest/api/iceberg_create_table_request.hpp"
+#ifdef ICEBERG_ENABLE_VORTEX
+#include "storage/iceberg_vortex.hpp"
+#endif
 
 namespace duckdb {
 
@@ -71,7 +74,27 @@ CopyIcebergBindData::CopyIcebergBindData(const CopyInfo &info, vector<string> &&
 	table_metadata->last_partition_field_id = 0;
 	table_metadata->default_sort_order_id = 0;
 
+#ifdef ICEBERG_ENABLE_VORTEX
+	// Catalog appends resolve the default sort order from this map.
+	IcebergSortOrder sort_order;
+	sort_order.sort_order_id = 0;
+	table_metadata->sort_specs.emplace(0, std::move(sort_order));
+	for (const auto &option : info.options) {
+		if (StringUtil::CIEquals(option.first, "data_format")) {
+			if (option.second.size() != 1 || option.second[0].IsNull()) {
+				throw BinderException("Iceberg DATA_FORMAT requires one format name");
+			}
+			table_metadata->table_properties["write.format.default"] = option.second[0].GetValue<string>();
+		} else {
+			throw BinderException("Unsupported Iceberg COPY option '%s'", option.first);
+		}
+	}
+	if (IcebergVortex::WriteFormat(*table_metadata) == "vortex") {
+		IcebergVortex::ValidateTable(*table_metadata);
+	}
+#else
 	//! TODO: Parse any iceberg-specific options from info.options if needed
+#endif
 }
 
 unique_ptr<FunctionData> CopyIcebergBindData::Copy() const {

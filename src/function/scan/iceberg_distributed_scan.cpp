@@ -60,6 +60,11 @@ static shared_ptr<IcebergScanInfo> CreateOwnedDistributedScanInfo(const string &
 }
 
 static void SerializeDataFile(Serializer &serializer, const IcebergDataFile &file) {
+#ifdef ICEBERG_ENABLE_VORTEX
+	if (StringUtil::CIEquals(file.file_format, "vortex")) {
+		throw NotImplementedException("Distributed Iceberg scans of Vortex data files are not yet supported");
+	}
+#endif
 	vector<uint64_t> partition_field_ids;
 	vector<Value> partition_values;
 	partition_field_ids.reserve(file.partition_info.size());
