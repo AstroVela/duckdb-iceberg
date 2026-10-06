@@ -1,0 +1,96 @@
+# name: test/sql/local/vortex/vortex_time.test
+# group: [vortex]
+
+require-env ICEBERG_TEST_VORTEX 1
+
+require avro
+
+require parquet
+
+require iceberg
+
+require vortex
+
+statement error
+COPY (SELECT TIME '24:00:00' t) TO '__TEST_DIR__/iceberg_time_invalid' (FORMAT iceberg, DATA_FORMAT vortex);
+----
+Vortex Iceberg time value is outside the supported range
+
+# A rejected write must leave the connection usable.
+query I
+SELECT 42;
+----
+42
+
+statement ok
+CREATE TABLE time_bounds AS
+SELECT * FROM (VALUES (1, TIME '00:00:00'), (2, TIME '23:59:59.999999'),
+                     (3, TIME '12:34:56.123456'), (4, NULL::TIME)) v(id, t);
+
+statement ok
+COPY time_bounds TO '__TEST_DIR__/iceberg_time_bounds' (FORMAT iceberg, DATA_FORMAT vortex);
+
+query I
+SELECT count(*) FROM (
+    (FROM time_bounds EXCEPT ALL FROM iceberg_scan('__TEST_DIR__/iceberg_time_bounds'))
+    UNION ALL
+    (FROM iceberg_scan('__TEST_DIR__/iceberg_time_bounds') EXCEPT ALL FROM time_bounds)
+);
+----
+0
+
+statement ok
+COPY (SELECT TIME '23:59:59.999999' t FROM range(4099)) TO '__TEST_DIR__/iceberg_time_constant' (FORMAT iceberg, DATA_FORMAT vortex);
+
+query ITT
+SELECT count(*), min(t), max(t) FROM iceberg_scan('__TEST_DIR__/iceberg_time_constant');
+----
+4099	23:59:59.999999	23:59:59.999999
+
+statement ok
+COPY (SELECT NULL::TIME t FROM range(4099)) TO '__TEST_DIR__/iceberg_time_null' (FORMAT iceberg, DATA_FORMAT vortex);
+
+query II
+SELECT count(*), count(t) FROM iceberg_scan('__TEST_DIR__/iceberg_time_null');
+----
+4099	0
+
+# Reject an invalid value even after earlier batches have been written.
+statement error
+COPY (
+    SELECT CASE WHEN i = 2048 THEN TIME '24:00:00' ELSE TIME '12:00:00' END t FROM range(4099) v(i)
+) TO '__TEST_DIR__/iceberg_time_late' (FORMAT iceberg, DATA_FORMAT vortex);
+----
+Vortex Iceberg time value is outside the supported range
+
+query I
+SELECT 42;
+----
+42
+
+statement ok
+CREATE TABLE time_selection AS
+SELECT i, CASE WHEN i % 2 = 0 THEN TIME '24:00:00' ELSE TIME '12:34:56.123456' END t FROM range(4099) v(i);
+
+# Values removed by a filter must not be validated or written.
+statement ok
+COPY (SELECT t FROM time_selection WHERE i % 2 = 1) TO '__TEST_DIR__/iceberg_time_selected' (FORMAT iceberg, DATA_FORMAT vortex);
+
+query ITT
+SELECT count(*), min(t), max(t) FROM iceberg_scan('__TEST_DIR__/iceberg_time_selected');
+----
+2049	12:34:56.123456	12:34:56.123456
+
+statement error
+COPY (SELECT t FROM time_selection WHERE i % 2 = 0) TO '__TEST_DIR__/iceberg_time_selected_invalid' (FORMAT iceberg, DATA_FORMAT vortex);
+----
+Vortex Iceberg time value is outside the supported range
+
+# The Parquet writer continues to support DuckDB's end-of-day value.
+statement ok
+COPY (SELECT TIME '24:00:00' t) TO '__TEST_DIR__/iceberg_time_parquet' (FORMAT iceberg, DATA_FORMAT parquet);
+
+query T
+SELECT t FROM iceberg_scan('__TEST_DIR__/iceberg_time_parquet');
+----
+24:00:00

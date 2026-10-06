@@ -3,6 +3,8 @@
 #include "duckdb/catalog/catalog_entry/copy_function_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp"
 #include "duckdb/common/multi_file/multi_file_function.hpp"
+#include "duckdb/common/types/datetime.hpp"
+#include "duckdb/common/types/interval.hpp"
 #include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/execution/execution_context.hpp"
@@ -277,34 +279,45 @@ static void ValidateAppend(ClientContext &context, const IcebergTableMetadata &m
 	}
 }
 
-static void ValidateTimestamps(DataChunk &chunk) {
+template <class T>
+static void ValidateTemporalRange(Vector &column, idx_t count, int64_t minimum, int64_t maximum,
+                                  const char *type_name) {
+	UnifiedVectorFormat format;
+	column.ToUnifiedFormat(count, format);
+	auto values = UnifiedVectorFormat::GetData<T>(format);
+	for (idx_t row = 0; row < count; row++) {
+		auto index = format.sel->get_index(row);
+		if (!format.validity.RowIsValid(index)) {
+			continue;
+		}
+		auto value = static_cast<int64_t>(values[index]);
+		if (value < minimum || value > maximum) {
+			throw InvalidInputException("Vortex Iceberg %s value is outside the supported range", type_name);
+		}
+	}
+}
+
+static void ValidateTemporalValues(DataChunk &chunk) {
 	for (auto &column : chunk.data) {
-		int64_t minimum;
-		int64_t maximum;
 		switch (column.GetType().id()) {
+		case LogicalTypeId::TIME:
+			// DuckDB permits 24:00:00, but the pinned Vortex/Jiff time scalar excludes it.
+			ValidateTemporalRange<dtime_t>(column, chunk.size(), 0, Interval::MICROS_PER_DAY - 1, "time");
+			break;
 		case LogicalTypeId::TIMESTAMP:
 		case LogicalTypeId::TIMESTAMP_TZ:
 			// The pinned Vortex writer validates scalars with jiff::Timestamp. Its
 			// bounds are narrower than DuckDB's, and constructing a large Span can panic.
-			minimum = -377705023201000000LL;
-			maximum = 253402207200999999LL;
+			ValidateTemporalRange<timestamp_t>(column, chunk.size(), -377705023201000000LL, 253402207200999999LL,
+			                                   "timestamp");
 			break;
 		case LogicalTypeId::TIMESTAMP_NS:
 			// Exclude DuckDB's infinities and i64::MIN, which Jiff spans cannot represent.
-			minimum = -NumericLimits<int64_t>::Maximum() + 1;
-			maximum = NumericLimits<int64_t>::Maximum() - 1;
+			ValidateTemporalRange<timestamp_ns_t>(column, chunk.size(), -NumericLimits<int64_t>::Maximum() + 1,
+			                                      NumericLimits<int64_t>::Maximum() - 1, "timestamp");
 			break;
 		default:
-			continue;
-		}
-		UnifiedVectorFormat format;
-		column.ToUnifiedFormat(chunk.size(), format);
-		auto values = UnifiedVectorFormat::GetData<timestamp_t>(format);
-		for (idx_t row = 0; row < chunk.size(); row++) {
-			auto index = format.sel->get_index(row);
-			if (format.validity.RowIsValid(index) && (values[index].value < minimum || values[index].value > maximum)) {
-				throw InvalidInputException("Vortex Iceberg timestamp value is outside the supported range");
-			}
+			break;
 		}
 	}
 }
@@ -365,7 +378,7 @@ IcebergCopyOptions IcebergVortex::CopyOptions(ClientContext &context, const Iceb
 				throw ConstraintException("NOT NULL constraint failed: %s", column.second);
 			}
 		}
-		ValidateTimestamps(chunk);
+		ValidateTemporalValues(chunk);
 		bind.function.copy_to_sink(context, *bind.inner, *state.inner, local, chunk);
 		state.row_count += chunk.size();
 	};

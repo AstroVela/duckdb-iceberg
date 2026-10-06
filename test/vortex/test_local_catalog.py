@@ -327,6 +327,40 @@ def check_timestamp_appends(shell, root, dtype):
         assert not server.errors, server.errors
 
 
+def check_time_appends(shell, root):
+    table = root / "times"
+    run_sql(
+        shell,
+        f"COPY (SELECT 0::BIGINT id, TIME '24:00:00' t) TO {quote(table)} (FORMAT iceberg);",
+    )
+    with local_catalog(next((table / "metadata").glob("*.metadata.json"))) as (server, attach):
+        before_metadata = copy.deepcopy(server.metadata)
+        for insert in (
+            "INSERT INTO lake.main.items VALUES (1, TIME '24:00:00');",
+            "INSERT INTO lake.main.items SELECT i + 1, "
+            "CASE WHEN i = 2048 THEN TIME '24:00:00' ELSE TIME '12:00:00' END FROM range(4099) v(i);",
+        ):
+            run_sql(shell, attach + insert, error="Vortex Iceberg time value is outside the supported range")
+            assert not server.commits
+            assert server.metadata == before_metadata
+            assert run_sql(shell, attach + "SELECT id, t::VARCHAR t FROM lake.main.items;") == [
+                {"id": 0, "t": "24:00:00"}
+            ]
+        run_sql(
+            shell,
+            attach + "INSERT INTO lake.main.items VALUES (1, TIME '00:00:00'), "
+            "(2, TIME '23:59:59.999999'), (3, NULL);",
+        )
+        assert run_sql(shell, attach + "SELECT id, t::VARCHAR t FROM lake.main.items ORDER BY id;") == [
+            {"id": 0, "t": "24:00:00"},
+            {"id": 1, "t": "00:00:00"},
+            {"id": 2, "t": "23:59:59.999999"},
+            {"id": 3, "t": None},
+        ]
+        assert len(server.commits) == 1
+        assert not server.errors, server.errors
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--duckdb", required=True, type=Path)
@@ -340,7 +374,8 @@ def main():
         check_float_filters(shell, Path(directory))
         for dtype in ("TIMESTAMP", "TIMESTAMPTZ"):
             check_timestamp_appends(shell, Path(directory), dtype)
-    print("Vortex catalog append, filter, delete and timestamp regressions passed.")
+        check_time_appends(shell, Path(directory))
+    print("Vortex catalog append, filter, delete, timestamp and time regressions passed.")
 
 
 if __name__ == "__main__":

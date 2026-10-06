@@ -81,6 +81,11 @@ raise a SQL error instead of terminating the process. `TIMESTAMP` and
 `9223372036854775806` epoch nanoseconds. NULLs remain supported. In particular,
 year 30000 is rejected by the Vortex writer; the Parquet writer is unchanged.
 
+`TIME` is checked in the same way and must be between `00:00:00` and
+`23:59:59.999999` (inclusive). DuckDB's `TIME '24:00:00'` raises a SQL error
+before entering the Vortex writer in both COPY and catalog INSERT. NULLs
+remain supported, and Parquet continues to accept `24:00:00`.
+
 The adapter stores field IDs in physical names of the form
 `__iceberg_vortex_v1_field_<id>`. Iceberg supplies the logical column names.
 Every Vortex file must contain exactly the declared fields with matching types;
@@ -98,14 +103,15 @@ Set `ICEBERG_TEST_VORTEX=1` only for builds with the feature enabled. Default
 builds skip these tests even if a standalone Vortex extension is installed.
 
 The SQL tests cover NULLs, primitive types, filters (including NaN, signed zero,
-infinity and JOINs), timestamp limits, projections, empty tables, manifest row
-counts, and the default Parquet writer.
+infinity and JOINs), timestamp and TIME limits, projections, empty tables,
+manifest row counts, and the default Parquet writer.
 The Python test starts an isolated loopback REST catalog stub and verifies
 Vortex appends, mixed-format snapshots, actual file sizes, old snapshot
 readability, required fields, and unsupported-operation rejection. It also
 verifies that Vortex appends to tables
 with delete manifests are rejected before any file or new snapshot is written,
 including after a transaction that deletes rows and changes the write format.
-Invalid timestamp appends leave the committed snapshot readable and unchanged.
+Invalid timestamp and TIME appends leave the committed snapshot readable and
+unchanged, including when an invalid TIME appears after earlier batches.
 It requires no Docker, Spark, or shared catalog resources. It tests the
 extension's REST commit path, not compatibility with a production catalog.
