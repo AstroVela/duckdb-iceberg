@@ -68,6 +68,13 @@ before writing Vortex data files or committing a snapshot. Relative data paths
 are expanded to absolute paths, including validation of the working directory.
 Parquet data paths retain their existing behavior.
 
+Before binding or executing a Vortex file scan, the adapter opens the actual
+data file through DuckDB's client filesystem to enforce its access policy.
+With `enable_external_access=false`, permitting the metadata directory alone
+does not permit reading data files. Each data file must be covered by
+`allowed_directories` or `allowed_paths`, including in mixed-format snapshots
+and queries prepared before external access was disabled.
+
 Vortex appends are rejected before creating files if the current snapshot
 contains delete manifests, including deletes made while the table still used
 Parquet. A format change through `set_iceberg_table_properties` takes effect at
@@ -106,6 +113,7 @@ data files. This convention does not change the Vortex binary file format.
 ```sh
 ICEBERG_TEST_VORTEX=1 ./build/release/test/unittest '*test/sql/local/vortex/*'
 python3 test/vortex/test_local_catalog.py --duckdb build/release/duckdb
+python3 test/vortex/test_file_access.py --duckdb build/release/duckdb
 ```
 
 Set `ICEBERG_TEST_VORTEX=1` only for builds with the feature enabled. Default
@@ -128,3 +136,7 @@ spaces, `#`, `%`, non-ASCII names, and a relative path from a working directory
 containing spaces. Aggregate appends preserve decimal values and NULLs.
 It requires no Docker, Spark, or shared catalog resources. It tests the
 extension's REST commit path, not compatibility with a production catalog.
+
+The access test compares Parquet and Vortex with external access disabled. It
+checks metadata-only denial, directory and exact-file grants, cached and
+prepared queries, and individual file permissions in mixed-format snapshots.

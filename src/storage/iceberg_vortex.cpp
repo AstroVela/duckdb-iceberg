@@ -85,12 +85,20 @@ static string VortexLocalPath(ClientContext &context, const string &path) {
 	return absolute_path;
 }
 
+static void VerifyVortexFileAccess(ClientContext &context, const string &path) {
+	// Native Vortex I/O bypasses DuckDB's filesystem. Open through it first to
+	// enforce the client's access policy and disabled-filesystem restrictions.
+	auto handle = FileSystem::GetFileSystem(context).OpenFile(path, FileFlags::FILE_FLAGS_READ);
+}
+
 // Each file is claimed by one scan task. Other files can be scanned in parallel.
 class IcebergVortexReader : public BaseFileReader {
 public:
 	IcebergVortexReader(ClientContext &context, const OpenFileInfo &file, const MultiFileBindData &iceberg_bind)
 	    : BaseFileReader(file), scan(FindScan(context, "read_vortex", LogicalType::VARCHAR)) {
-		vector<Value> inputs {Value(VortexLocalPath(context, file.path))};
+		scan_path = VortexLocalPath(context, file.path);
+		VerifyVortexFileAccess(context, scan_path);
+		vector<Value> inputs {Value(scan_path)};
 		named_parameter_map_t parameters;
 		vector<LogicalType> input_types;
 		vector<string> input_names;
@@ -137,6 +145,8 @@ public:
 	}
 
 	void PrepareScan(ClientContext &context, GlobalTableFunctionState &, LocalTableFunctionState &) override {
+		// Access settings can change after a prepared query has bound this reader.
+		VerifyVortexFileAccess(context, scan_path);
 		if (deletion_filter) {
 			throw NotImplementedException("Vortex Iceberg scans do not yet support delete files");
 		}
@@ -168,6 +178,7 @@ public:
 
 private:
 	TableFunction scan;
+	string scan_path;
 	unique_ptr<FunctionData> bind_data;
 	unique_ptr<GlobalTableFunctionState> global;
 	unique_ptr<LocalTableFunctionState> local;
