@@ -55,10 +55,19 @@ acceptance of the custom file format must be tested for that catalog.
 - Table export, scans with projection and filters, and catalog-backed appends.
 - Accurate file row counts and sizes; optional column statistics are omitted.
 - Required Iceberg fields are checked for NULLs before writing each batch.
+- Query results are cast to the Iceberg schema before writing. For example,
+  `SUM(BIGINT)` produces a `HUGEINT` that is stored as `DECIMAL(38,0)`; values
+  outside the decimal range raise a SQL cast error.
 
 Delete files, UPDATE, DELETE, MERGE, virtual row columns, and distributed Vane
 Vortex scans/writes are not supported by this first implementation. Remote
 Vortex data paths are rejected until object-store credentials are integrated.
+The pinned reader also cannot read URL-escaped local paths. Spaces, `#`, `%`,
+non-ASCII characters, and other characters requiring URL escaping are rejected
+before writing Vortex data files or committing a snapshot. Relative data paths
+are expanded to absolute paths, including validation of the working directory.
+Parquet data paths retain their existing behavior.
+
 Vortex appends are rejected before creating files if the current snapshot
 contains delete manifests, including deletes made while the table still used
 Parquet. A format change through `set_iceberg_table_properties` takes effect at
@@ -104,7 +113,8 @@ builds skip these tests even if a standalone Vortex extension is installed.
 
 The SQL tests cover NULLs, primitive types, filters (including NaN, signed zero,
 infinity and JOINs), timestamp and TIME limits, projections, empty tables,
-manifest row counts, and the default Parquet writer.
+manifest row counts, aggregate output casts, decimal limits, and the default
+Parquet writer.
 The Python test starts an isolated loopback REST catalog stub and verifies
 Vortex appends, mixed-format snapshots, actual file sizes, old snapshot
 readability, required fields, and unsupported-operation rejection. It also
@@ -113,5 +123,8 @@ with delete manifests are rejected before any file or new snapshot is written,
 including after a transaction that deletes rows and changes the write format.
 Invalid timestamp and TIME appends leave the committed snapshot readable and
 unchanged, including when an invalid TIME appears after earlier batches.
+Rejected data paths leave the snapshot and files unchanged; the tests cover
+spaces, `#`, `%`, non-ASCII names, and a relative path from a working directory
+containing spaces. Aggregate appends preserve decimal values and NULLs.
 It requires no Docker, Spark, or shared catalog resources. It tests the
 extension's REST commit path, not compatibility with a production catalog.

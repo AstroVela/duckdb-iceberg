@@ -57,16 +57,40 @@ static TableFunction FindScan(ClientContext &context, const string &name, const 
 	return entry.functions.GetFunctionByArguments(context, {argument});
 }
 
+static string VortexLocalPath(ClientContext &context, const string &path) {
+	auto &fs = FileSystem::GetFileSystem(context);
+	if (fs.IsRemoteFile(path) || path.find("://") != string::npos) {
+		throw NotImplementedException("Vortex Iceberg data files currently require literal local file paths");
+	}
+	auto absolute_path = fs.ExpandPath(path);
+	if (!fs.IsPathAbsolute(absolute_path)) {
+		absolute_path = fs.JoinPath(fs.GetWorkingDirectory(), absolute_path);
+	}
+	if (absolute_path.find_first_of("*?[") != string::npos) {
+		throw NotImplementedException("Vortex Iceberg data files currently require literal local file paths");
+	}
+	// The pinned reader uses Url::path() without decoding it. Check the absolute
+	// path so a relative destination cannot hide an escaped working directory.
+	const string escaped_characters = "\"#%<>`{}";
+	for (auto character : absolute_path) {
+		auto byte = static_cast<uint8_t>(character);
+		auto requires_encoding = byte <= 0x20 || byte >= 0x7f || escaped_characters.find(character) != string::npos;
+#ifndef _WIN32
+		requires_encoding = requires_encoding || character == '\\';
+#endif
+		if (requires_encoding) {
+			throw NotImplementedException("Vortex Iceberg data paths cannot contain URL-escaped characters");
+		}
+	}
+	return absolute_path;
+}
+
 // Each file is claimed by one scan task. Other files can be scanned in parallel.
 class IcebergVortexReader : public BaseFileReader {
 public:
 	IcebergVortexReader(ClientContext &context, const OpenFileInfo &file, const MultiFileBindData &iceberg_bind)
 	    : BaseFileReader(file), scan(FindScan(context, "read_vortex", LogicalType::VARCHAR)) {
-		if (FileSystem::GetFileSystem(context).IsRemoteFile(file.path) ||
-		    file.path.find_first_of("*?[") != string::npos) {
-			throw NotImplementedException("Vortex Iceberg data files currently require literal local file paths");
-		}
-		vector<Value> inputs {Value(file.path)};
+		vector<Value> inputs {Value(VortexLocalPath(context, file.path))};
 		named_parameter_map_t parameters;
 		vector<LogicalType> input_types;
 		vector<string> input_names;
@@ -236,19 +260,28 @@ unique_ptr<FunctionData> IcebergVortex::BindScan(ClientContext &context, TableFu
 }
 
 struct VortexCopyBind : public FunctionData {
-	VortexCopyBind(CopyFunction function, unique_ptr<FunctionData> inner, vector<pair<idx_t, string>> required_columns)
-	    : function(std::move(function)), inner(std::move(inner)), required_columns(std::move(required_columns)) {
+	VortexCopyBind(CopyFunction function, unique_ptr<FunctionData> inner, vector<LogicalType> types,
+	               vector<pair<idx_t, string>> required_columns)
+	    : function(std::move(function)), inner(std::move(inner)), types(std::move(types)),
+	      required_columns(std::move(required_columns)) {
 	}
 	unique_ptr<FunctionData> Copy() const override {
-		return make_uniq<VortexCopyBind>(function, inner->Copy(), required_columns);
+		return make_uniq<VortexCopyBind>(function, inner->Copy(), types, required_columns);
 	}
 	bool Equals(const FunctionData &other) const override {
 		auto &other_bind = other.Cast<VortexCopyBind>();
-		return required_columns == other_bind.required_columns && inner->Equals(*other_bind.inner);
+		return types == other_bind.types && required_columns == other_bind.required_columns &&
+		       inner->Equals(*other_bind.inner);
 	}
 	CopyFunction function;
 	unique_ptr<FunctionData> inner;
+	vector<LogicalType> types;
 	vector<pair<idx_t, string>> required_columns;
+};
+
+struct VortexCopyLocal : public LocalFunctionData {
+	unique_ptr<LocalFunctionData> inner;
+	DataChunk cast_chunk;
 };
 
 struct VortexCopyGlobal : public GlobalFunctionData {
@@ -329,18 +362,16 @@ IcebergCopyOptions IcebergVortex::CopyOptions(ClientContext &context, const Iceb
 		throw NotImplementedException("Vortex Iceberg writes currently support append only");
 	}
 	auto &fs = FileSystem::GetFileSystem(context);
-	if (fs.IsRemoteFile(input.data_path) || input.data_path.find_first_of("*?[") != string::npos) {
-		throw NotImplementedException("Vortex Iceberg data files currently require literal local file paths");
-	}
+	auto data_path = VortexLocalPath(context, input.data_path);
 	if (!input.options.empty()) {
 		throw NotImplementedException("Vortex Iceberg writes do not yet support COPY options");
 	}
-	if (!fs.DirectoryExists(input.data_path)) {
-		fs.CreateDirectoriesRecursive(input.data_path);
+	if (!fs.DirectoryExists(data_path)) {
+		fs.CreateDirectoriesRecursive(data_path);
 	}
 	auto &inner = IcebergUtils::GetCopyFunction(context, "vortex").function;
 	auto info = make_uniq<CopyInfo>();
-	info->file_path = input.data_path;
+	info->file_path = data_path;
 	info->format = "vortex";
 	info->is_from = false;
 	vector<string> physical_names;
@@ -354,8 +385,8 @@ IcebergCopyOptions IcebergVortex::CopyOptions(ClientContext &context, const Iceb
 		types.push_back(column->type);
 	}
 	CopyFunctionBindInput bind_input(*info);
-	auto bind = make_uniq<VortexCopyBind>(inner, inner.copy_to_bind(context, bind_input, physical_names, types),
-	                                      std::move(required_columns));
+	auto inner_bind = inner.copy_to_bind(context, bind_input, physical_names, types);
+	auto bind = make_uniq<VortexCopyBind>(inner, std::move(inner_bind), std::move(types), std::move(required_columns));
 	CopyFunction function("iceberg_vortex");
 	function.extension = "vortex";
 	function.copy_to_initialize_global = [](ClientContext &context, FunctionData &data, const string &path) {
@@ -367,26 +398,44 @@ IcebergCopyOptions IcebergVortex::CopyOptions(ClientContext &context, const Iceb
 	};
 	function.copy_to_initialize_local = [](ExecutionContext &context, FunctionData &data) {
 		auto &bind = data.Cast<VortexCopyBind>();
-		return bind.function.copy_to_initialize_local(context, *bind.inner);
+		auto result = make_uniq<VortexCopyLocal>();
+		result->inner = bind.function.copy_to_initialize_local(context, *bind.inner);
+		result->cast_chunk.Initialize(context.client, bind.types);
+		return unique_ptr<LocalFunctionData>(std::move(result));
 	};
 	function.copy_to_sink = [](ExecutionContext &context, FunctionData &data, GlobalFunctionData &global,
 	                           LocalFunctionData &local, DataChunk &chunk) {
 		auto &bind = data.Cast<VortexCopyBind>();
 		auto &state = global.Cast<VortexCopyGlobal>();
+		auto &local_state = local.Cast<VortexCopyLocal>();
+		auto &converted = local_state.cast_chunk;
+		converted.Reset();
+		D_ASSERT(chunk.ColumnCount() == bind.types.size());
+		// COPY query output can differ from the Iceberg schema (e.g. SUM returns
+		// HUGEINT, stored as DECIMAL(38,0)). The native writer uses the chunk types.
+		for (idx_t column = 0; column < bind.types.size(); column++) {
+			if (chunk.data[column].GetType() != bind.types[column]) {
+				VectorOperations::Cast(context.client, chunk.data[column], converted.data[column], chunk.size());
+			} else {
+				converted.data[column].Reference(chunk.data[column]);
+			}
+		}
+		converted.SetCardinality(chunk.size());
 		for (const auto &column : bind.required_columns) {
-			if (VectorOperations::HasNull(chunk.data[column.first], chunk.size())) {
+			if (VectorOperations::HasNull(converted.data[column.first], converted.size())) {
 				throw ConstraintException("NOT NULL constraint failed: %s", column.second);
 			}
 		}
-		ValidateTemporalValues(chunk);
-		bind.function.copy_to_sink(context, *bind.inner, *state.inner, local, chunk);
+		ValidateTemporalValues(converted);
+		bind.function.copy_to_sink(context, *bind.inner, *state.inner, *local_state.inner, converted);
 		state.row_count += chunk.size();
 	};
 	function.copy_to_combine = [](ExecutionContext &context, FunctionData &data, GlobalFunctionData &global,
 	                              LocalFunctionData &local) {
 		auto &bind = data.Cast<VortexCopyBind>();
 		if (bind.function.copy_to_combine) {
-			bind.function.copy_to_combine(context, *bind.inner, *global.Cast<VortexCopyGlobal>().inner, local);
+			bind.function.copy_to_combine(context, *bind.inner, *global.Cast<VortexCopyGlobal>().inner,
+			                              *local.Cast<VortexCopyLocal>().inner);
 		}
 	};
 	function.copy_to_get_written_statistics = [](ClientContext &, FunctionData &, GlobalFunctionData &global,
@@ -408,7 +457,7 @@ IcebergCopyOptions IcebergVortex::CopyOptions(ClientContext &context, const Iceb
 	};
 	IcebergCopyOptions result(std::move(info), std::move(function));
 	result.bind_data = std::move(bind);
-	result.file_path = input.data_path;
+	result.file_path = data_path;
 	result.file_extension = "vortex";
 	result.filename_pattern.SetFilenamePattern("{uuidv7}");
 	result.use_tmp_file = false;

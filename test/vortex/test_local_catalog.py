@@ -131,7 +131,7 @@ class CatalogHandler(BaseHTTPRequestHandler):
             self.reply({"error": {"message": str(error), "type": "CommitFailedException", "code": 409}}, 409)
 
 
-def run_sql(shell, sql, error=None):
+def run_sql(shell, sql, error=None, cwd=None):
     result = subprocess.run(
         [
             str(shell),
@@ -145,6 +145,7 @@ def run_sql(shell, sql, error=None):
         text=True,
         capture_output=True,
         timeout=120,
+        cwd=cwd,
     )
     if error is not None:
         assert result.returncode > 0, f"Exit {result.returncode}: {result.stderr}\n{result.stdout}"
@@ -361,6 +362,65 @@ def check_time_appends(shell, root):
         assert not server.errors, server.errors
 
 
+def check_local_paths(shell, root):
+    error = "Vortex Iceberg data paths cannot contain URL-escaped characters"
+    for name in ("space name", "hash#name", "percent%name", "encoded%20name", "unicode-\u76ee\u5f55"):
+        table = root / name
+        run_sql(
+            shell, f"COPY (SELECT 1::BIGINT id) TO {quote(table)} (FORMAT iceberg, DATA_FORMAT vortex);", error=error
+        )
+        assert not any(path.is_file() for path in table.rglob("*"))
+        run_sql(shell, f"COPY (SELECT 1::BIGINT id) TO {quote(table)} (FORMAT iceberg);")
+        with local_catalog(next((table / "metadata").glob("*.metadata.json"))) as (server, attach):
+            before_metadata = copy.deepcopy(server.metadata)
+            before_files = set(table.rglob("*"))
+            run_sql(shell, attach + "INSERT INTO lake.main.items VALUES (2);", error=error)
+            assert not server.commits
+            assert server.metadata == before_metadata
+            assert set(table.rglob("*")) == before_files
+            assert run_sql(shell, attach + "SELECT id FROM lake.main.items;") == [{"id": 1}]
+            server.metadata["properties"]["write.format.default"] = "parquet"
+            run_sql(shell, attach + "INSERT INTO lake.main.items VALUES (2);")
+            assert len(server.commits) == 1
+            assert run_sql(shell, attach + "SELECT id FROM lake.main.items ORDER BY id;") == [{"id": 1}, {"id": 2}]
+            assert not server.errors, server.errors
+
+    # Relative paths inherit any unsafe characters in the current working directory.
+    working_directory = root / "working directory"
+    working_directory.mkdir()
+    run_sql(
+        shell,
+        "COPY (SELECT 1::BIGINT id) TO 'relative_table' (FORMAT iceberg, DATA_FORMAT vortex);",
+        error=error,
+        cwd=working_directory,
+    )
+    assert not any(path.is_file() for path in working_directory.rglob("*"))
+
+    # Punctuation that is preserved in a file URL should still be usable.
+    safe_relative_path = "safe-+'&=@,;()"
+    run_sql(
+        shell,
+        f"COPY (SELECT 42::BIGINT id) TO {quote(safe_relative_path)} (FORMAT iceberg, DATA_FORMAT vortex);",
+        cwd=root,
+    )
+    assert run_sql(shell, f"SELECT id FROM iceberg_scan({quote(safe_relative_path)});", cwd=root) == [{"id": 42}]
+
+
+def check_aggregate_appends(shell, root):
+    table = root / "aggregate_appends"
+    run_sql(shell, f"COPY (SELECT 0::BIGINT id, 0::DECIMAL(38,0) total) TO {quote(table)} (FORMAT iceberg);")
+    with local_catalog(next((table / "metadata").glob("*.metadata.json"))) as (server, attach):
+        run_sql(shell, attach + "INSERT INTO lake.main.items SELECT 1, sum(i) FROM range(10) t(i);")
+        run_sql(shell, attach + "INSERT INTO lake.main.items SELECT 2, sum(i) FROM range(0) t(i);")
+        assert run_sql(shell, attach + "SELECT id, total::VARCHAR total FROM lake.main.items ORDER BY id;") == [
+            {"id": 0, "total": "0"},
+            {"id": 1, "total": "45"},
+            {"id": 2, "total": None},
+        ]
+        assert len(server.commits) == 2
+        assert not server.errors, server.errors
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--duckdb", required=True, type=Path)
@@ -375,7 +435,9 @@ def main():
         for dtype in ("TIMESTAMP", "TIMESTAMPTZ"):
             check_timestamp_appends(shell, Path(directory), dtype)
         check_time_appends(shell, Path(directory))
-    print("Vortex catalog append, filter, delete, timestamp and time regressions passed.")
+        check_local_paths(shell, Path(directory))
+        check_aggregate_appends(shell, Path(directory))
+    print("Vortex catalog append, filter, delete, temporal, path and cast regressions passed.")
 
 
 if __name__ == "__main__":
