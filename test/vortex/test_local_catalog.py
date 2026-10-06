@@ -3,7 +3,7 @@
 Run with a shell built with ICEBERG_ENABLE_VORTEX=ON:
     python3 test/vortex/test_local_catalog.py --duckdb build/vortex/duckdb
 
-The test catalog implements only load-table, snapshot and property commits.
+The test catalog implements only load-table, snapshot, schema and property commits.
 It is not a substitute for qualifying a production catalog's acceptance of Vortex files.
 """
 
@@ -44,9 +44,11 @@ class AppendCatalog(HTTPServer):
                 assert requirement["uuid"] == metadata["table-uuid"]
             elif kind == "assert-ref-snapshot-id":
                 assert requirement["ref"] == "main"
-                assert requirement["snapshot-id"] == metadata["current-snapshot-id"]
+                assert requirement["snapshot-id"] == metadata.get("current-snapshot-id")
             elif kind == "assert-current-schema-id":
                 assert requirement["current-schema-id"] == metadata["current-schema-id"]
+            elif kind == "assert-last-assigned-field-id":
+                assert requirement["last-assigned-field-id"] == metadata["last-column-id"]
             else:
                 raise AssertionError(f"Unexpected commit requirement: {requirement}")
         for update in body["updates"]:
@@ -65,6 +67,11 @@ class AppendCatalog(HTTPServer):
                 }
             elif action == "set-properties":
                 metadata["properties"].update(update["updates"])
+            elif action == "add-schema":
+                metadata["schemas"].append(update["schema"])
+                metadata["last-column-id"] = update.get("last-column-id", metadata["last-column-id"])
+            elif action == "set-current-schema":
+                metadata["current-schema-id"] = update["schema-id"]
             else:
                 raise AssertionError(f"Unexpected commit update: {update}")
         metadata.setdefault("snapshot-log", []).append(

@@ -12,8 +12,10 @@
 #include "duckdb/parser/tableref/table_function_ref.hpp"
 
 #include "common/iceberg_utils.hpp"
+#include "catalog/rest/catalog_entry/table/iceberg_table_information.hpp"
 #include "execution/operator/iceberg_insert.hpp"
 #include "planning/metadata_io/avro/avro_scan.hpp"
+#include "planning/metadata_io/manifest/iceberg_manifest_reader.hpp"
 #include "planning/metadata_io/manifest_list/iceberg_manifest_list_reader.hpp"
 
 namespace duckdb {
@@ -47,6 +49,72 @@ void IcebergVortex::ValidateTable(const IcebergTableMetadata &metadata) {
 	for (const auto &column : metadata.GetLatestSchema().columns) {
 		if (!column->children.empty() || column->type.IsNested()) {
 			throw NotImplementedException("Vortex Iceberg data files currently require primitive columns");
+		}
+	}
+}
+
+static bool ContainsVortexFiles(const vector<IcebergManifestListEntry> &manifests) {
+	for (const auto &manifest : manifests) {
+		for (const auto &entry : manifest.manifest_entries) {
+			if (entry.status != IcebergManifestEntryStatusType::DELETED &&
+			    StringUtil::CIEquals(entry.data_file.file_format, "vortex")) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+void IcebergVortex::ValidateSchemaChange(const IcebergTransactionData &transaction_data) {
+	const auto &metadata = transaction_data.table_info.table_metadata;
+	auto reject = []() {
+		throw NotImplementedException(
+		    "Vortex Iceberg data files currently require a fixed schema; schema changes are not supported");
+	};
+	if (WriteFormat(metadata) == "vortex") {
+		reject();
+	}
+	// Inserts earlier in this transaction have not been written to manifests yet.
+	for (const auto &alter : transaction_data.alters) {
+		if (ContainsVortexFiles(alter.get().GetManifestFiles())) {
+			reject();
+		}
+	}
+	// A property change or a Parquet-only current snapshot does not remove Vortex
+	// files referenced by retained snapshots. Read each immutable manifest once.
+	auto &context = transaction_data.context;
+	auto &fs = FileSystem::GetFileSystem(context);
+	IcebergOptions options;
+	unordered_set<string> scanned_manifests;
+	for (const auto &snapshot_entry : metadata.snapshots) {
+		const auto &snapshot = snapshot_entry.second;
+		IcebergSnapshotScanInfo snapshot_info;
+		snapshot_info.snapshot = &snapshot;
+		snapshot_info.schema_id = snapshot.GetSchemaId();
+		vector<IcebergManifestListEntry> manifests;
+		auto list_scan =
+		    AvroScan::ScanManifestList(snapshot_info, metadata, context, snapshot.manifest_list, manifests);
+		manifest_list::ManifestListReader list_reader(*list_scan);
+		while (!list_reader.Finished()) {
+			list_reader.Read();
+		}
+		vector<IcebergManifestListEntry> data_manifests;
+		for (auto &manifest : manifests) {
+			if (manifest.file.content == IcebergManifestContentType::DATA &&
+			    scanned_manifests.insert(manifest.file.manifest_path).second) {
+				data_manifests.push_back(std::move(manifest));
+			}
+		}
+		if (data_manifests.empty()) {
+			continue;
+		}
+		auto scan = AvroScan::ScanManifest(snapshot_info, data_manifests, options, fs, "", metadata, context);
+		manifest_file::ManifestReader reader(*scan);
+		while (!reader.Finished()) {
+			reader.Read();
+		}
+		if (ContainsVortexFiles(data_manifests)) {
+			reject();
 		}
 	}
 }

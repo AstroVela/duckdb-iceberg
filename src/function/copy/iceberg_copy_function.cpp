@@ -79,21 +79,30 @@ CopyIcebergBindData::CopyIcebergBindData(const CopyInfo &info, vector<string> &&
 	IcebergSortOrder sort_order;
 	sort_order.sort_order_id = 0;
 	table_metadata->sort_specs.emplace(0, std::move(sort_order));
+#endif
 	for (const auto &option : info.options) {
 		if (StringUtil::CIEquals(option.first, "data_format")) {
 			if (option.second.size() != 1 || option.second[0].IsNull()) {
 				throw BinderException("Iceberg DATA_FORMAT requires one format name");
 			}
-			table_metadata->table_properties["write.format.default"] = option.second[0].GetValue<string>();
+			auto format = StringUtil::Lower(option.second[0].GetValue<string>());
+			if (format != "parquet" && format != "vortex") {
+				throw NotImplementedException("Unsupported Iceberg data format '%s'", format);
+			}
+#ifndef ICEBERG_ENABLE_VORTEX
+			if (format == "vortex") {
+				throw NotImplementedException("Vortex support is not enabled; rebuild with ICEBERG_ENABLE_VORTEX=ON");
+			}
+#endif
+			table_metadata->table_properties["write.format.default"] = format;
 		} else {
 			throw BinderException("Unsupported Iceberg COPY option '%s'", option.first);
 		}
 	}
+#ifdef ICEBERG_ENABLE_VORTEX
 	if (IcebergVortex::WriteFormat(*table_metadata) == "vortex") {
 		IcebergVortex::ValidateTable(*table_metadata);
 	}
-#else
-	//! TODO: Parse any iceberg-specific options from info.options if needed
 #endif
 }
 

@@ -39,6 +39,9 @@ SELECT DISTINCT file_format FROM iceberg_metadata('/tmp/vortex-table');
 ```
 
 `COPY ... FORMAT iceberg` without `DATA_FORMAT` continues to write Parquet.
+Both builds validate `DATA_FORMAT`. An OFF build rejects an explicit request
+for `vortex` with `Vortex support is not enabled`, including empty exports;
+it never silently substitutes Parquet. Explicit `parquet` remains supported.
 Use a fresh destination for COPY; it creates a table export rather than
 appending to an existing table.
 
@@ -67,6 +70,15 @@ non-ASCII characters, and other characters requiring URL escaping are rejected
 before writing Vortex data files or committing a snapshot. Relative data paths
 are expanded to absolute paths, including validation of the working directory.
 Parquet data paths retain their existing behavior.
+
+Schema changes are rejected before sending a catalog commit when the table
+uses `write.format.default=vortex`, a retained snapshot references Vortex files,
+or the transaction has appended Vortex files. This includes adding, dropping,
+renaming and changing the types or nullability of columns. Switching the write
+format back to Parquet does not make existing Vortex files support schema
+evolution. Parquet-only tables retain schema evolution; in enabled builds this
+requires inspecting retained manifests and asserting the current snapshot at
+commit to reject a schema update if that snapshot changed during validation.
 
 Before binding or executing a Vortex file scan, the adapter opens the actual
 data file through DuckDB's client filesystem to enforce its access policy.
@@ -114,10 +126,14 @@ data files. This convention does not change the Vortex binary file format.
 ICEBERG_TEST_VORTEX=1 ./build/release/test/unittest '*test/sql/local/vortex/*'
 python3 test/vortex/test_local_catalog.py --duckdb build/release/duckdb
 python3 test/vortex/test_file_access.py --duckdb build/release/duckdb
+python3 test/vortex/test_schema_changes.py --duckdb build/release/duckdb
 ```
 
 Set `ICEBERG_TEST_VORTEX=1` only for builds with the feature enabled. Default
 builds skip these tests even if a standalone Vortex extension is installed.
+For an OFF build, run the disabled-feature regression with
+`ICEBERG_TEST_VORTEX=0 ./build/release/test/unittest '*test/sql/copy/vortex_disabled.test'`.
+`test/sql/copy/data_format.test` checks COPY option validation in both builds.
 
 The SQL tests cover NULLs, primitive types, filters (including NaN, signed zero,
 infinity and JOINs), timestamp and TIME limits, projections, empty tables,
@@ -140,3 +156,9 @@ extension's REST commit path, not compatibility with a production catalog.
 The access test compares Parquet and Vortex with external access disabled. It
 checks metadata-only denial, directory and exact-file grants, cached and
 prepared queries, and individual file permissions in mixed-format snapshots.
+
+The schema test checks that rejected ALTER commits leave the metadata, data
+files, current reads and reads of older snapshots intact, and that a later
+valid append succeeds. It covers Vortex and mixed snapshots, changing the write
+format back to Parquet, Vortex files only in retained snapshots, and an append
+followed by ALTER in one transaction. Parquet schema evolution remains enabled.
