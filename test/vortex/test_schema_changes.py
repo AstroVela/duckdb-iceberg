@@ -140,6 +140,51 @@ def check_pending_append(shell, root):
         assert not server.errors, server.errors
 
 
+def check_manifest_short_circuit(shell, root):
+    table = root / "manifest_short_circuit"
+    path = export_table(shell, table, "vortex")
+    with local_catalog(path) as (server, attach):
+        run_sql(
+            shell, attach + "CALL set_iceberg_table_properties(lake.main.items, {'write.format.default': 'parquet'});"
+        )
+        run_sql(shell, attach + "INSERT INTO lake.main.items VALUES (2, 'row-2');")
+        # Keep only the mixed snapshot so a historical Vortex-only snapshot cannot mask the extra read.
+        snapshot = server.metadata["snapshots"][-1]
+        server.metadata["snapshots"] = [snapshot]
+        server.metadata["snapshot-log"] = [
+            {"timestamp-ms": snapshot["timestamp-ms"], "snapshot-id": snapshot["snapshot-id"]}
+        ]
+        server.metadata_path.write_text(json.dumps(server.metadata))
+        manifests = run_sql(shell, f"SELECT manifest_path FROM read_avro({quote(snapshot['manifest-list'])});")
+        assert len(manifests) == 2
+        for manifest, fmt in zip(manifests, ("vortex", "parquet")):
+            assert run_sql(
+                shell, f"SELECT DISTINCT data_file.file_format fmt FROM read_avro({quote(manifest['manifest_path'])});"
+            ) == [{"fmt": fmt}]
+
+        before_metadata = copy.deepcopy(server.metadata)
+        before_files = set(table.rglob("*"))
+        before_commits = len(server.commits)
+        later_manifest = Path(manifests[1]["manifest_path"])
+        hidden_manifest = later_manifest.with_suffix(".hidden")
+        later_manifest.rename(hidden_manifest)
+        try:
+            # Reject on the first Vortex manifest without opening the missing later manifest.
+            run_sql(
+                shell, attach + "ALTER TABLE lake.main.items ADD COLUMN extra BIGINT;", error="require a fixed schema"
+            )
+        finally:
+            hidden_manifest.rename(later_manifest)
+        assert server.metadata == before_metadata
+        assert len(server.commits) == before_commits
+        assert set(table.rglob("*")) == before_files
+        assert run_sql(shell, attach + "SELECT * FROM lake.main.items ORDER BY id;") == [
+            ROW,
+            {"id": 2, "payload": "row-2"},
+        ]
+        assert not server.errors, server.errors
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--duckdb", required=True, type=Path)
@@ -152,6 +197,7 @@ def main():
                 check_schema_change(shell, root, mode, action)
         check_retained_snapshot(shell, root)
         check_pending_append(shell, root)
+        check_manifest_short_circuit(shell, root)
     print("Parquet schema evolution and Vortex schema-commit rejection regressions passed.")
 
 

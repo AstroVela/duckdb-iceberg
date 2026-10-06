@@ -53,13 +53,12 @@ void IcebergVortex::ValidateTable(const IcebergTableMetadata &metadata) {
 	}
 }
 
-static bool ContainsVortexFiles(const vector<IcebergManifestListEntry> &manifests) {
-	for (const auto &manifest : manifests) {
-		for (const auto &entry : manifest.manifest_entries) {
-			if (entry.status != IcebergManifestEntryStatusType::DELETED &&
-			    StringUtil::CIEquals(entry.data_file.file_format, "vortex")) {
-				return true;
-			}
+static bool ContainsVortexFiles(const vector<IcebergManifestEntry> &entries, idx_t start_index = 0) {
+	for (idx_t index = start_index; index < entries.size(); index++) {
+		const auto &entry = entries[index];
+		if (entry.status != IcebergManifestEntryStatusType::DELETED &&
+		    StringUtil::CIEquals(entry.data_file.file_format, "vortex")) {
+			return true;
 		}
 	}
 	return false;
@@ -76,8 +75,10 @@ void IcebergVortex::ValidateSchemaChange(const IcebergTransactionData &transacti
 	}
 	// Inserts earlier in this transaction have not been written to manifests yet.
 	for (const auto &alter : transaction_data.alters) {
-		if (ContainsVortexFiles(alter.get().GetManifestFiles())) {
-			reject();
+		for (const auto &manifest : alter.get().GetManifestFiles()) {
+			if (ContainsVortexFiles(manifest.manifest_entries)) {
+				reject();
+			}
 		}
 	}
 	// A property change or a Parquet-only current snapshot does not remove Vortex
@@ -98,23 +99,24 @@ void IcebergVortex::ValidateSchemaChange(const IcebergTransactionData &transacti
 		while (!list_reader.Finished()) {
 			list_reader.Read();
 		}
-		vector<IcebergManifestListEntry> data_manifests;
 		for (auto &manifest : manifests) {
-			if (manifest.file.content == IcebergManifestContentType::DATA &&
-			    scanned_manifests.insert(manifest.file.manifest_path).second) {
-				data_manifests.push_back(std::move(manifest));
+			if (manifest.file.content != IcebergManifestContentType::DATA ||
+			    !scanned_manifests.insert(manifest.file.manifest_path).second) {
+				continue;
 			}
-		}
-		if (data_manifests.empty()) {
-			continue;
-		}
-		auto scan = AvroScan::ScanManifest(snapshot_info, data_manifests, options, fs, "", metadata, context);
-		manifest_file::ManifestReader reader(*scan);
-		while (!reader.Finished()) {
-			reader.Read();
-		}
-		if (ContainsVortexFiles(data_manifests)) {
-			reject();
+			// Open one manifest at a time so rejection does not read any later files.
+			vector<IcebergManifestListEntry> data_manifests;
+			data_manifests.push_back(std::move(manifest));
+			auto scan = AvroScan::ScanManifest(snapshot_info, data_manifests, options, fs, "", metadata, context);
+			manifest_file::ManifestReader reader(*scan);
+			auto &entries = data_manifests[0].manifest_entries;
+			while (!reader.Finished()) {
+				auto start_index = entries.size();
+				reader.Read();
+				if (ContainsVortexFiles(entries, start_index)) {
+					reject();
+				}
+			}
 		}
 	}
 }

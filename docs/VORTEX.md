@@ -19,8 +19,9 @@ make release EXT_FLAGS="-DICEBERG_ENABLE_VORTEX=ON -DRust_TOOLCHAIN=1.91.0"
 ```
 
 `ICEBERG_ENABLE_VORTEX` defaults to `OFF`. With the option disabled, the adapter
-is not compiled, Vortex is not fetched or linked, and the original Iceberg scan
-and write paths are used. Enabling it fetches a pinned revision
+is not compiled, Vortex is not fetched or linked, and the Parquet scan and write
+implementation is used. COPY option validation still applies in OFF builds.
+Enabling it fetches a pinned revision
 of `AstroVela/duckdb-vortex`, which pins its `AstroVela/vortex` Rust dependency.
 
 ```sql
@@ -51,6 +52,18 @@ file, and the existing Iceberg commit path publishes the new snapshot. Existing
 Parquet files remain readable when the write format changes to Vortex. Catalog
 acceptance of the custom file format must be tested for that catalog.
 
+## Compatibility changes
+
+- In both ON and OFF builds, unknown Iceberg COPY options now raise a
+  `BinderException`. Older OFF builds silently ignored them. Remove unsupported
+  options from existing COPY statements; `DATA_FORMAT parquet` remains valid.
+- With Vortex enabled, catalog INSERT accepts `write.format.default=parquet`
+  or `vortex`, and defaults to Parquet when the property is absent. Other
+  values, such as `orc`, raise `Unsupported Iceberg data format` instead of
+  silently producing Parquet files. To retain the previous Parquet output,
+  set the property to `parquet` or remove it before inserting. This validation
+  of catalog writes applies to enabled builds.
+
 ## Initial scope
 
 - Native execution, local data files, Iceberg v2, and unpartitioned tables.
@@ -79,6 +92,11 @@ format back to Parquet does not make existing Vortex files support schema
 evolution. Parquet-only tables retain schema evolution; in enabled builds this
 requires inspecting retained manifests and asserting the current snapshot at
 commit to reject a schema update if that snapshot changed during validation.
+Validation opens one data manifest at a time and checks only newly read entries
+after each batch. Finding a live Vortex entry stops further manifest and snapshot
+reads immediately. A table without Vortex files still requires checking all
+retained snapshot lists and unique data manifests; this worst-case I/O remains
+proportional to the retained metadata.
 
 Before binding or executing a Vortex file scan, the adapter opens the actual
 data file through DuckDB's client filesystem to enforce its access policy.
@@ -162,3 +180,5 @@ files, current reads and reads of older snapshots intact, and that a later
 valid append succeeds. It covers Vortex and mixed snapshots, changing the write
 format back to Parquet, Vortex files only in retained snapshots, and an append
 followed by ALTER in one transaction. Parquet schema evolution remains enabled.
+It also makes a later manifest temporarily unavailable to verify that finding
+Vortex in the first manifest rejects the change without opening later files.
