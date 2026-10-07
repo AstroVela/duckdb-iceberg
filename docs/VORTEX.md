@@ -147,10 +147,15 @@ validation. ON additionally runs all Vortex SQL tests and the three local Python
 regressions below; OFF checks that requesting Vortex fails. Tests run serially
 within each isolated runner. No Docker or external catalog is needed.
 
-The workflow builds `httpfs` from the revision pinned by DuckDB for the Parquet
-tests. It checks the CMake option and build graph, rejects fetched Vortex/Rust
+The workflow loads the static Parquet extension before Iceberg in both modes
+and builds `httpfs` from the revision pinned by DuckDB for the Parquet tests.
+The binaries use an isolated extension directory so preinstalled extensions
+cannot mask missing dependencies or an incorrect load order.
+It checks the CMake option and build graph, rejects fetched Vortex/Rust
 dependencies and Vortex symbols in OFF builds, and verifies statically linked
-extensions. Each SQL file must report at least one successful assertion;
+extensions. SQL files are selected by their exact absolute registered names,
+avoiding duplicate relative registrations from `UNITTEST_ROOT_DIRECTORY`.
+Each SQL file must report at least one successful assertion;
 skipped tests cannot pass this CI check. Compiler, vcpkg and Rust build caches
 are separate from the build configuration. Build logs and per-test XML/logs are
 uploaded for both modes.

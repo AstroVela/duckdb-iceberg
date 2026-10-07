@@ -15,12 +15,12 @@ class ReportValidationTests(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.report = Path(directory.name) / "report.xml"
-        self.expected = "test/sql/local/vortex/vortex_filters.test"
+        self.expected = "/checkout/test/sql/local/vortex/vortex_filters.test"
 
     def write_report(self, successes="24", failures="0", expected_failures="0", names=None):
         root = ET.Element("Catch")
         group = ET.SubElement(root, "Group")
-        for name in names if names is not None else ["/checkout/" + self.expected]:
+        for name in names if names is not None else [self.expected]:
             case = ET.SubElement(group, "TestCase", name=name)
             ET.SubElement(case, "OverallResult", success="true" if failures == "0" else "false")
         ET.SubElement(
@@ -38,7 +38,13 @@ class ReportValidationTests(unittest.TestCase):
             sql_assertions(self.report, self.expected)
 
     def test_missing_wrong_or_multiple_cases(self):
-        for names in ([], ["another.test"], [self.expected, self.expected]):
+        for names in (
+            [],
+            ["another.test"],
+            [self.expected.removeprefix("/checkout/")],
+            ["/another" + self.expected],
+            [self.expected, self.expected],
+        ):
             with self.subTest(names=names):
                 self.write_report(names=names)
                 with self.assertRaisesRegex(ValueError, "exactly one matching"):

@@ -28,7 +28,7 @@ def sql_assertions(report, expected):
     """Catch reports a skipped sqllogictest as a successful case with zero assertions."""
     root = ET.parse(report).getroot()
     cases = root.findall("./Group/TestCase")
-    if len(cases) != 1 or not ("/" + cases[0].get("name", "")).endswith("/" + expected):
+    if len(cases) != 1 or cases[0].get("name") != expected:
         raise ValueError(f"{expected}: expected exactly one matching test case in {report}")
     result = cases[0].find("OverallResult")
     totals = root.find("OverallResults")
@@ -113,17 +113,20 @@ def run_tests(build, mode, output):
         tests.append("test/sql/copy/vortex_disabled.test")
     assertions = 0
     for test in tests:
-        if not (ROOT / test).is_file():
+        test_path = ROOT / test
+        if not test_path.is_file():
             raise ValueError(f"Missing test: {test}")
         report = output / (Path(test).stem + ".xml")
         # Remove previous output so a stale report cannot hide a missing test.
         report.unlink(missing_ok=True)
+        # LOAD_TESTS registers an absolute name even when UNITTEST_ROOT_DIRECTORY
+        # also registers the same file under a relative name.
         run_logged(
-            [str(build / "test/unittest"), "*" + test, "--reporter", "xml", "--out", str(report)],
+            [str(build / "test/unittest"), str(test_path), "--reporter", "xml", "--out", str(report)],
             report.with_suffix(".log"),
             env,
         )
-        count = sql_assertions(report, test)
+        count = sql_assertions(report, str(test_path))
         assertions += count
         print(f"PASS {test}: {count} assertions", flush=True)
     print(f"SQL {mode}: {len(tests)} cases, {assertions} assertions", flush=True)

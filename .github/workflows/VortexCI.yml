@@ -102,11 +102,13 @@ jobs:
             -DCMAKE_TOOLCHAIN_FILE="$PWD/vcpkg/scripts/buildsystems/vcpkg.cmake" \
             -DVCPKG_BUILD=ON -DVCPKG_TARGET_TRIPLET=x64-linux-release \
             -DVCPKG_MANIFEST_DIR="$PWD" \
-            -DDUCKDB_EXTENSION_CONFIGS="$PWD/duckdb/.github/config/extensions/httpfs.cmake;$PWD/extension_config.cmake" \
+            '-DBUILD_EXTENSIONS=parquet;httpfs' \
+            -DDUCKDB_EXTENSION_CONFIGS="$PWD/extension_config.cmake" \
             '-DSKIP_EXTENSIONS=ducklake;aws;tpch;icu;jemalloc' \
             -DEXTENSION_STATIC_BUILD=ON \
             -DBUILD_SHELL=ON -DBUILD_UNITTESTS=ON -DENABLE_UNITTEST_CPP_TESTS=OFF \
             -DENABLE_EXTENSION_AUTOLOADING=OFF -DENABLE_EXTENSION_AUTOINSTALL=OFF \
+            -DEXTENSION_DIRECTORIES="$PWD/build/vortex-ci/empty-extensions" \
             -DUNITTEST_ROOT_DIRECTORY="$PWD" \
             "${vortex_flags[@]}" 2>&1 | tee build/ci-logs/configure.log
 
