@@ -140,6 +140,30 @@ data files. This convention does not change the Vortex binary file format.
 
 ## Validation
 
+The `Vortex format CI` workflow builds Linux native shells and SQL test runners
+with Vortex enabled and with the default OFF setting. Each build runs the same
+Parquet COPY, column mapping and delete-read regressions, plus COPY option
+validation. ON additionally runs all Vortex SQL tests and the three local Python
+regressions below; OFF checks that requesting Vortex fails. Tests run serially
+within each isolated runner. No Docker or external catalog is needed.
+
+The workflow builds `httpfs` from the revision pinned by DuckDB for the Parquet
+tests. It checks the CMake option and build graph, rejects fetched Vortex/Rust
+dependencies and Vortex symbols in OFF builds, and verifies statically linked
+extensions. Each SQL file must report at least one successful assertion;
+skipped tests cannot pass this CI check. Compiler, vcpkg and Rust build caches
+are separate from the build configuration. Build logs and per-test XML/logs are
+uploaded for both modes.
+
+To repeat the CI tests against one of these native Ninja builds:
+
+```sh
+python3 scripts/ci/run_vortex_tests.py --mode ON --build-dir build/vortex-ci
+# Use --mode OFF for the default build, in a separate build directory.
+```
+
+Individual regressions can also be run directly:
+
 ```sh
 ICEBERG_TEST_VORTEX=1 ./build/release/test/unittest '*test/sql/local/vortex/*'
 python3 test/vortex/test_local_catalog.py --duckdb build/release/duckdb
