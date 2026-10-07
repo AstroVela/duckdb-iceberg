@@ -155,10 +155,13 @@ It checks the CMake option and build graph, rejects fetched Vortex/Rust
 dependencies and Vortex symbols in OFF builds, and verifies statically linked
 extensions. SQL files are selected by their exact absolute registered names,
 avoiding duplicate relative registrations from `UNITTEST_ROOT_DIRECTORY`.
-Each SQL file must report at least one successful assertion;
-skipped tests cannot pass this CI check. Compiler, vcpkg and Rust build caches
-are separate from the build configuration. Build logs and per-test XML/logs are
-uploaded for both modes.
+Each SQL file must finish with an all-passed console summary and at least one
+successful assertion. DuckDB's XML reporter omits mid-test skips, so the runner
+uses console totals and exact case names from duration output instead. Default
+HTTP/connection error skips are disabled; an unmet requirement also fails CI,
+even after successful assertions. Both builds exercise these checks with real
+sqllogictests. Compiler, vcpkg and Rust build caches are separate from the build
+configuration. Build logs and per-test reports/logs are uploaded for both modes.
 
 To repeat the CI tests against one of these native Ninja builds:
 

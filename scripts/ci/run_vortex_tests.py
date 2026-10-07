@@ -8,7 +8,6 @@ from pathlib import Path
 import re
 import subprocess
 import sys
-import xml.etree.ElementTree as ET
 
 ROOT = Path(__file__).resolve().parents[2]
 PARQUET_TESTS = (
@@ -25,25 +24,22 @@ PYTHON_TESTS = ("test_local_catalog.py", "test_file_access.py", "test_schema_cha
 
 
 def sql_assertions(report, expected):
-    """Catch reports a skipped sqllogictest as a successful case with zero assertions."""
-    root = ET.parse(report).getroot()
-    cases = root.findall("./Group/TestCase")
-    if len(cases) != 1 or cases[0].get("name") != expected:
+    """Use Catch's console totals: its XML reporter omits mid-test skips."""
+    contents = report.read_text()
+    # With --durations yes, every completed SQL case prints its exact name.
+    cases = re.findall(r"^\d+\.\d+ s: (.+)$", contents, re.MULTILINE)
+    if cases != [expected]:
         raise ValueError(f"{expected}: expected exactly one matching test case in {report}")
-    result = cases[0].find("OverallResult")
-    totals = root.find("OverallResults")
-    if (
-        result is None
-        or result.get("success") != "true"
-        or totals is None
-        or totals.get("failures") != "0"
-        or totals.get("expectedFailures") != "0"
+    if re.search(
+        r"^(All tests were skipped|Skipped tests for the following reasons:)",
+        contents,
+        re.MULTILINE,
     ):
+        raise ValueError(f"{expected}: test was skipped ({report})")
+    totals = re.search(r"\nAll tests passed \(([1-9]\d*) assertions? in 1 test case\)\s*\Z", contents)
+    if totals is None:
         raise ValueError(f"{expected}: unsuccessful or incomplete report: {report}")
-    assertions = int(totals.get("successes", "0"))
-    if assertions <= 0:
-        raise ValueError(f"{expected}: zero assertions; test was skipped ({report})")
-    return assertions
+    return int(totals.group(1))
 
 
 def check_build(build, mode):
@@ -97,6 +93,38 @@ def run_logged(command, log, env):
         raise RuntimeError(f"Command failed ({result.returncode}); see {log}")
 
 
+def run_sql_test(binary, test, report, env):
+    env = env.copy()
+    # DuckDB otherwise skips unexpected errors containing HTTP/Unable to connect.
+    env["DUCKDB_TEST_SKIP_ERROR_MESSAGES"] = "[]"
+    # Remove previous output so a stale report cannot hide a missing test.
+    report.unlink(missing_ok=True)
+    try:
+        run_logged(
+            [
+                str(binary),
+                test,
+                "--test-dir",
+                str(ROOT),
+                "--reporter",
+                "console",
+                "--durations",
+                "yes",
+                "--use-colour",
+                "no",
+                "--out",
+                str(report),
+            ],
+            report.with_suffix(".log"),
+            env,
+        )
+        return sql_assertions(report, test)
+    except (RuntimeError, ValueError):
+        if report.exists():
+            print(report.read_text(), file=sys.stderr)
+        raise
+
+
 def run_tests(build, mode, output):
     output.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
@@ -116,17 +144,10 @@ def run_tests(build, mode, output):
         test_path = ROOT / test
         if not test_path.is_file():
             raise ValueError(f"Missing test: {test}")
-        report = output / (Path(test).stem + ".xml")
-        # Remove previous output so a stale report cannot hide a missing test.
-        report.unlink(missing_ok=True)
+        report = output / (Path(test).stem + ".txt")
         # LOAD_TESTS registers an absolute name even when UNITTEST_ROOT_DIRECTORY
         # also registers the same file under a relative name.
-        run_logged(
-            [str(build / "test/unittest"), str(test_path), "--reporter", "xml", "--out", str(report)],
-            report.with_suffix(".log"),
-            env,
-        )
-        count = sql_assertions(report, str(test_path))
+        count = run_sql_test(build / "test/unittest", str(test_path), report, env)
         assertions += count
         print(f"PASS {test}: {count} assertions", flush=True)
     print(f"SQL {mode}: {len(tests)} cases, {assertions} assertions", flush=True)
