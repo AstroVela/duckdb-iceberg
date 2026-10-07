@@ -1,0 +1,114 @@
+# name: test/sql/local/vortex/vortex_float_filters.test
+# group: [vortex]
+
+require-env ICEBERG_TEST_VORTEX 1
+
+require avro
+
+require parquet
+
+require iceberg
+
+require vortex
+
+foreach type FLOAT DOUBLE
+
+statement ok
+COPY (
+    SELECT * FROM (VALUES
+        (1, '0.0'::{type}), (2, '-0.0'::{type}), (3, '-1.0'::{type}), (4, '1.0'::{type}),
+        (5, '-infinity'::{type}), (6, 'infinity'::{type}), (7, 'NaN'::{type}), (8, NULL::{type})
+    ) v(id, x)
+) TO '__TEST_DIR__/iceberg_float_{type}' (FORMAT iceberg, DATA_FORMAT vortex);
+
+query I
+SELECT id FROM iceberg_scan('__TEST_DIR__/iceberg_float_{type}') WHERE x = 0 ORDER BY id;
+----
+1
+2
+
+query I
+SELECT id FROM iceberg_scan('__TEST_DIR__/iceberg_float_{type}') WHERE x < 0 ORDER BY id;
+----
+3
+5
+
+query I
+SELECT id FROM iceberg_scan('__TEST_DIR__/iceberg_float_{type}') WHERE x <= 0 ORDER BY id;
+----
+1
+2
+3
+5
+
+query I
+SELECT id FROM iceberg_scan('__TEST_DIR__/iceberg_float_{type}') WHERE x > 0 ORDER BY id;
+----
+4
+6
+7
+
+query I
+SELECT id FROM iceberg_scan('__TEST_DIR__/iceberg_float_{type}') WHERE x >= 0 ORDER BY id;
+----
+1
+2
+4
+6
+7
+
+query I
+SELECT id FROM iceberg_scan('__TEST_DIR__/iceberg_float_{type}') WHERE x <> 0 ORDER BY id;
+----
+3
+4
+5
+6
+7
+
+query I
+SELECT id FROM iceberg_scan('__TEST_DIR__/iceberg_float_{type}') WHERE x BETWEEN '-0.0'::{type} AND 0 ORDER BY id;
+----
+1
+2
+
+query I
+SELECT id FROM iceberg_scan('__TEST_DIR__/iceberg_float_{type}') WHERE x IN ('-0.0'::{type}, -1) ORDER BY id;
+----
+1
+2
+3
+
+query I
+SELECT count(*) FROM iceberg_scan('__TEST_DIR__/iceberg_float_{type}') WHERE x = 0;
+----
+2
+
+query I
+SELECT id FROM iceberg_scan('__TEST_DIR__/iceberg_float_{type}') WHERE x = 0 AND id = 2;
+----
+2
+
+query I
+SELECT id FROM iceberg_scan('__TEST_DIR__/iceberg_float_{type}') WHERE x < 0 OR x IS NULL ORDER BY id;
+----
+3
+5
+8
+
+query I
+SELECT count(*) FROM iceberg_scan('__TEST_DIR__/iceberg_float_{type}') WHERE x = 0 AND signbit(x);
+----
+1
+
+# A stored build-side value also exercises dynamic filters produced by the join optimizer.
+statement ok
+CREATE TABLE float_keys_{type} AS SELECT '0.0'::{type} x;
+
+query I
+SELECT id FROM iceberg_scan('__TEST_DIR__/iceberg_float_{type}') JOIN float_keys_{type} USING (x) ORDER BY id;
+----
+1
+2
+
+endloop

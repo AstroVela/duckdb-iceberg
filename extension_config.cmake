@@ -1,4 +1,17 @@
 # This file is included by DuckDB's build system. It specifies which extension to load
+option(ICEBERG_ENABLE_VORTEX "Enable experimental Vortex data files" OFF)
+if(ICEBERG_ENABLE_VORTEX)
+  # Iceberg needs Parquet registered before it in a statically linked shell.
+  duckdb_extension_load(parquet)
+  if(ICEBERG_VANE_DISTRIBUTED)
+    set(VORTEX_VANE_DISTRIBUTED ON CACHE BOOL "Build Vane distributed Vortex support" FORCE)
+  endif()
+  duckdb_extension_load(vortex
+    GIT_URL https://github.com/AstroVela/duckdb-vortex
+    GIT_TAG 348d44eebb39009c291c776104a6c6649d8460d5
+  )
+endif()
+
 if (NOT EMSCRIPTEN)
   duckdb_extension_load(avro
   LOAD_TESTS

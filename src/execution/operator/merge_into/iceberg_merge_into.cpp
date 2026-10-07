@@ -9,6 +9,9 @@
 #include "execution/operator/merge_into/iceberg_merge_insert.hpp"
 #include "execution/operator/merge_into/iceberg_merge_update.hpp"
 #include "execution/operator/merge_into/iceberg_merge_into.hpp"
+#ifdef ICEBERG_ENABLE_VORTEX
+#include "storage/iceberg_vortex.hpp"
+#endif
 #include "catalog/rest/iceberg_catalog.hpp"
 #include "catalog/rest/catalog_entry/table/iceberg_table_entry.hpp"
 #include "execution/operator/iceberg_update.hpp"
@@ -644,6 +647,11 @@ static unique_ptr<MergeIntoOperator> IcebergPlanMergeIntoAction(IcebergCatalog &
 
 	auto &table_entry = op.table.Cast<IcebergTableEntry>();
 	table_entry.PrepareIcebergScanFromEntry(context);
+#ifdef ICEBERG_ENABLE_VORTEX
+	if (IcebergVortex::WriteFormat(table_entry.table_info.table_metadata) == "vortex") {
+		throw NotImplementedException("Vortex Iceberg writes currently support append only");
+	}
+#endif
 
 	auto &irc_transaction = IcebergTransaction::Get(context, catalog);
 	auto &alter = irc_transaction.GetOrCreateAlter();
