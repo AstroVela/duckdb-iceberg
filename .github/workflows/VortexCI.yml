@@ -1,0 +1,146 @@
+name: Vortex format CI
+
+on:
+  pull_request:
+  push:
+    branches: [v1.5-variegata_vane]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vortex-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  native:
+    name: Linux Vortex ${{ matrix.vortex }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        vortex: ['OFF', 'ON']
+    env:
+      CMAKE_BUILD_PARALLEL_LEVEL: '2'
+      CARGO_BUILD_JOBS: '2'
+      CCACHE_DIR: ${{ github.workspace }}/.cache/ccache
+      CCACHE_MAXSIZE: 2G
+      VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}/.cache/vcpkg,readwrite
+      VCPKG_MAX_CONCURRENCY: '2'
+      RUST_TOOLCHAIN: '1.91.0'
+      VORTEX_MODE: ${{ matrix.vortex }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Initialize pinned DuckDB
+        id: duckdb
+        run: |
+          git submodule update --init duckdb
+          printf 'revision=%s\n' "$(git -C duckdb rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build ccache libclang-dev autoconf automake libtool pkg-config
+          mkdir -p .cache/vcpkg build/ci-logs
+
+      - name: Restore native dependency and compiler caches
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            .cache/ccache
+            .cache/vcpkg
+          key: vortex-native-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.vortex }}-${{ hashFiles('vcpkg.json', 'vcpkg_ports/**', 'extension_config.cmake', '.gitmodules') }}-${{ github.sha }}
+          restore-keys: |
+            vortex-native-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.vortex }}-${{ hashFiles('vcpkg.json', 'vcpkg_ports/**', 'extension_config.cmake', '.gitmodules') }}-
+
+      - name: Set up pinned vcpkg
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11.6
+        with:
+          vcpkgGitCommitId: 84bab45d415d22042bd0b9081aea57f362da3f35
+          vcpkgDirectory: ${{ github.workspace }}/vcpkg
+          doNotCache: true
+
+      - name: Set up Rust for Vortex
+        if: matrix.vortex == 'ON'
+        run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+
+      - name: Restore Rust cache
+        if: matrix.vortex == 'ON'
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            build/vortex-ci/cargo/build
+          key: vortex-rust-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_TOOLCHAIN }}-${{ steps.duckdb.outputs.revision }}-${{ hashFiles('extension_config.cmake', 'vcpkg.json', '.github/workflows/VortexCI.yml') }}-${{ github.sha }}
+          restore-keys: |
+            vortex-rust-v1-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_TOOLCHAIN }}-${{ steps.duckdb.outputs.revision }}-${{ hashFiles('extension_config.cmake', 'vcpkg.json', '.github/workflows/VortexCI.yml') }}-
+
+      - name: Check test report validation
+        run: python3 test/vortex/test_ci_runner.py
+
+      - name: Configure native build
+        run: |
+          vortex_flags=()
+          if [[ "$VORTEX_MODE" == ON ]]; then
+            vortex_flags=(-DICEBERG_ENABLE_VORTEX=ON "-DRust_TOOLCHAIN=$RUST_TOOLCHAIN")
+          fi
+          # OFF deliberately omits the option to exercise the default.
+          cmake -S duckdb -B build/vortex-ci -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_TOOLCHAIN_FILE="$PWD/vcpkg/scripts/buildsystems/vcpkg.cmake" \
+            -DVCPKG_BUILD=ON -DVCPKG_TARGET_TRIPLET=x64-linux-release \
+            -DVCPKG_MANIFEST_DIR="$PWD" \
+            '-DBUILD_EXTENSIONS=parquet;httpfs' \
+            -DDUCKDB_EXTENSION_CONFIGS="$PWD/extension_config.cmake" \
+            '-DSKIP_EXTENSIONS=ducklake;aws;tpch;icu;jemalloc' \
+            -DEXTENSION_STATIC_BUILD=ON \
+            -DBUILD_SHELL=ON -DBUILD_UNITTESTS=ON -DENABLE_UNITTEST_CPP_TESTS=OFF \
+            -DENABLE_EXTENSION_AUTOLOADING=OFF -DENABLE_EXTENSION_AUTOINSTALL=OFF \
+            -DEXTENSION_DIRECTORIES="$PWD/build/vortex-ci/empty-extensions" \
+            -DUNITTEST_ROOT_DIRECTORY="$PWD" \
+            "${vortex_flags[@]}" 2>&1 | tee build/ci-logs/configure.log
+
+      - name: Check build isolation
+        run: |
+          python3 scripts/ci/run_vortex_tests.py --mode "$VORTEX_MODE" \
+            --build-dir build/vortex-ci --check-build-only
+
+      - name: Build native shell and test runner
+        run: |
+          cmake --build build/vortex-ci --target duckdb unittest 2>&1 | tee build/ci-logs/build.log
+
+      - name: Check SQL skip detection with the native runner
+        run: |
+          python3 test/vortex/test_ci_runner_integration.py --unittest build/vortex-ci/test/unittest
+
+      - name: Run SQL and local catalog regressions serially
+        run: |
+          python3 scripts/ci/run_vortex_tests.py --mode "$VORTEX_MODE" \
+            --build-dir build/vortex-ci --output-dir build/ci-logs/tests
+
+      - name: Report compiler cache statistics
+        if: always()
+        run: ccache --show-stats
+
+      - name: Upload build and test logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vortex-${{ matrix.vortex }}-logs
+          path: |
+            build/ci-logs/
+            build/vortex-ci/CMakeCache.txt
+            build/vortex-ci/CMakeFiles/CMakeConfigureLog.yaml
+          retention-days: 7

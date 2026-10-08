@@ -140,6 +140,38 @@ data files. This convention does not change the Vortex binary file format.
 
 ## Validation
 
+The `Vortex format CI` workflow builds Linux native shells and SQL test runners
+with Vortex enabled and with the default OFF setting. Each build runs the same
+Parquet COPY, column mapping and delete-read regressions, plus COPY option
+validation. ON additionally runs all Vortex SQL tests and the three local Python
+regressions below; OFF checks that requesting Vortex fails. Tests run serially
+within each isolated runner. No Docker or external catalog is needed.
+
+The workflow loads the static Parquet extension before Iceberg in both modes
+and builds `httpfs` from the revision pinned by DuckDB for the Parquet tests.
+The binaries use an isolated extension directory so preinstalled extensions
+cannot mask missing dependencies or an incorrect load order.
+It checks the CMake option and build graph, rejects fetched Vortex/Rust
+dependencies and Vortex symbols in OFF builds, and verifies statically linked
+extensions. SQL files are selected by their exact absolute registered names,
+avoiding duplicate relative registrations from `UNITTEST_ROOT_DIRECTORY`.
+Each SQL file must finish with an all-passed console summary and at least one
+successful assertion. DuckDB's XML reporter omits mid-test skips, so the runner
+uses console totals and exact case names from duration output instead. Default
+HTTP/connection error skips are disabled; an unmet requirement also fails CI,
+even after successful assertions. Both builds exercise these checks with real
+sqllogictests. Compiler, vcpkg and Rust build caches are separate from the build
+configuration. Build logs and per-test reports/logs are uploaded for both modes.
+
+To repeat the CI tests against one of these native Ninja builds:
+
+```sh
+python3 scripts/ci/run_vortex_tests.py --mode ON --build-dir build/vortex-ci
+# Use --mode OFF for the default build, in a separate build directory.
+```
+
+Individual regressions can also be run directly:
+
 ```sh
 ICEBERG_TEST_VORTEX=1 ./build/release/test/unittest '*test/sql/local/vortex/*'
 python3 test/vortex/test_local_catalog.py --duckdb build/release/duckdb
