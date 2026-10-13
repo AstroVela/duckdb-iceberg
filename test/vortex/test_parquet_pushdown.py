@@ -81,6 +81,12 @@ def check_float_predicates(shell, source, setup, dtype, ids, pushdown):
         "x < 0": [3, 5],
         "x <= 0": [1, 2, 3, 5],
         "x > 0": [4, 6, 7],
+        "x = 'NaN'": [7],
+        "x >= 'NaN'": [7],
+        "x > 'NaN'": [],
+        "x < 'NaN'": [1, 2, 3, 4, 5, 6],
+        "x > 'infinity'": [7],
+        "x IN (0, 'NaN')": [1, 2, 7],
         "isnan(x)": [7],
         "x IS NULL": [8],
         "x = 0 AND signbit(x)": [2],
@@ -94,20 +100,32 @@ def check_float_predicates(shell, source, setup, dtype, ids, pushdown):
     assert len(scans) == 1, scans
     assert ("Filters" in scans[0]["extra_info"]) == pushdown, scans[0]
     assert "Dynamic Filters" not in scans[0]["extra_info"], scans[0]
-    join_setup = setup + f"CREATE TABLE float_keys AS SELECT '0.0'::{dtype} x; "
-    query = f"SELECT id FROM {source} JOIN float_keys USING (x) ORDER BY id"
-    assert run_sql(shell, join_setup + query) == [{"id": index} for index in (1, 2) if index in ids]
-    if not pushdown:
-        scans = iceberg_scans(profile(shell, query, join_setup))
-        assert "Dynamic Filters" not in scans[0]["extra_info"], scans[0]
-        assert "Filters" not in scans[0]["extra_info"], scans[0]
+    for key, expected in (("0.0", (1, 2)), ("NaN", (7,)), ("infinity", (6,))):
+        join_setup = setup + f"CREATE TABLE float_keys AS SELECT {quote(key)}::{dtype} x; "
+        query = f"SELECT id FROM {source} JOIN float_keys USING (x) ORDER BY id"
+        actual = run_sql(shell, join_setup + query)
+        assert actual == [{"id": index} for index in expected if index in ids], (key, actual)
+        if not pushdown:
+            scans = iceberg_scans(profile(shell, query, join_setup))
+            assert "Dynamic Filters" not in scans[0]["extra_info"], scans[0]
+            assert "Filters" not in scans[0]["extra_info"], scans[0]
+
+
+def check_parquet_floats(shell, root, dtype):
+    table = root / f"parquet_float_{dtype}"
+    ids = (1, 2, 3, 7, 8)
+    run_sql(
+        shell,
+        f"COPY (SELECT * FROM (VALUES {float_values(dtype, ids)}) t(id, x)) "
+        f"TO {quote(table)} (FORMAT iceberg, DATA_FORMAT parquet);",
+    )
+    check_float_predicates(shell, f"iceberg_scan({quote(table)})", "", dtype, ids, True)
 
 
 def check_mixed_snapshots(shell, root, dtype, first_format):
     table = root / f"{dtype}_{first_format}"
-    # Include a positive value with NaN: existing Iceberg min/max pruning can
-    # otherwise drop NaN for x > 0, including with the default OFF build.
-    initial_ids = (1, 3, 4, 7)
+    # The finite upper bound is zero: x > 0 must retain the NaN in this file.
+    initial_ids = (1, 3, 7)
     run_sql(
         shell,
         f"COPY (SELECT * FROM (VALUES {float_values(dtype, initial_ids)}) t(id, x)) "
@@ -120,7 +138,7 @@ def check_mixed_snapshots(shell, root, dtype, first_format):
         # Deliberately disagree with the stored format before the first append.
         server.metadata["properties"]["write.format.default"] = next_format
         check_float_predicates(shell, "lake.main.items", attach, dtype, initial_ids, first_format == "parquet")
-        run_sql(shell, attach + f"INSERT INTO lake.main.items VALUES {float_values(dtype, (2, 5, 6, 8))};")
+        run_sql(shell, attach + f"INSERT INTO lake.main.items VALUES {float_values(dtype, (2, 4, 5, 6, 8))};")
         run_sql(
             shell, attach + "CALL set_iceberg_table_properties(lake.main.items, {'write.format.default': 'parquet'});"
         )
@@ -139,22 +157,28 @@ def check_mixed_snapshots(shell, root, dtype, first_format):
         assert not server.errors, server.errors
 
 
-def check_pending_append(shell, root, first_format):
-    table = root / f"pending_append_{first_format}"
+def check_pending_append(shell, root, dtype, first_format):
+    table = root / f"pending_append_{dtype}_{first_format}"
     run_sql(
         shell,
-        f"COPY (SELECT 1::INTEGER id, '0.0'::DOUBLE x) TO {quote(table)} "
+        f"COPY (SELECT 1::INTEGER id, '0.0'::{dtype} x) TO {quote(table)} "
         f"(FORMAT iceberg, DATA_FORMAT {first_format});",
     )
     path = next((table / "metadata").glob("*.metadata.json"))
     with local_catalog(path) as (server, attach):
         server.metadata["properties"]["write.format.default"] = "vortex" if first_format == "parquet" else "parquet"
-        query = "SELECT id FROM lake.main.items WHERE x = 0 ORDER BY id"
-        setup = attach + f"BEGIN; PREPARE p AS {query}; INSERT INTO lake.main.items VALUES (2, '-0.0'::DOUBLE); "
-        assert run_sql(shell, setup + query + "; ROLLBACK;") == [{"id": 1}, {"id": 2}]
-        assert run_sql(shell, setup + "EXECUTE p; ROLLBACK;") == [{"id": 1}, {"id": 2}]
-        scans = iceberg_scans(profile(shell, query, setup))
-        assert "Filters" not in scans[0]["extra_info"], scans[0]
+        for predicate, expected in (("x = 0", [1, 2]), ("x > 0", [3]), ("x = 'NaN'", [3])):
+            query = f"SELECT id FROM lake.main.items WHERE {predicate} ORDER BY id"
+            setup = (
+                attach + f"BEGIN; PREPARE p AS {query}; "
+                f"INSERT INTO lake.main.items VALUES (2, '-0.0'::{dtype}), (3, 'NaN'::{dtype}); "
+            )
+            rows = [{"id": index} for index in expected]
+            assert run_sql(shell, setup + query + "; ROLLBACK;") == rows
+            assert run_sql(shell, setup + "EXECUTE p; ROLLBACK;") == rows
+            scans = iceberg_scans(profile(shell, query, setup))
+            assert "Filters" not in scans[0]["extra_info"], scans[0]
+            assert "Dynamic Filters" not in scans[0]["extra_info"], scans[0]
         assert not server.commits, server.commits
         assert not server.errors, server.errors
 
@@ -168,12 +192,13 @@ def main():
     with tempfile.TemporaryDirectory(prefix="iceberg-pushdown-") as directory:
         root = Path(directory)
         check_parquet(shell, root)
+        for dtype in ("FLOAT", "DOUBLE"):
+            check_parquet_floats(shell, root, dtype)
         if args.mode == "ON":
             for dtype in ("FLOAT", "DOUBLE"):
                 for first_format in ("parquet", "vortex"):
                     check_mixed_snapshots(shell, root, dtype, first_format)
-            for first_format in ("parquet", "vortex"):
-                check_pending_append(shell, root, first_format)
+                    check_pending_append(shell, root, dtype, first_format)
     print(f"Iceberg predicate pushdown {args.mode}: passed")
 
 

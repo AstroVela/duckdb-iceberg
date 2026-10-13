@@ -20,6 +20,7 @@ PARQUET_TESTS = (
     "test/sql/local/equality_delete_extra_column.test",
     "test/sql/local/equality_deletes_join.test",
     "test/sql/local/iceberg_scans/nan_pruning.test",
+    "test/sql/local/iceberg_scans/is_not_null.test",
 )
 PYTHON_TESTS = ("test_local_catalog.py", "test_file_access.py", "test_schema_changes.py")
 
