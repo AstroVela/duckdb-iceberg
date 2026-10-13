@@ -70,8 +70,9 @@ acceptance of the custom file format must be tested for that catalog.
 - Primitive columns with one fixed schema; no nested columns or schema evolution.
 - Table export, scans with projection and filters, and catalog-backed appends.
 - Accurate file row counts and sizes. INTEGER, BIGINT, FLOAT and DOUBLE columns
-  also record lower/upper bounds and NULL counts; floating columns record exact
-  NaN counts, including zero. Other column types omit these optional metrics.
+  also record lower/upper bounds, total value counts and NULL counts; floating
+  columns record exact NaN counts, including zero. Total value counts include
+  NULLs and NaNs. Other column types omit these optional metrics.
 - Required Iceberg fields are checked for NULLs before writing each batch.
 - Query results are cast to the Iceberg schema before writing. For example,
   `SUM(BIGINT)` produces a `HUGEINT` that is stored as `DECIMAL(38,0)`; values
@@ -136,17 +137,26 @@ and stored by Iceberg field ID. Bounds exclude NULLs and NaNs, preserve infiniti
 and order negative zero before positive zero. Files containing only NULLs or NaNs
 have no bounds. Existing files without metrics remain readable and are retained
 conservatively during pruning; newly collected metrics do not rewrite old files.
-The existing comparison pruner also retains files with no bounds. NULL counts
-are stored, but `IS NULL` predicates on Vortex/mixed scans currently remain in
-DuckDB and do not drive file pruning.
+The existing comparison pruner also retains files with no bounds. Direct
+`IS NULL` and `IS NOT NULL` checks on scalar columns can prune files using counts
+even without bounds: `IS NULL` skips files with a known zero NULL count, and
+`IS NOT NULL` skips files whose known total and NULL counts are equal. Missing
+counts remain unknown. Vortex/mixed scans retain the original row filters in
+DuckDB; derived expressions, nested fields and NULL checks inside OR conditions
+are not extracted by this metadata-only NULL optimization.
 
 The table properties `write.metadata.metrics.default` and
 `write.metadata.metrics.column.<name>` control collection. `none` disables metrics
-for the column; `counts` collects NULL/NaN counts without bounds; `full` and
+for the column; `counts` collects total/NULL/NaN counts without bounds; `full` and
 `truncate(n)` collect numeric bounds. Collection is scoped to each output file,
 including parallel writes. The common manifest writer preserves exact NaN counts
 when present; it leaves unknown counts unspecified, including for Parquet writers
 that report only whether a NaN exists.
+The shared writer also persists total counts supplied for top-level scalar
+Parquet columns, in both build modes. It does not newly collect counts for nested
+or repeated Parquet leaves. Existing counts survive manifest rewrites.
+Both builds include the default unsorted order in COPY exports, so a subsequent
+catalog append can resolve the metadata's default sort-order ID.
 
 The pinned Vortex writer also has a narrower timestamp range than DuckDB. Each
 batch is checked before entering the writer: infinite or out-of-range values
@@ -178,9 +188,9 @@ validation. ON additionally runs all Vortex SQL tests and the local catalog,
 file-access, schema-change and file-metrics Python regressions; OFF checks that
 requesting Vortex fails. Tests run serially within each isolated runner. No Docker
 or external catalog is needed.
-Both modes also run the NaN metadata and partition-summary regressions, verify
-Parquet FLOAT/DOUBLE predicates and JOIN results, and check scan-level filtering
-using JSON execution profiles. ON extends those checks to mixed snapshots,
+Both modes also run the NaN metadata, partition-summary and NULL-pruning
+regressions, verify Parquet FLOAT/DOUBLE predicates and JOIN results, and check
+scan-level filtering using JSON execution profiles. ON extends those checks to mixed snapshots,
 old snapshots, prepared queries and transaction-local appends. The SQL suite
 also checks NULL-filter results and the files skipped by metadata pruning using
 the committed fixtures, without requiring generated data.
@@ -238,7 +248,13 @@ validates their contents, and measures COPY latency. It then measures integer
 and floating range queries and a full scan over eight files, checking results
 and reporting skipped files. Defaults are one thread, a warm-up and seven
 measured runs; latency comes from detailed JSON profiles and excludes shell
-startup. Use a fresh output directory for each comparison.
+startup. Query measurements alternate the build order on each repetition and
+include individual samples in the JSON report. Use a fresh output directory for
+each comparison.
+
+Add `--null-files 4` to use four all-NULL and four non-NULL files and measure
+`IS NULL` / `IS NOT NULL` pruning instead of ranges. Total row counts, non-NULL
+counts and query results are checked in both binaries.
 
 Individual regressions can also be run directly:
 
@@ -246,6 +262,7 @@ Individual regressions can also be run directly:
 ICEBERG_TEST_VORTEX=1 ./build/release/test/unittest '*test/sql/local/vortex/*'
 python3 test/standalone/test_nan_pruning.py --duckdb build/release/duckdb
 python3 test/vortex/test_parquet_pushdown.py --mode ON --duckdb build/release/duckdb
+python3 test/vortex/test_null_pruning.py --mode ON --duckdb build/release/duckdb
 python3 test/vortex/test_local_catalog.py --duckdb build/release/duckdb
 python3 test/vortex/test_file_access.py --duckdb build/release/duckdb
 python3 test/vortex/test_schema_changes.py --duckdb build/release/duckdb
@@ -294,3 +311,10 @@ It covers metrics modes and column overrides, nonconsecutive field IDs, quoted
 column names, filtered/constant vectors, multiple batches and parallel output
 files. Mixed snapshots retain correct results and old snapshots remain readable;
 comparison queries also assert how many files metadata pruning skips.
+
+The NULL-pruning test checks direct and catalog reads, mixed formats, old
+snapshots, column aliases, conjunctions, retained row filtering and prepared
+queries before and after transaction-local appends. It also checks `counts` and
+`none` modes, all-NULL files without bounds, and legacy manifests missing either
+total counts or NULL counts. Parquet nested fields and derived NULL expressions
+retain their results. Use `--mode OFF` for its Parquet-only coverage.

@@ -22,6 +22,7 @@ def file_metrics(shell, metadata):
                 shell,
                 "SELECT data_file.file_path AS path, data_file.file_format AS format, "
                 "data_file.record_count AS rows, data_file.null_value_counts AS nulls, "
+                "json_extract(to_json(data_file), '$.value_counts') AS counts, "
                 "json_extract(to_json(data_file), '$.nan_value_counts') AS nans, "
                 "map_from_entries(list_transform(map_entries(data_file.lower_bounds), "
                 "lambda e: {'key': e.key, 'value': hex(e.value)})) AS lower, "
@@ -50,6 +51,7 @@ class FileMetricsTests(unittest.TestCase):
 
     def check_bounds(self, file, field_id, dtype, values):
         key = str(field_id)
+        self.assertEqual((file['counts'] or {}).get(key), len(values))
         self.assertEqual(file['nulls'].get(key), values.count(None))
         floating = dtype in ('FLOAT', 'DOUBLE')
         if floating:
@@ -119,12 +121,13 @@ class FileMetricsTests(unittest.TestCase):
                     self.assertEqual(next(f for f in files if f['path'] == old[0]['path']), old[0])
                     file = next(f for f in files if f['path'] != old[0]['path'])
                     ids = {f['name']: str(f['id']) for f in metadata['schemas'][0]['fields']}
-                    for key in ('nulls', 'nans', 'lower', 'upper'):
+                    for key in ('counts', 'nulls', 'nans', 'lower', 'upper'):
                         self.assertNotIn(ids['id'], file[key] or {})
                     if mode == 'none':
-                        for key in ('nulls', 'nans', 'lower', 'upper'):
+                        for key in ('counts', 'nulls', 'nans', 'lower', 'upper'):
                             self.assertFalse(file[key])
                     else:
+                        self.assertEqual(file['counts'][ids['x']], 3)
                         self.assertEqual(file['nulls'][ids['x']], 1)
                         self.assertEqual(file['nans'][ids['x']], 1)
                         self.assertEqual(ids['x'] in file['lower'], mode != 'counts')
@@ -155,6 +158,7 @@ class FileMetricsTests(unittest.TestCase):
             files = file_metrics(DUCKDB, server.metadata)
             self.assertEqual(len(files), 1)
             file = files[0]
+            self.assertEqual(file['counts'], {'11': 3, '37': 3})
             self.assertEqual(file['nulls'], {'11': 0, '37': 1})
             self.assertEqual(file['nans'], {'37': 1})
             self.assertNotIn('11', file['lower'])
@@ -234,6 +238,7 @@ class FileMetricsTests(unittest.TestCase):
                     f'max({x}) FILTER (WHERE NOT isnan({x})) AS high FROM read_vortex({quote(file["path"])});'
                 )[0]
                 key = str(fields['x'])
+                self.assertEqual(file['counts'][key], file['rows'])
                 self.assertEqual(file['nulls'][key], expected['n'])
                 self.assertEqual(file['nans'][key], expected['nan'])
                 self.assertEqual(file['lower'][key], struct.pack('<d', expected['low']).hex().upper())

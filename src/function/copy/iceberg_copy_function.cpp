@@ -74,12 +74,10 @@ CopyIcebergBindData::CopyIcebergBindData(const CopyInfo &info, vector<string> &&
 	table_metadata->last_partition_field_id = 0;
 	table_metadata->default_sort_order_id = 0;
 
-#ifdef ICEBERG_ENABLE_VORTEX
 	// Catalog appends resolve the default sort order from this map.
 	IcebergSortOrder sort_order;
 	sort_order.sort_order_id = 0;
 	table_metadata->sort_specs.emplace(0, std::move(sort_order));
-#endif
 	for (const auto &option : info.options) {
 		if (StringUtil::CIEquals(option.first, "data_format")) {
 			if (option.second.size() != 1 || option.second[0].IsNull()) {

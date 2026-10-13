@@ -74,6 +74,9 @@ private:
 	mutable ManifestEntryReadState read_state;
 
 	mutable bool initialized = false;
+#ifdef ICEBERG_ENABLE_VORTEX
+	bool row_filter_pushdown = true;
+#endif
 
 	//! Scanned delete manifests and their owners.
 	mutable vector<IcebergManifestListEntry> committed_delete_manifests;
@@ -128,6 +131,7 @@ public:
 #ifdef ICEBERG_ENABLE_VORTEX
 	//! Inspect the bound snapshot and transaction before optimizer pruning.
 	bool HasOnlyParquetDataFiles() const;
+	void SetRowFilterPushdown(bool enabled);
 #endif
 	unique_ptr<IcebergMultiFileList> PushdownInternal(ClientContext &context, TableFilterSet &new_filters) const;
 	unique_ptr<DeleteFilter> GetPositionalDeletesForFile(const string &file_path) const;

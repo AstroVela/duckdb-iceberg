@@ -830,6 +830,10 @@ void IcebergInsertGlobalState::AddFiles(DataChunk &chunk, const string &table_na
 			if (stats.has_null_count) {
 				data_file.null_value_counts[column_info.id] = stats.null_count;
 			}
+			// Repeated/nested Parquet leaf counts need separate Iceberg semantics.
+			if (stats.has_num_values && column_names.size() == 1 && !column_info.type.IsNested()) {
+				data_file.value_counts[column_info.id] = stats.num_values;
+			}
 
 			// A boolean has_nan from Parquet cannot supply an exact count.
 			if (stats.has_nan_count) {
