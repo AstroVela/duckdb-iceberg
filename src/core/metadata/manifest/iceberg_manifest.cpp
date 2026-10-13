@@ -314,6 +314,11 @@ Value IcebergDataFile::ToValue(const IcebergTableMetadata &table_metadata, const
 		nan_value_counts_values.push_back(Value::STRUCT({{"key", child.first}, {"value", child.second}}));
 	}
 	children.push_back(Value::MAP(LogicalType::STRUCT(null_value_count_types), nan_value_counts_values));
+	vector<Value> value_counts_values;
+	for (auto &child : value_counts) {
+		value_counts_values.push_back(Value::STRUCT({{"key", child.first}, {"value", child.second}}));
+	}
+	children.push_back(Value::MAP(LogicalType::STRUCT(null_value_count_types), value_counts_values));
 
 	// equality_ids: list<int> (empty for non equality-delete files)
 	vector<Value> equality_id_values;
@@ -506,7 +511,6 @@ idx_t WriteToFile(const IcebergTableMetadata &table_metadata, const IcebergManif
 
 	//! NOTE: These are optional but we should probably add them, to support better filtering
 	//! column_sizes
-	//! value_counts
 
 	// lower bounds struct
 	child_list_t<LogicalType> bounds_fields;
@@ -571,6 +575,11 @@ idx_t WriteToFile(const IcebergTableMetadata &table_metadata, const IcebergManif
 	                                 Value::STRUCT({{"__duckdb_field_id", Value::INTEGER(NAN_VALUE_COUNTS)},
 	                                                {"key", CreateFieldID(NAN_VALUE_COUNTS_KEY, false)},
 	                                                {"value", CreateFieldID(NAN_VALUE_COUNTS_VALUE, false)}}));
+	children.emplace_back("value_counts", LogicalType::MAP(LogicalType::STRUCT(null_value_counts_fields)));
+	data_file_field_ids.emplace_back("value_counts",
+	                                 Value::STRUCT({{"__duckdb_field_id", Value::INTEGER(VALUE_COUNTS)},
+	                                                {"key", CreateFieldID(VALUE_COUNTS_KEY, false)},
+	                                                {"value", CreateFieldID(VALUE_COUNTS_VALUE, false)}}));
 
 	// equality_ids: list<int> - the field-ids an equality-delete file applies to
 	children.emplace_back("equality_ids", LogicalType::LIST(LogicalType::INTEGER));

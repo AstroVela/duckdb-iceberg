@@ -156,6 +156,7 @@ def run_tests(build, mode, output):
     python_tests = [
         (ROOT / "test/standalone/test_nan_pruning.py", []),
         (ROOT / "test/vortex/test_parquet_pushdown.py", ["--mode", mode]),
+        (ROOT / "test/vortex/test_null_pruning.py", ["--mode", mode]),
     ]
     if mode == "ON":
         python_tests.extend((ROOT / "test/vortex" / test, []) for test in PYTHON_TESTS)
