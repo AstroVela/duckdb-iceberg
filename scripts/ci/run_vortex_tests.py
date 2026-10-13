@@ -152,12 +152,15 @@ def run_tests(build, mode, output):
         assertions += count
         print(f"PASS {test}: {count} assertions", flush=True)
     print(f"SQL {mode}: {len(tests)} cases, {assertions} assertions", flush=True)
-    python_tests = [ROOT / "test/standalone/test_nan_pruning.py"]
+    python_tests = [
+        (ROOT / "test/standalone/test_nan_pruning.py", []),
+        (ROOT / "test/vortex/test_parquet_pushdown.py", ["--mode", mode]),
+    ]
     if mode == "ON":
-        python_tests.extend(ROOT / "test/vortex" / test for test in PYTHON_TESTS)
-    for test in python_tests:
+        python_tests.extend((ROOT / "test/vortex" / test, []) for test in PYTHON_TESTS)
+    for test, arguments in python_tests:
         run_logged(
-            [sys.executable, str(test), "--duckdb", str(build / "duckdb")],
+            [sys.executable, str(test), "--duckdb", str(build / "duckdb"), *arguments],
             output / (test.stem + ".log"),
             env,
         )

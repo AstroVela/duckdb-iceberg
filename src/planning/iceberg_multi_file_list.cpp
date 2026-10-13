@@ -289,6 +289,25 @@ void IcebergMultiFileList::Bind(vector<LogicalType> &return_types, vector<string
 	this->types = return_types;
 }
 
+#ifdef ICEBERG_ENABLE_VORTEX
+bool IcebergMultiFileList::HasOnlyParquetDataFiles() const {
+	lock_guard<mutex> guard(shared_state->lock);
+	D_ASSERT(table_filters.filters.empty());
+	InitializeFiles(guard);
+	// Reuse the manifest entries that execution will consume. The write-format
+	// property and the first data file cannot describe a mixed snapshot.
+	for (idx_t file_id = 0;; file_id++) {
+		auto entry = GetDataFile(file_id, guard);
+		if (!entry) {
+			return true;
+		}
+		if (!StringUtil::CIEquals(entry->entry.data_file.file_format, "parquet")) {
+			return false;
+		}
+	}
+}
+#endif
+
 unique_ptr<IcebergMultiFileList> IcebergMultiFileList::PushdownInternal(ClientContext &context,
                                                                         TableFilterSet &new_filters) const {
 	auto filtered_list = unique_ptr<IcebergMultiFileList>(new IcebergMultiFileList(shared_state));

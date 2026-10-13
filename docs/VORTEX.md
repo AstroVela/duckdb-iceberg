@@ -110,12 +110,23 @@ contains delete manifests, including deletes made while the table still used
 Parquet. A format change through `set_iceberg_table_properties` takes effect at
 commit; inserts in that transaction continue to use the previously committed format.
 
-With Vortex enabled, all row filters are evaluated by DuckDB. The pinned Vortex
-reader distinguishes positive and negative zero, so even simple comparisons
-and dynamic JOIN filters must not be delegated to it. This also disables row
-filter pushdown for Parquet-only Iceberg scans in an enabled build, with a
-possible performance cost. Iceberg metadata pruning remains enabled; default
-builds retain the original Parquet filter pushdown.
+With Vortex enabled, binding inspects live data-file entries in the selected
+snapshot, including transaction-local appends. Parquet-only scans retain
+Parquet's row-filter, expression and dynamic JOIN filter pushdown. Each scan is
+classified independently from its actual files, including reads of older
+snapshots; the table's current write-format property does not determine scan
+capabilities. Classification reuses the existing manifest read state and may
+wait for all data manifests of a Parquet-only snapshot during binding.
+
+For Vortex and mixed-format scans, DuckDB evaluates row filters. The pinned
+Vortex reader distinguishes positive and negative zero, so even simple
+comparisons and dynamic JOIN filters must not be delegated to it. Iceberg
+metadata pruning remains enabled, and default builds retain the original
+Parquet scan path.
+
+Existing Iceberg min/max pruning can still drop Parquet NaN rows when a range
+predicate excludes the non-NaN values, such as `x > 0` over `0, -1, NaN`. This
+also occurs in OFF builds and is separate from reader-level filter pushdown.
 
 The pinned Vortex writer also has a narrower timestamp range than DuckDB. Each
 batch is checked before entering the writer: infinite or out-of-range values
@@ -146,6 +157,9 @@ Parquet COPY, column mapping and delete-read regressions, plus COPY option
 validation. ON additionally runs all Vortex SQL tests and the three local Python
 regressions below; OFF checks that requesting Vortex fails. Tests run serially
 within each isolated runner. No Docker or external catalog is needed.
+Both modes also verify Parquet predicate results and scan-level filtering using
+JSON execution profiles. ON extends that check to FLOAT/DOUBLE edge cases in
+mixed snapshots, old snapshots, prepared queries and transaction-local appends.
 
 The workflow loads the static Parquet extension before Iceberg in both modes
 and builds `httpfs` from the revision pinned by DuckDB for the Parquet tests.
@@ -169,6 +183,22 @@ To repeat the CI tests against one of these native Ninja builds:
 python3 scripts/ci/run_vortex_tests.py --mode ON --build-dir build/vortex-ci
 # Use --mode OFF for the default build, in a separate build directory.
 ```
+
+To compare Parquet scan performance across native builds on identical data:
+
+```sh
+python3 scripts/benchmark_vortex_pushdown.py \
+  --duckdb OFF=build/off/duckdb --duckdb ON=build/on/duckdb \
+  --directory build/pushdown-benchmark --output build/pushdown-benchmark/results.json
+```
+
+The benchmark validates every result, warms the OS file cache, and records median
+JSON-profile latency, binding time and scan output rows for a selective range,
+dynamic JOIN and full scan. Detailed profiling includes binding and optimization
+in the total latency, including file-format classification; shell startup is
+excluded. It uses one thread, two million rows and seven measured runs per query
+by default. Performance timings are informational; CI asserts filtering behavior
+and results without a timing threshold.
 
 Individual regressions can also be run directly:
 
