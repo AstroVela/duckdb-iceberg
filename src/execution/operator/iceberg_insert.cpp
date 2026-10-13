@@ -831,8 +831,10 @@ void IcebergInsertGlobalState::AddFiles(DataChunk &chunk, const string &table_na
 				data_file.null_value_counts[column_info.id] = stats.null_count;
 			}
 
-			//! nan_value_counts won't work, we can only indicate if they exist.
-			//! TODO: revisit when duckdb/duckdb can record nan_value_counts
+			// A boolean has_nan from Parquet cannot supply an exact count.
+			if (stats.has_nan_count) {
+				data_file.nan_value_counts[column_info.id] = stats.nan_count;
+			}
 		}
 		DUCKDB_LOG(context, IcebergLogType,
 		           "Iceberg INSERT, wrote data_file '%s', record_count=%lld, file_size=%lld bytes", data_file.file_path,
