@@ -738,6 +738,12 @@ bool IcebergMultiFileList::FileMatchesFilter(const IcebergManifestFile &manifest
 						stats.upper_bound = partition_val.value;
 						stats.has_upper_bounds = true;
 						stats.has_lower_bounds = true;
+						// An exact partition value includes NaN, unlike Iceberg min/max bounds.
+						stats.has_nan_stats = true;
+						auto type_id = partition_val.value.type().id();
+						stats.has_nan = !partition_val.value.IsNull() &&
+						                (type_id == LogicalTypeId::FLOAT || type_id == LogicalTypeId::DOUBLE) &&
+						                Value::IsNan(partition_val.value.GetValue<double>());
 						// set null stats for partitioned column.
 						if (partition_val.value.IsNull()) {
 							// partition values can be null
@@ -752,12 +758,6 @@ bool IcebergMultiFileList::FileMatchesFilter(const IcebergManifestFile &manifest
 				if (!found_partition_field) {
 					// continue to next partition spec field summary
 					continue;
-				}
-
-				auto nan_counts_it = data_file.nan_value_counts.find(column_id.GetPrimaryIndex());
-				if (nan_counts_it != data_file.nan_value_counts.end()) {
-					auto &nan_counts = nan_counts_it->second;
-					stats.has_nan = nan_counts != 0;
 				}
 
 				// if the filter doesn't match the partition value, we don't need to scan the data file
@@ -863,6 +863,7 @@ bool IcebergMultiFileList::FileMatchesFilter(const IcebergManifestFile &manifest
 		if (nan_counts_it != data_file.nan_value_counts.end()) {
 			auto &nan_counts = nan_counts_it->second;
 			stats.has_nan = nan_counts != 0;
+			stats.has_nan_stats = true;
 		}
 
 		auto &filter = *it->second;
@@ -1115,6 +1116,7 @@ bool IcebergMultiFileList::ManifestMatchesFilter(const IcebergManifestFile &mani
 		auto stats = IcebergPredicateStats::DeserializeBounds(field_summary.lower_bound, field_summary.upper_bound,
 		                                                      column.name, result_type);
 		stats.has_nan = field_summary.contains_nan;
+		stats.has_nan_stats = field_summary.has_contains_nan;
 		stats.has_null = field_summary.contains_null;
 		stats.has_not_null = true; // Not enough information in field_summary to determine if this should be false
 
