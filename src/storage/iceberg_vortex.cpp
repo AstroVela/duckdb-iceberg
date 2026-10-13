@@ -344,6 +344,7 @@ unique_ptr<FunctionData> IcebergVortex::BindScan(ClientContext &context, TableFu
 	auto &files = bind.file_list->Cast<IcebergMultiFileList>();
 	auto parquet_only = files.HasOnlyParquetDataFiles();
 	input.table_function.filter_pushdown = parquet_only && parquet.filter_pushdown;
+	files.SetRowFilterPushdown(input.table_function.filter_pushdown);
 	input.table_function.pushdown_expression = parquet_only ? parquet.pushdown_expression : nullptr;
 	return result;
 }
@@ -642,6 +643,7 @@ IcebergCopyOptions IcebergVortex::CopyOptions(ClientContext &context, const Iceb
 				auto &column = bind.metrics_columns[i];
 				auto &metrics = state.metrics[i];
 				auto &stats = state.statistics->column_statistics[column.name];
+				stats["num_values"] = Value::UBIGINT(state.row_count);
 				stats["null_count"] = Value::UBIGINT(metrics.null_count);
 				auto type = bind.types[column.index].id();
 				if (type == LogicalTypeId::FLOAT || type == LogicalTypeId::DOUBLE) {
