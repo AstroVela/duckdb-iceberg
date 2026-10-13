@@ -22,6 +22,9 @@ IcebergColumnStats IcebergColumnStats::ParseColumnStats(const LogicalType &type,
 			D_ASSERT(!column_stats.has_null_count);
 			column_stats.has_null_count = true;
 			column_stats.null_count = StringUtil::ToUnsigned(StringValue::Get(stats_children[1]));
+		} else if (stats_name == "nan_count") {
+			column_stats.has_nan_count = true;
+			column_stats.nan_count = StringUtil::ToUnsigned(StringValue::Get(stats_children[1]));
 		} else if (stats_name == "num_values") {
 			D_ASSERT(!column_stats.has_num_values);
 			column_stats.has_num_values = true;
