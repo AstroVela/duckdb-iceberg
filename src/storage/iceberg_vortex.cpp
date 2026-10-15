@@ -17,6 +17,7 @@
 #include "planning/metadata_io/avro/avro_scan.hpp"
 #include "planning/metadata_io/manifest/iceberg_manifest_reader.hpp"
 #include "planning/metadata_io/manifest_list/iceberg_manifest_list_reader.hpp"
+#include "planning/iceberg_multi_file_list.hpp"
 
 namespace duckdb {
 
@@ -337,6 +338,10 @@ unique_ptr<FunctionData> IcebergVortex::BindScan(ClientContext &context, TableFu
 	auto result = parquet.bind(context, input, types, names);
 	auto &bind = result->Cast<MultiFileBindData>();
 	bind.interface = make_uniq<IcebergFileInterface>(std::move(bind.interface));
+	auto &files = bind.file_list->Cast<IcebergMultiFileList>();
+	auto parquet_only = files.HasOnlyParquetDataFiles();
+	input.table_function.filter_pushdown = parquet_only && parquet.filter_pushdown;
+	input.table_function.pushdown_expression = parquet_only ? parquet.pushdown_expression : nullptr;
 	return result;
 }
 
