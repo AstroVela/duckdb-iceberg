@@ -110,12 +110,24 @@ contains delete manifests, including deletes made while the table still used
 Parquet. A format change through `set_iceberg_table_properties` takes effect at
 commit; inserts in that transaction continue to use the previously committed format.
 
-With Vortex enabled, all row filters are evaluated by DuckDB. The pinned Vortex
-reader distinguishes positive and negative zero, so even simple comparisons
-and dynamic JOIN filters must not be delegated to it. This also disables row
-filter pushdown for Parquet-only Iceberg scans in an enabled build, with a
-possible performance cost. Iceberg metadata pruning remains enabled; default
-builds retain the original Parquet filter pushdown.
+With Vortex enabled, binding inspects live data-file entries in the selected
+snapshot, including transaction-local appends. Parquet-only scans retain
+Parquet's row-filter, expression and dynamic JOIN filter pushdown. Each scan is
+classified independently from its actual files, including reads of older
+snapshots; the table's current write-format property does not determine scan
+capabilities. Classification reuses the existing manifest read state and may
+wait for all data manifests of a Parquet-only snapshot during binding.
+
+For Vortex and mixed-format scans, DuckDB evaluates row filters. The pinned
+Vortex reader distinguishes positive and negative zero, so even simple
+comparisons and dynamic JOIN filters must not be delegated to it. Iceberg
+metadata pruning remains enabled, and default builds retain the original
+Parquet scan path.
+
+Iceberg min/max bounds exclude NaNs. Metadata pruning preserves possible NaN
+matches when NaN statistics are absent and uses known zero counts to retain
+safe upper-bound pruning. This applies to both build modes and to data-file
+and partition summaries, separately from reader-level filter pushdown.
 
 The pinned Vortex writer also has a narrower timestamp range than DuckDB. Each
 batch is checked before entering the writer: infinite or out-of-range values
@@ -143,9 +155,16 @@ data files. This convention does not change the Vortex binary file format.
 The `Vortex format CI` workflow builds Linux native shells and SQL test runners
 with Vortex enabled and with the default OFF setting. Each build runs the same
 Parquet COPY, column mapping and delete-read regressions, plus COPY option
-validation. ON additionally runs all Vortex SQL tests and the three local Python
-regressions below; OFF checks that requesting Vortex fails. Tests run serially
-within each isolated runner. No Docker or external catalog is needed.
+validation. ON additionally runs all Vortex SQL tests and the local catalog,
+file-access and schema-change Python regressions; OFF checks that requesting
+Vortex fails. Tests run serially within each isolated runner. No Docker or
+external catalog is needed.
+Both modes also run the NaN metadata and partition-summary regressions, verify
+Parquet FLOAT/DOUBLE predicates and JOIN results, and check scan-level filtering
+using JSON execution profiles. ON extends those checks to mixed snapshots,
+old snapshots, prepared queries and transaction-local appends. The SQL suite
+also checks NULL-filter results and the files skipped by metadata pruning using
+the committed fixtures, without requiring generated data.
 
 The workflow loads the static Parquet extension before Iceberg in both modes
 and builds `httpfs` from the revision pinned by DuckDB for the Parquet tests.
@@ -170,10 +189,28 @@ python3 scripts/ci/run_vortex_tests.py --mode ON --build-dir build/vortex-ci
 # Use --mode OFF for the default build, in a separate build directory.
 ```
 
+To compare Parquet scan performance across native builds on identical data:
+
+```sh
+python3 scripts/benchmark_vortex_pushdown.py \
+  --duckdb OFF=build/off/duckdb --duckdb ON=build/on/duckdb \
+  --directory build/pushdown-benchmark --output build/pushdown-benchmark/results.json
+```
+
+The benchmark validates every result, warms the OS file cache, and records median
+JSON-profile latency, binding time and scan output rows for a selective range,
+dynamic JOIN and full scan. Detailed profiling includes binding and optimization
+in the total latency, including file-format classification; shell startup is
+excluded. It uses one thread, two million rows and seven measured runs per query
+by default. Performance timings are informational; CI asserts filtering behavior
+and results without a timing threshold.
+
 Individual regressions can also be run directly:
 
 ```sh
 ICEBERG_TEST_VORTEX=1 ./build/release/test/unittest '*test/sql/local/vortex/*'
+python3 test/standalone/test_nan_pruning.py --duckdb build/release/duckdb
+python3 test/vortex/test_parquet_pushdown.py --mode ON --duckdb build/release/duckdb
 python3 test/vortex/test_local_catalog.py --duckdb build/release/duckdb
 python3 test/vortex/test_file_access.py --duckdb build/release/duckdb
 python3 test/vortex/test_schema_changes.py --duckdb build/release/duckdb
