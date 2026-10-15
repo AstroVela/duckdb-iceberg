@@ -27,10 +27,12 @@ struct IcebergColumnStats {
 	string min;
 	string max;
 	idx_t null_count = 0;
+	idx_t nan_count = 0;
 	idx_t num_values = 0;
 	idx_t column_size_bytes = 0;
 	bool contains_nan = false;
 	bool has_null_count = false;
+	bool has_nan_count = false;
 	bool has_num_values = false;
 	bool has_min = false;
 	bool has_max = false;
