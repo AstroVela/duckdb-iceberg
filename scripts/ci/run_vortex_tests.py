@@ -20,7 +20,7 @@ PARQUET_TESTS = (
     "test/sql/local/equality_delete_extra_column.test",
     "test/sql/local/equality_deletes_join.test",
 )
-PYTHON_TESTS = ("test_local_catalog.py", "test_file_access.py", "test_schema_changes.py")
+PYTHON_TESTS = ("test_local_catalog.py", "test_file_access.py", "test_schema_changes.py", "test_fts.py")
 
 
 def sql_assertions(report, expected):

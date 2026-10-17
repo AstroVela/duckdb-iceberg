@@ -1,4 +1,9 @@
 # This file is included by DuckDB's build system. It specifies which extension to load
+option(ICEBERG_ENABLE_TANTIVY "Enable explicit Iceberg snapshot full-text tooling" OFF)
+if(ICEBERG_ENABLE_TANTIVY)
+  set(ICEBERG_ENABLE_VORTEX ON CACHE BOOL "Enable Vortex snapshot materialization" FORCE)
+  set(VORTEX_ENABLE_INDEX_TANTIVY ON CACHE BOOL "Enable Tantivy SQL" FORCE)
+endif()
 option(ICEBERG_ENABLE_VORTEX "Enable experimental Vortex data files" OFF)
 if(ICEBERG_ENABLE_VORTEX)
   # Iceberg needs Parquet registered before it in a statically linked shell.
@@ -7,8 +12,8 @@ if(ICEBERG_ENABLE_VORTEX)
     set(VORTEX_VANE_DISTRIBUTED ON CACHE BOOL "Build Vane distributed Vortex support" FORCE)
   endif()
   duckdb_extension_load(vortex
-    GIT_URL https://github.com/AstroVela/duckdb-vortex
-    GIT_TAG 348d44eebb39009c291c776104a6c6649d8460d5
+    GIT_URL https://github.com/sollhui/duckdb-vortex
+    GIT_TAG b1f7bdbee9b424c9d11f5234d91364511c0d4426
   )
 endif()
 
