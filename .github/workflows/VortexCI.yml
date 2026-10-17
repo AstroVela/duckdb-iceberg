@@ -92,7 +92,7 @@ jobs:
         run: |
           vortex_flags=()
           if [[ "$VORTEX_MODE" == ON ]]; then
-            vortex_flags=(-DICEBERG_ENABLE_VORTEX=ON "-DRust_TOOLCHAIN=$RUST_TOOLCHAIN")
+            vortex_flags=(-DICEBERG_ENABLE_VORTEX=ON -DICEBERG_ENABLE_TANTIVY=ON "-DRust_TOOLCHAIN=$RUST_TOOLCHAIN")
           fi
           # OFF deliberately omits the option to exercise the default.
           cmake -S duckdb -B build/vortex-ci -G Ninja \
