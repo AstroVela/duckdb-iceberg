@@ -164,11 +164,17 @@ snapshots; the table's current write-format property does not determine scan
 capabilities. Classification reuses the existing manifest read state and may
 wait for all data manifests of a Parquet-only snapshot during binding.
 
-For Vortex and mixed-format scans, DuckDB evaluates row filters. The pinned
-Vortex reader distinguishes positive and negative zero, so even simple
-comparisons and dynamic JOIN filters must not be delegated to it. Iceberg
-metadata pruning remains enabled, and default builds retain the original
-Parquet scan path.
+For Vortex and mixed-format scans, DuckDB evaluates the complete row predicate.
+The adapter additionally copies static INTEGER/BIGINT comparisons and scalar
+`IS NULL` / `IS NOT NULL` checks from metadata pruning into the Vortex reader,
+reducing the rows exported before DuckDB's final check. Existing conjunctions
+and disjunctions are copied only when every child is supported, including
+DuckDB's optional wrapper around a complete same-column OR clause. Column
+mapping uses Iceberg field IDs and the actual projected scan positions.
+Floating comparisons, arbitrary expressions and dynamic JOIN filters remain in
+DuckDB: the pinned Vortex reader distinguishes positive and negative zero.
+Iceberg metadata pruning remains enabled, and default builds retain the
+original Parquet scan path.
 
 Iceberg min/max bounds exclude NaNs. Metadata pruning preserves possible NaN
 matches when NaN statistics are absent and uses known zero counts to retain
@@ -312,6 +318,7 @@ python3 test/vortex/test_schema_changes.py --duckdb build/release/duckdb
 python3 test/vortex/test_file_metrics.py --duckdb build/release/duckdb
 python3 test/vortex/test_format_benchmark.py --duckdb build/release/duckdb
 python3 test/vortex/test_s3_reads.py --duckdb build/release/duckdb
+python3 test/vortex/test_static_filter_hints.py --duckdb build/release/duckdb
 ```
 
 Set `ICEBERG_TEST_VORTEX=1` only for builds with the feature enabled. Default
@@ -400,3 +407,20 @@ caches. Linux physical read bytes can therefore be zero. DuckDB's reported
 read-byte and buffer-memory counters are included separately and do not cover
 all Vortex I/O or allocations; they must not be interpreted as comparable
 totals. CI runs only a small correctness smoke test, without timing thresholds.
+
+To compare a filter change against a saved binary using the same retained data:
+
+```sh
+python3 scripts/profile_vortex_filters.py \
+  --before build/baseline/duckdb --after build/on/duckdb \
+  --data-directory build/formats-sorted --output-directory build/filter-profile
+```
+
+This runs the seven query classes with one thread, one warmup and five measured
+repetitions. Variant order rotates between the two Vortex binaries and Parquet
+in the new binary. Every result must agree. The output preserves detailed JSON
+profiles, individual samples, binding time, scan output rows, medians and binary
+checksums. `--queries selective_range null_filter` narrows the workload; `--rows`
+must match the retained benchmark data. DuckDB's `cpu_time` is an operator timing
+metric rather than whole-process CPU usage, and it must not be added to binding
+time to reconstruct total latency.
