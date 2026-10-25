@@ -11,6 +11,9 @@
 #include "duckdb/parallel/thread_context.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/parser/tableref/table_function_ref.hpp"
+#include "duckdb/planner/filter/constant_filter.hpp"
+#include "duckdb/planner/filter/conjunction_filter.hpp"
+#include "duckdb/planner/filter/optional_filter.hpp"
 #include <cmath>
 
 #include "common/iceberg_utils.hpp"
@@ -165,6 +168,55 @@ static void VerifyVortexFileAccess(ClientContext &context, const string &path) {
 	auto handle = FileSystem::GetFileSystem(context).OpenFile(path, FileFlags::FILE_FLAGS_READ);
 }
 
+static bool CanCopyVortexFilter(const TableFilter &filter, const LogicalType &type) {
+	switch (filter.filter_type) {
+	case TableFilterType::IS_NULL:
+	case TableFilterType::IS_NOT_NULL:
+		return !type.IsNested();
+	case TableFilterType::CONSTANT_COMPARISON: {
+		if (type.id() != LogicalTypeId::INTEGER && type.id() != LogicalTypeId::BIGINT) {
+			return false;
+		}
+		auto &comparison = filter.Cast<ConstantFilter>();
+		if (comparison.constant.type() != type || comparison.constant.IsNull()) {
+			return false;
+		}
+		switch (comparison.comparison_type) {
+		case ExpressionType::COMPARE_EQUAL:
+		case ExpressionType::COMPARE_NOTEQUAL:
+		case ExpressionType::COMPARE_LESSTHAN:
+		case ExpressionType::COMPARE_LESSTHANOREQUALTO:
+		case ExpressionType::COMPARE_GREATERTHAN:
+		case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+			return true;
+		default:
+			return false;
+		}
+	}
+	case TableFilterType::CONJUNCTION_AND:
+	case TableFilterType::CONJUNCTION_OR: {
+		auto &conjunction = filter.filter_type == TableFilterType::CONJUNCTION_AND
+		                        ? static_cast<const ConjunctionFilter &>(filter.Cast<ConjunctionAndFilter>())
+		                        : static_cast<const ConjunctionFilter &>(filter.Cast<ConjunctionOrFilter>());
+		for (auto &child : conjunction.child_filters) {
+			if (!CanCopyVortexFilter(*child, type)) {
+				return false;
+			}
+		}
+		return !conjunction.child_filters.empty();
+	}
+	case TableFilterType::OPTIONAL_FILTER: {
+		// DuckDB wraps complete same-column OR clauses as pruning hints. Copy only
+		// a fully validated disjunction, never runtime or arbitrary-expression hints.
+		auto &optional = filter.Cast<OptionalFilter>();
+		return optional.child_filter && optional.child_filter->filter_type == TableFilterType::CONJUNCTION_OR &&
+		       CanCopyVortexFilter(*optional.child_filter, type);
+	}
+	default:
+		return false;
+	}
+}
+
 // Each file is claimed by one scan task. Other files can be scanned in parallel.
 class IcebergVortexReader : public BaseFileReader {
 public:
@@ -215,6 +267,25 @@ public:
 			columns.push_back(std::move(column));
 			fields.erase(field);
 		}
+		// These are immutable static predicates from metadata pruning. DuckDB keeps the
+		// complete residual predicate; copy only operations whose Vortex semantics agree.
+		auto &files = iceberg_bind.file_list->Cast<IcebergMultiFileList>();
+		for (auto &entry : files.GetPruningFilters().filters) {
+			if (entry.first >= schema.size()) {
+				continue;
+			}
+			auto &column = schema[entry.first];
+			if (!CanCopyVortexFilter(*entry.second, column.type)) {
+				continue;
+			}
+			auto name = PhysicalColumnName(column.identifier.GetValue<int32_t>());
+			for (idx_t index = 0; index < columns.size(); index++) {
+				if (columns[index].name == name) {
+					source_filters.PushFilter(ColumnIndex(index), entry.second->Copy());
+					break;
+				}
+			}
+		}
 	}
 
 	void AddVirtualColumn(column_t id) override {
@@ -242,11 +313,19 @@ public:
 			throw NotImplementedException("Vortex Iceberg scans do not yet support delete files");
 		}
 		vector<column_t> ids;
+		scan_filters = filters ? filters->Copy() : nullptr;
 		for (idx_t index = 0; index < column_ids.size(); index++) {
 			auto id = column_ids[MultiFileLocalIndex(index)];
 			ids.push_back(columns[id].name.empty() ? COLUMN_IDENTIFIER_EMPTY : id);
+			auto filter = source_filters.filters.find(id);
+			if (filter != source_filters.filters.end()) {
+				if (!scan_filters) {
+					scan_filters = make_uniq<TableFilterSet>();
+				}
+				scan_filters->PushFilter(ColumnIndex(index), filter->second->Copy());
+			}
 		}
-		TableFunctionInitInput input(bind_data.get(), std::move(ids), {}, filters.get());
+		TableFunctionInitInput input(bind_data.get(), std::move(ids), {}, scan_filters.get());
 		global = scan.init_global(context, input);
 		ThreadContext thread(context);
 		ExecutionContext execution(context, thread, nullptr);
@@ -270,6 +349,9 @@ public:
 private:
 	TableFunction scan;
 	string scan_path;
+	// Keep copied filter storage alive until all execution states have been destroyed.
+	TableFilterSet source_filters;
+	unique_ptr<TableFilterSet> scan_filters;
 	unique_ptr<FunctionData> bind_data;
 	unique_ptr<GlobalTableFunctionState> global;
 	unique_ptr<LocalTableFunctionState> local;

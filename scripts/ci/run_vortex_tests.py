@@ -29,6 +29,7 @@ PYTHON_TESTS = (
     "test_file_metrics.py",
     "test_format_benchmark.py",
     "test_s3_reads.py",
+    "test_static_filter_hints.py",
 )
 
 

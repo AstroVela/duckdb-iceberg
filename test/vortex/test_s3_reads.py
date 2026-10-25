@@ -236,6 +236,13 @@ class S3ReadTests(unittest.TestCase):
             error='disabled',
         )
 
+    def test_integer_filter_keeps_signed_zero_and_nulls(self):
+        scan, _, _, _ = self.table()
+        self.assertEqual(
+            self.sql(self.secret() + f'SELECT id FROM {scan} WHERE id >= 2 AND (x = 0 OR x IS NULL) ORDER BY id;'),
+            [{'id': 2}, {'id': 4}],
+        )
+
     def test_short_read_fails_without_partial_results(self):
         scan, _, _, _ = self.table()
         self.server.short_read_key = next(key for key in self.server.objects if key.endswith('.vortex'))

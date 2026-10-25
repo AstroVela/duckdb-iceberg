@@ -132,6 +132,9 @@ public:
 	//! Inspect the bound snapshot and transaction before optimizer pruning.
 	bool HasOnlyParquetDataFiles() const;
 	void SetRowFilterPushdown(bool enabled);
+	const TableFilterSet &GetPruningFilters() const {
+		return table_filters;
+	}
 #endif
 	unique_ptr<IcebergMultiFileList> PushdownInternal(ClientContext &context, TableFilterSet &new_filters) const;
 	unique_ptr<DeleteFilter> GetPositionalDeletesForFile(const string &file_path) const;
