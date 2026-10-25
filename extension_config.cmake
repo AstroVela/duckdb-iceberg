@@ -8,7 +8,7 @@ if(ICEBERG_ENABLE_VORTEX)
   endif()
   duckdb_extension_load(vortex
     GIT_URL https://github.com/AstroVela/duckdb-vortex
-    GIT_TAG 348d44eebb39009c291c776104a6c6649d8460d5
+    GIT_TAG a7d1700ca52167e34145e03a1d2b155b9b40e306
   )
 endif()
 

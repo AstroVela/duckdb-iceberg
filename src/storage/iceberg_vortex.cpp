@@ -169,9 +169,23 @@ static void VerifyVortexFileAccess(ClientContext &context, const string &path) {
 class IcebergVortexReader : public BaseFileReader {
 public:
 	IcebergVortexReader(ClientContext &context, const OpenFileInfo &file, const MultiFileBindData &iceberg_bind)
-	    : BaseFileReader(file), scan(FindScan(context, "read_vortex", LogicalType::VARCHAR)) {
-		scan_path = VortexLocalPath(context, file.path);
-		VerifyVortexFileAccess(context, scan_path);
+	    : BaseFileReader(file) {
+		duckdb_filesystem = StringUtil::StartsWith(file.path, "s3://");
+		if (duckdb_filesystem) {
+#ifdef ICEBERG_VANE_DISTRIBUTED
+			throw NotImplementedException("S3 Vortex Iceberg reads currently require native DuckDB execution");
+#else
+			if (file.path.find_first_of("*?[") != string::npos) {
+				throw NotImplementedException("Vortex Iceberg data files require literal S3 object paths");
+			}
+			scan_path = file.path;
+			scan = FindScan(context, "_read_vortex_file", LogicalType::VARCHAR);
+#endif
+		} else {
+			scan_path = VortexLocalPath(context, file.path);
+			scan = FindScan(context, "read_vortex", LogicalType::VARCHAR);
+			VerifyVortexFileAccess(context, scan_path);
+		}
 		vector<Value> inputs {Value(scan_path)};
 		named_parameter_map_t parameters;
 		vector<LogicalType> input_types;
@@ -220,7 +234,10 @@ public:
 
 	void PrepareScan(ClientContext &context, GlobalTableFunctionState &, LocalTableFunctionState &) override {
 		// Access settings can change after a prepared query has bound this reader.
-		VerifyVortexFileAccess(context, scan_path);
+		// The DuckDB-backed reader reopens with the current credentials in init_global.
+		if (!duckdb_filesystem) {
+			VerifyVortexFileAccess(context, scan_path);
+		}
 		if (deletion_filter) {
 			throw NotImplementedException("Vortex Iceberg scans do not yet support delete files");
 		}
@@ -257,6 +274,7 @@ private:
 	unique_ptr<GlobalTableFunctionState> global;
 	unique_ptr<LocalTableFunctionState> local;
 	bool claimed = false;
+	bool duckdb_filesystem = false;
 };
 
 // Keep the Parquet bind/options/state contract used by iceberg_scan. Only the
