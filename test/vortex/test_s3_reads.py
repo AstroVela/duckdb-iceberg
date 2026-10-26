@@ -211,6 +211,31 @@ class S3ReadTests(unittest.TestCase):
             )
             self.assertFalse(catalog.errors)
 
+    def test_physical_row_positions_with_native_filter(self):
+        scan, _, _, _ = self.table(large=True)
+        self.assertEqual(
+            self.sql(
+                self.secret() + f'SELECT file_row_number pos, id FROM {scan} '
+                'WHERE id >= 50001 AND id < 50004 ORDER BY pos;'
+            ),
+            [{'pos': i, 'id': i} for i in range(50001, 50004)],
+        )
+        self.assertEqual(self.sql(self.secret() + f'SELECT max(file_row_number) pos FROM {scan};'), [{'pos': 99999}])
+
+    def test_mixed_files_keep_original_row_positions(self):
+        scan, remote, _, old = self.table(mixed=True)
+        self.assertEqual(
+            self.sql(self.secret() + f'SELECT id, file_row_number pos FROM {scan} WHERE id >= 2 ORDER BY id;'),
+            [{'id': i, 'pos': pos} for i, pos in ((2, 1), (3, 2), (4, 3), (5, 0), (6, 1))],
+        )
+        self.assertEqual(
+            self.sql(
+                self.secret() + f'SELECT file_row_number pos FROM iceberg_scan({quote(remote)}, '
+                f'snapshot_from_id={old}) WHERE x IS NULL;'
+            ),
+            [{'pos': 3}],
+        )
+
     def test_credentials_are_scoped_and_rechecked(self):
         scan, _, _, _ = self.table()
         query = f'SELECT sum(id)::BIGINT n FROM {scan};'
