@@ -30,6 +30,7 @@ PYTHON_TESTS = (
     "test_format_benchmark.py",
     "test_s3_reads.py",
     "test_static_filter_hints.py",
+    "test_row_positions.py",
 )
 
 

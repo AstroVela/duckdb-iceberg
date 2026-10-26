@@ -265,6 +265,7 @@ public:
 			MultiFileColumnDefinition column(names[index], types[index]);
 			column.identifier = field->second->identifier;
 			columns.push_back(std::move(column));
+			source_column_ids.push_back(index);
 			fields.erase(field);
 		}
 		// These are immutable static predicates from metadata pruning. DuckDB keeps the
@@ -289,10 +290,14 @@ public:
 	}
 
 	void AddVirtualColumn(column_t id) override {
-		if (id != COLUMN_IDENTIFIER_EMPTY) {
-			throw NotImplementedException("Vortex Iceberg scans do not yet support virtual row columns");
+		if (id != COLUMN_IDENTIFIER_EMPTY && id != MultiFileReader::COLUMN_IDENTIFIER_FILE_ROW_NUMBER) {
+			throw NotImplementedException("Vortex Iceberg scans do not support virtual column id %llu", id);
 		}
-		columns.emplace_back("", LogicalType::BOOLEAN);
+		// The multi-file mapper has already appended this column to columns. Keep its
+		// source identifier separately: it is not a field in the physical file schema.
+		D_ASSERT(columns.size() == source_column_ids.size() + 1);
+		source_column_ids.push_back(id);
+		read_row_numbers |= id == MultiFileReader::COLUMN_IDENTIFIER_FILE_ROW_NUMBER;
 	}
 
 	bool TryInitializeScan(ClientContext &, GlobalTableFunctionState &, LocalTableFunctionState &) override {
@@ -313,10 +318,16 @@ public:
 			throw NotImplementedException("Vortex Iceberg scans do not yet support delete files");
 		}
 		vector<column_t> ids;
+		vector<LogicalType> scan_types;
 		scan_filters = filters ? filters->Copy() : nullptr;
 		for (idx_t index = 0; index < column_ids.size(); index++) {
 			auto id = column_ids[MultiFileLocalIndex(index)];
-			ids.push_back(columns[id].name.empty() ? COLUMN_IDENTIFIER_EMPTY : id);
+			auto source_id = source_column_ids[id];
+			ids.push_back(source_id);
+			// Vortex's row_idx() produces an unsigned position. Iceberg exposes BIGINT,
+			// so read the native type and apply a checked cast after the scan.
+			scan_types.push_back(source_id == MultiFileReader::COLUMN_IDENTIFIER_FILE_ROW_NUMBER ? LogicalType::UBIGINT
+			                                                                                     : columns[id].type);
 			auto filter = source_filters.filters.find(id);
 			if (filter != source_filters.filters.end()) {
 				if (!scan_filters) {
@@ -324,6 +335,9 @@ public:
 				}
 				scan_filters->PushFilter(ColumnIndex(index), filter->second->Copy());
 			}
+		}
+		if (read_row_numbers) {
+			scan_chunk.Initialize(context, scan_types);
 		}
 		TableFunctionInitInput input(bind_data.get(), std::move(ids), {}, scan_filters.get());
 		global = scan.init_global(context, input);
@@ -335,7 +349,22 @@ public:
 	AsyncResult Scan(ClientContext &context, GlobalTableFunctionState &, LocalTableFunctionState &,
 	                 DataChunk &chunk) override {
 		TableFunctionInput input(bind_data.get(), local.get(), global.get());
-		scan.function(context, input, chunk);
+		if (read_row_numbers) {
+			scan_chunk.Reset();
+			scan.function(context, input, scan_chunk);
+			chunk.SetCardinality(scan_chunk.size());
+			if (scan_chunk.size()) {
+				for (idx_t index = 0; index < chunk.ColumnCount(); index++) {
+					if (scan_chunk.data[index].GetType() == chunk.data[index].GetType()) {
+						chunk.data[index].Reference(scan_chunk.data[index]);
+					} else {
+						VectorOperations::Cast(context, scan_chunk.data[index], chunk.data[index], scan_chunk.size());
+					}
+				}
+			}
+		} else {
+			scan.function(context, input, chunk);
+		}
 		if (input.async_result.GetResultType() == AsyncResultType::INVALID) {
 			return chunk.size() ? SourceResultType::HAVE_MORE_OUTPUT : SourceResultType::FINISHED;
 		}
@@ -349,6 +378,8 @@ public:
 private:
 	TableFunction scan;
 	string scan_path;
+	vector<column_t> source_column_ids;
+	DataChunk scan_chunk;
 	// Keep copied filter storage alive until all execution states have been destroyed.
 	TableFilterSet source_filters;
 	unique_ptr<TableFilterSet> scan_filters;
@@ -357,6 +388,7 @@ private:
 	unique_ptr<LocalTableFunctionState> local;
 	bool claimed = false;
 	bool duckdb_filesystem = false;
+	bool read_row_numbers = false;
 };
 
 // Keep the Parquet bind/options/state contract used by iceberg_scan. Only the

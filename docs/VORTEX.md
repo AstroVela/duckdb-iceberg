@@ -78,7 +78,7 @@ acceptance of the custom file format must be tested for that catalog.
   `SUM(BIGINT)` produces a `HUGEINT` that is stored as `DECIMAL(38,0)`; values
   outside the decimal range raise a SQL cast error.
 
-Delete files, UPDATE, DELETE, MERGE, virtual row columns, and distributed Vane
+Delete files, UPDATE, DELETE, MERGE, and distributed Vane
 Vortex scans/writes are not supported by this implementation. Vortex export and
 append destinations still require local paths. Remote reads support `s3://`
 paths in native DuckDB builds; other remote schemes remain unsupported.
@@ -87,6 +87,30 @@ non-ASCII characters, and other characters requiring URL escaping are rejected
 before writing Vortex data files or committing a snapshot. Relative data paths
 are expanded to absolute paths, including validation of the working directory.
 Parquet data paths retain their existing behavior.
+
+## Physical row positions
+
+Native scans expose `file_row_number` as a zero-based `BIGINT` position in the
+original data file. Projection, filtering, scan batch boundaries and thread
+count do not renumber rows. Each file starts at zero; use `filename` together
+with the position to identify a physical row within a pinned Iceberg snapshot:
+
+```sql
+SELECT filename, file_row_number, id
+FROM iceberg_scan('/tmp/vortex-table')
+WHERE id BETWEEN 100 AND 200;
+```
+
+This also works for catalog tables, S3 reads, and snapshots containing both
+Parquet and Vortex files. The adapter requests Vortex's original `row_idx()`
+before filtering and converts its unsigned result to Iceberg's `BIGINT` with a
+checked cast. Positions outside the signed range fail rather than wrap.
+
+These are physical addresses, not primary keys or persistent logical row IDs.
+Rewriting or compacting a file creates new addresses. `file_index` is a
+query-local file-list ordinal and must not be persisted as a file identity.
+A durable file-ID registry, index row maps and delete-file handling are separate
+steps; exposing positions does not enable UPDATE or DELETE.
 
 ## Reading S3 data files
 
