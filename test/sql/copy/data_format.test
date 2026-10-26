@@ -1,0 +1,41 @@
+# name: test/sql/copy/data_format.test
+# group: [copy]
+
+require avro
+
+require parquet
+
+require iceberg
+
+statement ok
+COPY (SELECT 42 AS id) TO '__TEST_DIR__/explicit_parquet' (FORMAT iceberg, DATA_FORMAT PaRqUeT);
+
+query T
+SELECT DISTINCT file_format FROM iceberg_metadata('__TEST_DIR__/explicit_parquet');
+----
+parquet
+
+query I
+SELECT id FROM iceberg_scan('__TEST_DIR__/explicit_parquet');
+----
+42
+
+statement error
+COPY (SELECT 42 AS id) TO '__TEST_DIR__/invalid_data_format' (FORMAT iceberg, DATA_FORMAT unknown);
+----
+Unsupported Iceberg data format
+
+statement error
+COPY (SELECT 42 AS id) TO '__TEST_DIR__/null_data_format' (FORMAT iceberg, DATA_FORMAT NULL);
+----
+NULL is not supported as a valid option for COPY
+
+statement error
+COPY (SELECT 42 AS id) TO '__TEST_DIR__/multiple_data_formats' (FORMAT iceberg, DATA_FORMAT (parquet, vortex));
+----
+Iceberg DATA_FORMAT requires one format name
+
+statement error
+COPY (SELECT 42 AS id) TO '__TEST_DIR__/unknown_copy_option' (FORMAT iceberg, unsupported_option true);
+----
+Unsupported Iceberg COPY option

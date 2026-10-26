@@ -1,0 +1,61 @@
+# name: test/sql/local/vortex/vortex_file_access.test
+# group: [vortex]
+
+require-env ICEBERG_TEST_VORTEX 1
+
+require skip_reload
+
+require avro
+
+require parquet
+
+require iceberg
+
+require vortex
+
+foreach format parquet vortex
+
+statement ok
+COPY (SELECT 42::BIGINT id, 'private' payload) TO '__TEST_DIR__/iceberg_access_{format}' (FORMAT iceberg, DATA_FORMAT {format});
+
+statement ok
+SET VARIABLE metadata_path_{format} = (SELECT file FROM glob('__TEST_DIR__/iceberg_access_{format}/metadata/*.metadata.json'));
+
+endloop
+
+statement ok
+COPY (SELECT 42::BIGINT id, 'allowed' payload) TO '__TEST_DIR__/iceberg_access_allowed' (FORMAT iceberg, DATA_FORMAT vortex);
+
+statement ok
+PREPARE restricted_scan AS SELECT * FROM iceberg_scan(getvariable('metadata_path_vortex'));
+
+statement ok
+SET allowed_directories = ['__TEST_DIR__/iceberg_access_parquet/metadata', '__TEST_DIR__/iceberg_access_vortex/metadata', '__TEST_DIR__/iceberg_access_allowed'];
+
+statement ok
+SET enable_external_access = false;
+
+foreach format parquet vortex
+
+# The metadata is allowed, but the actual data file is outside the permitted directories.
+statement error
+SELECT * FROM iceberg_scan(getvariable('metadata_path_{format}'));
+----
+Permission Error
+
+endloop
+
+statement error
+EXECUTE restricted_scan;
+----
+Permission Error
+
+query IT
+SELECT id, payload FROM iceberg_scan('__TEST_DIR__/iceberg_access_allowed');
+----
+42	allowed
+
+query I
+SELECT 42;
+----
+42

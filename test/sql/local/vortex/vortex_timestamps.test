@@ -1,0 +1,101 @@
+# name: test/sql/local/vortex/vortex_timestamps.test
+# group: [vortex]
+
+require-env ICEBERG_TEST_VORTEX 1
+
+require avro
+
+require parquet
+
+require iceberg
+
+require vortex
+
+foreach type TIMESTAMP TIMESTAMPTZ
+
+foreach value -infinity infinity 30000-01-01
+
+statement error
+COPY (SELECT '{value}'::{type} t) TO '__TEST_DIR__/iceberg_timestamp_{type}_{value}' (FORMAT iceberg, DATA_FORMAT vortex);
+----
+Vortex Iceberg timestamp value is outside the supported range
+
+# SQL errors must leave the connection usable.
+query I
+SELECT 42;
+----
+42
+
+endloop
+
+# The pinned Vortex/Jiff timestamp limits, in microseconds since the epoch.
+statement ok
+CREATE TABLE timestamp_bounds_{type} AS
+SELECT id, make_timestamp(us)::{type} t
+FROM (VALUES (1, -377705023201000000::BIGINT), (2, 253402207200999999::BIGINT),
+             (3, 0::BIGINT), (4, NULL::BIGINT)) v(id, us);
+
+statement ok
+COPY timestamp_bounds_{type} TO '__TEST_DIR__/iceberg_timestamp_bounds_{type}' (FORMAT iceberg, DATA_FORMAT vortex);
+
+query I
+SELECT count(*) FROM (
+    (FROM timestamp_bounds_{type} EXCEPT ALL FROM iceberg_scan('__TEST_DIR__/iceberg_timestamp_bounds_{type}'))
+    UNION ALL
+    (FROM iceberg_scan('__TEST_DIR__/iceberg_timestamp_bounds_{type}') EXCEPT ALL FROM timestamp_bounds_{type})
+);
+----
+0
+
+foreach us -377705023201000001 253402207201000000
+
+statement error
+COPY (SELECT make_timestamp({us})::{type} t) TO '__TEST_DIR__/iceberg_timestamp_outside_{type}_{us}' (FORMAT iceberg, DATA_FORMAT vortex);
+----
+Vortex Iceberg timestamp value is outside the supported range
+
+endloop
+
+statement ok
+COPY (SELECT NULL::{type} t FROM range(4099)) TO '__TEST_DIR__/iceberg_timestamp_null_{type}' (FORMAT iceberg, DATA_FORMAT vortex);
+
+query II
+SELECT count(*), count(t) FROM iceberg_scan('__TEST_DIR__/iceberg_timestamp_null_{type}');
+----
+4099	0
+
+statement error
+COPY (
+    SELECT CASE WHEN i = 2048 THEN 'infinity'::{type} ELSE NULL::{type} END t FROM range(4099) v(i)
+) TO '__TEST_DIR__/iceberg_timestamp_late_{type}' (FORMAT iceberg, DATA_FORMAT vortex);
+----
+Vortex Iceberg timestamp value is outside the supported range
+
+endloop
+
+foreach value -infinity infinity
+
+statement error
+COPY (SELECT '{value}'::TIMESTAMP_NS t) TO '__TEST_DIR__/iceberg_timestamp_ns_{value}' (FORMAT iceberg, DATA_FORMAT vortex);
+----
+Vortex Iceberg timestamp value is outside the supported range
+
+endloop
+
+statement ok
+CREATE TABLE timestamp_ns_bounds AS
+SELECT id, make_timestamp_ns(ns) t
+FROM (VALUES (1, -9223372036854775806::BIGINT), (2, 9223372036854775806::BIGINT),
+             (3, 0::BIGINT), (4, NULL::BIGINT)) v(id, ns);
+
+statement ok
+COPY timestamp_ns_bounds TO '__TEST_DIR__/iceberg_timestamp_ns_bounds' (FORMAT iceberg, DATA_FORMAT vortex);
+
+query I
+SELECT count(*) FROM (
+    (FROM timestamp_ns_bounds EXCEPT ALL FROM iceberg_scan('__TEST_DIR__/iceberg_timestamp_ns_bounds'))
+    UNION ALL
+    (FROM iceberg_scan('__TEST_DIR__/iceberg_timestamp_ns_bounds') EXCEPT ALL FROM timestamp_ns_bounds)
+);
+----
+0

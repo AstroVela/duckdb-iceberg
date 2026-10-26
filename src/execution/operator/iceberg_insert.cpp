@@ -1,4 +1,7 @@
 #include "execution/operator/iceberg_insert.hpp"
+#ifdef ICEBERG_ENABLE_VORTEX
+#include "storage/iceberg_vortex.hpp"
+#endif
 
 #include "duckdb/catalog/catalog_entry/copy_function_catalog_entry.hpp"
 #include "duckdb/main/client_data.hpp"
@@ -175,6 +178,12 @@ void IcebergInsert::ConfigureDistributedUpdate(ClientContext &context, PhysicalC
 }
 
 void IcebergInsert::ValidateDistributedWriteShape() const {
+#ifdef ICEBERG_ENABLE_VORTEX
+	if (children.size() == 1 && children[0].get().type == PhysicalOperatorType::COPY_TO_FILE &&
+	    children[0].get().Cast<PhysicalCopyToFile>().function.name == "iceberg_vortex") {
+		throw NotImplementedException("Distributed Iceberg writes of Vortex data files are not yet supported");
+	}
+#endif
 	if (distributed_write_plan.operator_name == "update") {
 		if (!update_delete_op || !distributed_worker_child || !distributed_worker_plan_selected ||
 		    distributed_write_plan.worker_bind_data.empty() || distributed_artifact_namespace.empty() ||
@@ -656,7 +665,11 @@ void IcebergInsertGlobalState::AddFiles(DataChunk &chunk, const string &table_na
 		data_file.record_count = static_cast<int64_t>(chunk.GetValue(1, r).GetValue<idx_t>());
 		data_file.file_size_in_bytes = static_cast<int64_t>(chunk.GetValue(2, r).GetValue<idx_t>());
 		data_file.content = IcebergManifestEntryContentType::DATA;
+#ifdef ICEBERG_ENABLE_VORTEX
+		data_file.file_format = IcebergVortex::WriteFormat(table_metadata);
+#else
 		data_file.file_format = "parquet";
+#endif
 
 		// extract the column stats
 		auto column_stats = chunk.GetValue(4, r);
@@ -1237,6 +1250,11 @@ static const idx_t ICEBERG_TABLE_PROPERTY_MAPPING_SIZE =
 } // namespace
 
 IcebergCopyOptions IcebergInsert::GetCopyOptions(ClientContext &context, const IcebergCopyInput &copy_input) {
+#ifdef ICEBERG_ENABLE_VORTEX
+	if (IcebergVortex::WriteFormat(copy_input.table_metadata) == "vortex") {
+		return IcebergVortex::CopyOptions(context, copy_input);
+	}
+#endif
 	auto info = make_uniq<CopyInfo>();
 	info->file_path = copy_input.data_path;
 

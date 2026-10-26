@@ -1,0 +1,34 @@
+# name: test/sql/copy/vortex_disabled.test
+# group: [copy]
+
+require-env ICEBERG_TEST_VORTEX 0
+
+require avro
+
+require parquet
+
+require iceberg
+
+foreach format vortex VoRtEx
+
+statement error
+COPY (SELECT 42 AS id) TO '__TEST_DIR__/disabled_{format}' (FORMAT iceberg, DATA_FORMAT {format});
+----
+Vortex support is not enabled
+
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/disabled_{format}/**');
+----
+0
+
+endloop
+
+statement error
+COPY (SELECT 42 AS id WHERE false) TO '__TEST_DIR__/disabled_empty' (FORMAT iceberg, DATA_FORMAT vortex);
+----
+Vortex support is not enabled
+
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/disabled_empty/**');
+----
+0

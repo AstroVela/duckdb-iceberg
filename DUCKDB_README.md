@@ -9,6 +9,9 @@ of an iceberg tables.
 
 See the [Iceberg page in the DuckDB documentation](https://duckdb.org/docs/extensions/iceberg).
 
+AstroVela's optional [Vortex data-file integration](docs/VORTEX.md) is experimental
+and disabled by default (`ICEBERG_ENABLE_VORTEX=OFF`).
+
 ## Developer guide
 
 ### Dependencies

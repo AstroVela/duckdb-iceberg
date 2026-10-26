@@ -1,0 +1,80 @@
+# name: test/sql/local/vortex/vortex_casts.test
+# group: [vortex]
+
+require-env ICEBERG_TEST_VORTEX 1
+
+require avro
+
+require parquet
+
+require iceberg
+
+require vortex
+
+foreach format vortex parquet
+
+statement ok
+COPY (SELECT sum(i) total FROM range(10) t(i)) TO '__TEST_DIR__/iceberg_sum_{format}' (FORMAT iceberg, DATA_FORMAT {format});
+
+query IT
+SELECT total, typeof(total) FROM iceberg_scan('__TEST_DIR__/iceberg_sum_{format}');
+----
+45	DECIMAL(38,0)
+
+statement ok
+COPY (SELECT sum(i) total FROM range(0) t(i)) TO '__TEST_DIR__/iceberg_sum_null_{format}' (FORMAT iceberg, DATA_FORMAT {format});
+
+query IT
+SELECT total IS NULL, typeof(total) FROM iceberg_scan('__TEST_DIR__/iceberg_sum_null_{format}');
+----
+true	DECIMAL(38,0)
+
+endloop
+
+statement ok
+CREATE TABLE hugeint_values AS
+SELECT i::INTEGER id, CASE WHEN i % 3 = 0 THEN NULL::HUGEINT ELSE i::HUGEINT * 1000000000000000000::HUGEINT END total,
+       CASE WHEN i % 2 = 0 THEN NULL ELSE 'row-' || i END payload
+FROM range(4099) t(i);
+
+statement ok
+COPY hugeint_values TO '__TEST_DIR__/iceberg_hugeint_values' (FORMAT iceberg, DATA_FORMAT vortex);
+
+query I
+SELECT count(*) FROM (
+    (FROM hugeint_values EXCEPT ALL FROM iceberg_scan('__TEST_DIR__/iceberg_hugeint_values'))
+    UNION ALL
+    (FROM iceberg_scan('__TEST_DIR__/iceberg_hugeint_values') EXCEPT ALL FROM hugeint_values)
+);
+----
+0
+
+query T
+SELECT DISTINCT typeof(total) FROM iceberg_scan('__TEST_DIR__/iceberg_hugeint_values');
+----
+DECIMAL(38,0)
+
+statement ok
+COPY (
+    SELECT * FROM (VALUES ('99999999999999999999999999999999999999'::HUGEINT),
+                         ('-99999999999999999999999999999999999999'::HUGEINT)) v(total)
+) TO '__TEST_DIR__/iceberg_hugeint_bounds' (FORMAT iceberg, DATA_FORMAT vortex);
+
+query T rowsort
+SELECT total::VARCHAR FROM iceberg_scan('__TEST_DIR__/iceberg_hugeint_bounds');
+----
+-99999999999999999999999999999999999999
+99999999999999999999999999999999999999
+
+# Values outside DECIMAL(38,0) must raise a SQL cast error instead of being truncated.
+statement error
+COPY (
+    SELECT '170141183460469231731687303715884105727'::HUGEINT total
+) TO '__TEST_DIR__/iceberg_hugeint_overflow' (FORMAT iceberg, DATA_FORMAT vortex);
+----
+DECIMAL(38,0)
+
+query I
+SELECT 42;
+----
+42

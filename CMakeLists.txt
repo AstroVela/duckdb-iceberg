@@ -29,6 +29,10 @@ if(ICEBERG_VANE_DISTRIBUTED)
 	add_definitions(-DICEBERG_VANE_DISTRIBUTED)
 endif()
 
+option(ICEBERG_ENABLE_VORTEX "Enable experimental Vortex data files" OFF)
+if(ICEBERG_ENABLE_VORTEX)
+	add_definitions(-DICEBERG_ENABLE_VORTEX)
+endif()
 
 set(EXTENSION_SOURCES
 	src/catalog/rest/api/api_utils.cpp
@@ -124,6 +128,10 @@ set(EXTENSION_SOURCES
 	src/storage/statistics/iceberg_variant_statistics.cpp
 	src/storage/statistics/iceberg_statistics.cpp
 )
+
+if(ICEBERG_ENABLE_VORTEX)
+	list(APPEND EXTENSION_SOURCES src/storage/iceberg_vortex.cpp)
+endif()
 
 add_subdirectory(src/execution/operator)
 add_subdirectory(src/function/scan)

@@ -25,6 +25,9 @@
 #include "iceberg_logging.hpp"
 #include "catalog/rest/api/table_update.hpp"
 #include "catalog/rest/transaction/iceberg_transaction_update.hpp"
+#ifdef ICEBERG_ENABLE_VORTEX
+#include "storage/iceberg_vortex.hpp"
+#endif
 
 namespace duckdb {
 
@@ -361,6 +364,16 @@ TableTransactionInfo IcebergTransaction::GetTransactionRequest(IcebergTransactio
 		auto &metadata = commit_state.table_info.table_metadata;
 		auto current_snapshot = metadata.GetLatestSnapshot();
 		auto &transaction_data = *commit_state.table_info.transaction_data;
+		auto needs_snapshot_check = !transaction_data.alters.empty();
+#ifdef ICEBERG_ENABLE_VORTEX
+		if (transaction_data.set_schema_id && metadata.GetSchemas().size() > 1) {
+			auto &ic_table_entry = table_info.GetLatestSchema(context)->Cast<IcebergTableEntry>();
+			ic_table_entry.PrepareIcebergScanFromEntry(context);
+			IcebergVortex::ValidateSchemaChange(transaction_data);
+			// Reject the schema commit if another writer changed the current snapshot.
+			needs_snapshot_check = true;
+		}
+#endif
 		if (!transaction_data.alters.empty()) {
 			commit_state.manifests = transaction_data.existing_manifest_list;
 		}
@@ -398,11 +411,11 @@ TableTransactionInfo IcebergTransaction::GetTransactionRequest(IcebergTransactio
 			uuid_requirement.CreateRequirement(db, context, commit_state);
 		}
 
-		if (current_snapshot && !transaction_data.alters.empty()) {
+		if (current_snapshot && needs_snapshot_check) {
 			//! If any changes were made to the state of the table, we should assert that our parent snapshot has
 			//! not changed. We don't want to change the table location if someone has added a snapshot
 			commit_state.table_change.requirements.push_back(CreateAssertRefSnapshotIdRequirement(*current_snapshot));
-		} else if (!current_snapshot && !transaction_data.alters.empty() && !info.has_assert_create) {
+		} else if (!current_snapshot && needs_snapshot_check && !info.has_assert_create) {
 			//! If the table had no snapshots, is not created in this transaction, and has some kind of update
 			//! we should ensure no snapshots have been added in the meantime
 			commit_state.table_change.requirements.push_back(CreateAssertNoSnapshotRequirement());
