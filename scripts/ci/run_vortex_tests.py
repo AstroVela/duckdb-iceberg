@@ -19,6 +19,8 @@ PARQUET_TESTS = (
     "test/sql/local/equality_deletes.test",
     "test/sql/local/equality_delete_extra_column.test",
     "test/sql/local/equality_deletes_join.test",
+    "test/sql/local/iceberg_scans/nan_pruning.test",
+    "test/sql/local/iceberg_scans/is_not_null.test",
 )
 PYTHON_TESTS = ("test_local_catalog.py", "test_file_access.py", "test_schema_changes.py")
 
@@ -151,17 +153,21 @@ def run_tests(build, mode, output):
         assertions += count
         print(f"PASS {test}: {count} assertions", flush=True)
     print(f"SQL {mode}: {len(tests)} cases, {assertions} assertions", flush=True)
+    python_tests = [
+        (ROOT / "test/standalone/test_nan_pruning.py", []),
+        (ROOT / "test/vortex/test_parquet_pushdown.py", ["--mode", mode]),
+    ]
     if mode == "ON":
-        for test in PYTHON_TESTS:
-            run_logged(
-                [sys.executable, str(ROOT / "test/vortex" / test), "--duckdb", str(build / "duckdb")],
-                output / (Path(test).stem + ".log"),
-                env,
-            )
-            print(f"PASS {test}", flush=True)
+        python_tests.extend((ROOT / "test/vortex" / test, []) for test in PYTHON_TESTS)
+    for test, arguments in python_tests:
+        run_logged(
+            [sys.executable, str(test), "--duckdb", str(build / "duckdb"), *arguments],
+            output / (test.stem + ".log"),
+            env,
+        )
+        print(f"PASS {test.name}", flush=True)
     summary = f"Vortex {mode}: {len(tests)} SQL cases / {assertions} assertions passed.\n"
-    if mode == "ON":
-        summary += f"{len(PYTHON_TESTS)} local Python regressions passed.\n"
+    summary += f"{len(python_tests)} local Python regressions passed.\n"
     (output / "summary.txt").write_text(summary)
     if "GITHUB_STEP_SUMMARY" in os.environ:
         with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as stream:

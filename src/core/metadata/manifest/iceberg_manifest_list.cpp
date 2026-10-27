@@ -131,6 +131,9 @@ void ManifestPartitions::Create(const IcebergTableMetadata &metadata, const Iceb
 
 	auto num_fields = partition_spec.fields.size();
 	field_summary.resize(num_fields);
+	for (auto &summary : field_summary) {
+		summary.has_contains_nan = true;
+	}
 	vector<Value> min_values(num_fields);
 	vector<Value> max_values(num_fields);
 	vector<bool> initialized(num_fields, false);
@@ -164,6 +167,11 @@ void ManifestPartitions::Create(const IcebergTableMetadata &metadata, const Iceb
 			// Cast the partition value (stored as VARCHAR) to the correct serialized type so we can compare typed
 			// values
 			auto typed_value = extended_partition_info.value.DefaultCastAs(serialized_type);
+			if ((serialized_type.id() == LogicalTypeId::FLOAT || serialized_type.id() == LogicalTypeId::DOUBLE) &&
+			    Value::IsNan(typed_value.GetValue<double>())) {
+				field_summary[i].contains_nan = true;
+				continue;
+			}
 
 			if (!initialized[i]) {
 				min_values[i] = typed_value;
@@ -183,7 +191,7 @@ void ManifestPartitions::Create(const IcebergTableMetadata &metadata, const Iceb
 	// Serialize the min/max values as bounds
 	for (idx_t i = 0; i < num_fields; i++) {
 		if (!initialized[i]) {
-			// All values for this field are null - set bounds to null BLOBs
+			// All values for this field are null or NaN - set bounds to null BLOBs
 			field_summary[i].lower_bound = Value(LogicalType::BLOB);
 			field_summary[i].upper_bound = Value(LogicalType::BLOB);
 			continue;

@@ -192,6 +192,7 @@ void ManifestListReader::ReadChunk(DataChunk &chunk, idx_t iceberg_version, vect
 				auto contains_nan_index = contains_nan_format.sel->get_index(list_entry.offset + j);
 				if (contains_nan_format.validity.RowIsValid(contains_nan_index)) {
 					summary.contains_nan = contains_nan_data[contains_nan_index];
+					summary.has_contains_nan = true;
 				}
 				auto lower_bound_index = lower_bound_format.sel->get_index(list_entry.offset + j);
 				if (lower_bound_format.validity.RowIsValid(lower_bound_index)) {

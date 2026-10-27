@@ -1,0 +1,74 @@
+# name: test/sql/local/iceberg_scans/nan_pruning.test
+# group: [iceberg_scans]
+
+require avro
+
+require parquet
+
+require iceberg
+
+# Iceberg bounds exclude NaNs. COPY currently leaves nan_value_counts absent.
+foreach type FLOAT DOUBLE
+
+statement ok
+CREATE OR REPLACE TABLE nan_values AS
+SELECT x::${type} AS x FROM (VALUES ('-1'), ('0'), ('NaN'), (NULL)) t(x);
+
+statement ok
+COPY nan_values TO '__TEST_DIR__/nan_${type}' (FORMAT ICEBERG);
+
+query I
+SELECT count(*) FROM nan_values WHERE x > 0;
+----
+1
+
+query I
+SELECT count(*) FROM read_parquet('__TEST_DIR__/nan_${type}/data/*.parquet') WHERE x > 0;
+----
+1
+
+query I
+SELECT count(*) FROM iceberg_scan('__TEST_DIR__/nan_${type}') WHERE x > 0;
+----
+1
+
+foreach predicate = >=
+
+query I
+SELECT count(*) FROM iceberg_scan('__TEST_DIR__/nan_${type}') WHERE x ${predicate} 'NaN'::${type};
+----
+1
+
+endloop
+
+query I
+SELECT count(*) FROM iceberg_scan('__TEST_DIR__/nan_${type}') WHERE x > 'NaN'::${type};
+----
+0
+
+query I
+SELECT count(*) FROM iceberg_scan('__TEST_DIR__/nan_${type}') WHERE x < 'NaN'::${type};
+----
+2
+
+query I
+SELECT count(*) FROM iceberg_scan('__TEST_DIR__/nan_${type}') WHERE x <= 'NaN'::${type};
+----
+3
+
+query I
+SELECT count(*) FROM iceberg_scan('__TEST_DIR__/nan_${type}') WHERE x IN ('NaN'::${type}, 2::${type});
+----
+1
+
+query I
+SELECT count(*) FROM iceberg_scan('__TEST_DIR__/nan_${type}') WHERE x > 0 AND x < 'NaN'::${type};
+----
+0
+
+query I
+SELECT count(*) FROM iceberg_scan('__TEST_DIR__/nan_${type}') WHERE x IS NULL;
+----
+1
+
+endloop
