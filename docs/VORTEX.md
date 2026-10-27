@@ -66,23 +66,69 @@ acceptance of the custom file format must be tested for that catalog.
 
 ## Initial scope
 
-- Native execution, local data files, Iceberg v2, and unpartitioned tables.
+- Native execution, local or S3 data-file reads, Iceberg v2, and unpartitioned tables.
 - Primitive columns with one fixed schema; no nested columns or schema evolution.
 - Table export, scans with projection and filters, and catalog-backed appends.
-- Accurate file row counts and sizes; optional column statistics are omitted.
+- Accurate file row counts and sizes. INTEGER, BIGINT, FLOAT and DOUBLE columns
+  also record lower/upper bounds, total value counts and NULL counts; floating
+  columns record exact NaN counts, including zero. Total value counts include
+  NULLs and NaNs. Other column types omit these optional metrics.
 - Required Iceberg fields are checked for NULLs before writing each batch.
 - Query results are cast to the Iceberg schema before writing. For example,
   `SUM(BIGINT)` produces a `HUGEINT` that is stored as `DECIMAL(38,0)`; values
   outside the decimal range raise a SQL cast error.
 
 Delete files, UPDATE, DELETE, MERGE, virtual row columns, and distributed Vane
-Vortex scans/writes are not supported by this first implementation. Remote
-Vortex data paths are rejected until object-store credentials are integrated.
+Vortex scans/writes are not supported by this implementation. Vortex export and
+append destinations still require local paths. Remote reads support `s3://`
+paths in native DuckDB builds; other remote schemes remain unsupported.
 The pinned reader also cannot read URL-escaped local paths. Spaces, `#`, `%`,
 non-ASCII characters, and other characters requiring URL escaping are rejected
 before writing Vortex data files or committing a snapshot. Relative data paths
 are expanded to absolute paths, including validation of the working directory.
 Parquet data paths retain their existing behavior.
+
+## Reading S3 data files
+
+Load `httpfs` and configure an ordinary DuckDB S3 secret before querying a
+snapshot containing Vortex files. The same secret resolution applies to its
+metadata, Parquet data files and Vortex data files:
+
+```sql
+LOAD httpfs;
+CREATE SECRET iceberg_storage (
+    TYPE s3,
+    KEY_ID 'your-key-id',
+    SECRET 'your-secret',
+    SESSION_TOKEN 'your-temporary-session-token',
+    REGION 'us-east-1',
+    SCOPE 's3://your-bucket/'
+);
+SELECT id FROM iceberg_scan('s3://your-bucket/table/metadata/v1.metadata.json')
+WHERE id BETWEEN 100 AND 200;
+```
+
+Omit `SESSION_TOKEN` when using credentials that do not require one. S3-compatible
+stores can use the usual DuckDB `ENDPOINT`, `URL_STYLE` and `USE_SSL` secret
+options. No credentials are copied into Iceberg metadata or Vortex files.
+
+The native reader opens exact manifest paths through DuckDB's client filesystem
+and reads byte ranges as Vortex requests them. The adapter does not stage objects
+to a local directory; httpfs retains its normal forced-download and fallback
+settings. Each execution, including a prepared query, reopens with
+the current secret and access policy. File handles are serialized per file;
+separate files can read in parallel. In-flight blocking I/O follows httpfs
+timeouts; interruption is checked before and after each range read. Short reads
+and authentication errors fail the query. Files are expected to be immutable,
+as required by Iceberg's data-file model.
+
+The S3 regression uses an isolated loopback GET/HEAD server that verifies SigV4
+signatures and session tokens. It checks scoped credentials, credential changes
+after preparation, access policy, mixed snapshots, projection range reads,
+interruption and truncated responses. It does not qualify a production catalog
+or every S3-compatible service. Remote writes remain a separate phase.
+
+## Schema and scan behavior
 
 Schema changes are rejected before sending a catalog commit when the table
 uses `write.format.default=vortex`, a retained snapshot references Vortex files,
@@ -129,6 +175,32 @@ matches when NaN statistics are absent and uses known zero counts to retain
 safe upper-bound pruning. This applies to both build modes and to data-file
 and partition summaries, separately from reader-level filter pushdown.
 
+Vortex metrics are collected from the converted writer input in COPY and INSERT
+and stored by Iceberg field ID. Bounds exclude NULLs and NaNs, preserve infinities,
+and order negative zero before positive zero. Files containing only NULLs or NaNs
+have no bounds. Existing files without metrics remain readable and are retained
+conservatively during pruning; newly collected metrics do not rewrite old files.
+The existing comparison pruner also retains files with no bounds. Direct
+`IS NULL` and `IS NOT NULL` checks on scalar columns can prune files using counts
+even without bounds: `IS NULL` skips files with a known zero NULL count, and
+`IS NOT NULL` skips files whose known total and NULL counts are equal. Missing
+counts remain unknown. Vortex/mixed scans retain the original row filters in
+DuckDB; derived expressions, nested fields and NULL checks inside OR conditions
+are not extracted by this metadata-only NULL optimization.
+
+The table properties `write.metadata.metrics.default` and
+`write.metadata.metrics.column.<name>` control collection. `none` disables metrics
+for the column; `counts` collects total/NULL/NaN counts without bounds; `full` and
+`truncate(n)` collect numeric bounds. Collection is scoped to each output file,
+including parallel writes. The common manifest writer preserves exact NaN counts
+when present; it leaves unknown counts unspecified, including for Parquet writers
+that report only whether a NaN exists.
+The shared writer also persists total counts supplied for top-level scalar
+Parquet columns, in both build modes. It does not newly collect counts for nested
+or repeated Parquet leaves. Existing counts survive manifest rewrites.
+Both builds include the default unsorted order in COPY exports, so a subsequent
+catalog append can resolve the metadata's default sort-order ID.
+
 The pinned Vortex writer also has a narrower timestamp range than DuckDB. Each
 batch is checked before entering the writer: infinite or out-of-range values
 raise a SQL error instead of terminating the process. `TIMESTAMP` and
@@ -156,12 +228,12 @@ The `Vortex format CI` workflow builds Linux native shells and SQL test runners
 with Vortex enabled and with the default OFF setting. Each build runs the same
 Parquet COPY, column mapping and delete-read regressions, plus COPY option
 validation. ON additionally runs all Vortex SQL tests and the local catalog,
-file-access and schema-change Python regressions; OFF checks that requesting
-Vortex fails. Tests run serially within each isolated runner. No Docker or
-external catalog is needed.
-Both modes also run the NaN metadata and partition-summary regressions, verify
-Parquet FLOAT/DOUBLE predicates and JOIN results, and check scan-level filtering
-using JSON execution profiles. ON extends those checks to mixed snapshots,
+file-access, schema-change and file-metrics Python regressions; OFF checks that
+requesting Vortex fails. Tests run serially within each isolated runner. No Docker
+or external catalog is needed.
+Both modes also run the NaN metadata, partition-summary and NULL-pruning
+regressions, verify Parquet FLOAT/DOUBLE predicates and JOIN results, and check
+scan-level filtering using JSON execution profiles. ON extends those checks to mixed snapshots,
 old snapshots, prepared queries and transaction-local appends. The SQL suite
 also checks NULL-filter results and the files skipped by metadata pruning using
 the committed fixtures, without requiring generated data.
@@ -205,15 +277,41 @@ excluded. It uses one thread, two million rows and seven measured runs per query
 by default. Performance timings are informational; CI asserts filtering behavior
 and results without a timing threshold.
 
+To measure Vortex file pruning and the cost of collecting metrics, compare two
+ON builds, one before and one after this change:
+
+```sh
+python3 scripts/benchmark_vortex_metrics.py \
+  --duckdb BEFORE=build/before/duckdb --duckdb AFTER=build/after/duckdb \
+  --directory build/metrics-benchmark --output build/metrics-benchmark/results.json
+```
+
+This benchmark writes identical two-million-row datasets with each binary,
+validates their contents, and measures COPY latency. It then measures integer
+and floating range queries and a full scan over eight files, checking results
+and reporting skipped files. Defaults are one thread, a warm-up and seven
+measured runs; latency comes from detailed JSON profiles and excludes shell
+startup. Query measurements alternate the build order on each repetition and
+include individual samples in the JSON report. Use a fresh output directory for
+each comparison.
+
+Add `--null-files 4` to use four all-NULL and four non-NULL files and measure
+`IS NULL` / `IS NOT NULL` pruning instead of ranges. Total row counts, non-NULL
+counts and query results are checked in both binaries.
+
 Individual regressions can also be run directly:
 
 ```sh
 ICEBERG_TEST_VORTEX=1 ./build/release/test/unittest '*test/sql/local/vortex/*'
 python3 test/standalone/test_nan_pruning.py --duckdb build/release/duckdb
 python3 test/vortex/test_parquet_pushdown.py --mode ON --duckdb build/release/duckdb
+python3 test/vortex/test_null_pruning.py --mode ON --duckdb build/release/duckdb
 python3 test/vortex/test_local_catalog.py --duckdb build/release/duckdb
 python3 test/vortex/test_file_access.py --duckdb build/release/duckdb
 python3 test/vortex/test_schema_changes.py --duckdb build/release/duckdb
+python3 test/vortex/test_file_metrics.py --duckdb build/release/duckdb
+python3 test/vortex/test_format_benchmark.py --duckdb build/release/duckdb
+python3 test/vortex/test_s3_reads.py --duckdb build/release/duckdb
 ```
 
 Set `ICEBERG_TEST_VORTEX=1` only for builds with the feature enabled. Default
@@ -251,3 +349,54 @@ format back to Parquet, Vortex files only in retained snapshots, and an append
 followed by ALTER in one transaction. Parquet schema evolution remains enabled.
 It also makes a later manifest temporarily unavailable to verify that finding
 Vortex in the first manifest rejects the change without opening later files.
+
+The file-metrics test checks serialized bounds and counts, including integer
+limits, subnormal floats, infinities, signed zero, NaNs and all-NULL files.
+It covers metrics modes and column overrides, nonconsecutive field IDs, quoted
+column names, filtered/constant vectors, multiple batches and parallel output
+files. Mixed snapshots retain correct results and old snapshots remain readable;
+comparison queries also assert how many files metadata pruning skips.
+
+The NULL-pruning test checks direct and catalog reads, mixed formats, old
+snapshots, column aliases, conjunctions, retained row filtering and prepared
+queries before and after transaction-local appends. It also checks `counts` and
+`none` modes, all-NULL files without bounds, and legacy manifests missing either
+total counts or NULL counts. Parquet nested fields and derived NULL expressions
+retain their results. Use `--mode OFF` for its Parquet-only coverage.
+
+## Comparing Parquet and Vortex
+
+Use one ON build to compare both formats with identical data, schema, input
+order and data-file count. This Linux benchmark requires GNU `time`:
+
+```sh
+python3 scripts/benchmark_vortex_formats.py \
+  --duckdb build/on/duckdb --directory build/formats-sorted \
+  --output build/formats-sorted/results.json
+python3 scripts/benchmark_vortex_formats.py \
+  --duckdb build/on/duckdb --directory build/formats-permuted --order permuted \
+  --output build/formats-permuted/results.json
+```
+
+Defaults are eight files of 250,000 rows, one query thread, a 1 GB DuckDB memory
+limit, one warmup and five measured repetitions. Writes use one thread to keep
+file counts equal. Each format uses its default compression. `--order permuted`
+uses the same deterministic permutation for both formats, reducing the benefit
+of sorted file bounds. Use a fresh directory for each run; existing data is
+never overwritten. The final tables and JSON report are retained.
+
+Every measured write is validated against a query over the original data.
+Projection, range, equality, NULL, grouped aggregate, JOIN and full-scan queries
+are also checked against that reference. Format order alternates between
+repetitions. Query profiles exclude shell startup; write latency sums the
+COPY/INSERT profiles and includes source generation. The append catalog is the
+local REST test fixture, so these are not production catalog or S3 measurements.
+
+The report includes individual samples, medians, compressed data/metadata sizes,
+query latency and complete-process peak RSS, including Rust allocations. The
+DuckDB memory limit governs its buffer manager, not all Vortex memory. Queries
+use fresh processes and a warm OS cache; the benchmark does not evict shared
+caches. Linux physical read bytes can therefore be zero. DuckDB's reported
+read-byte and buffer-memory counters are included separately and do not cover
+all Vortex I/O or allocations; they must not be interpreted as comparable
+totals. CI runs only a small correctness smoke test, without timing thresholds.

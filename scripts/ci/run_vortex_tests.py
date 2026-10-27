@@ -22,7 +22,14 @@ PARQUET_TESTS = (
     "test/sql/local/iceberg_scans/nan_pruning.test",
     "test/sql/local/iceberg_scans/is_not_null.test",
 )
-PYTHON_TESTS = ("test_local_catalog.py", "test_file_access.py", "test_schema_changes.py")
+PYTHON_TESTS = (
+    "test_local_catalog.py",
+    "test_file_access.py",
+    "test_schema_changes.py",
+    "test_file_metrics.py",
+    "test_format_benchmark.py",
+    "test_s3_reads.py",
+)
 
 
 def sql_assertions(report, expected):
@@ -156,6 +163,7 @@ def run_tests(build, mode, output):
     python_tests = [
         (ROOT / "test/standalone/test_nan_pruning.py", []),
         (ROOT / "test/vortex/test_parquet_pushdown.py", ["--mode", mode]),
+        (ROOT / "test/vortex/test_null_pruning.py", ["--mode", mode]),
     ]
     if mode == "ON":
         python_tests.extend((ROOT / "test/vortex" / test, []) for test in PYTHON_TESTS)

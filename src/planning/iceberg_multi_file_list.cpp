@@ -13,6 +13,9 @@
 #include "duckdb/parser/tableref/table_function_ref.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/planner/filter/struct_filter.hpp"
+#include "duckdb/planner/filter/null_filter.hpp"
+#include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/expression/bound_operator_expression.hpp"
 #include "duckdb/execution/executor.hpp"
 
 #include "planning/iceberg_multi_file_reader.hpp"
@@ -306,6 +309,10 @@ bool IcebergMultiFileList::HasOnlyParquetDataFiles() const {
 		}
 	}
 }
+
+void IcebergMultiFileList::SetRowFilterPushdown(bool enabled) {
+	shared_state->row_filter_pushdown = enabled;
+}
 #endif
 
 unique_ptr<IcebergMultiFileList> IcebergMultiFileList::PushdownInternal(ClientContext &context,
@@ -442,6 +449,38 @@ unique_ptr<MultiFileList> IcebergMultiFileList::ComplexFilterPushdown(ClientCont
 
 	vector<FilterPushdownResult> unused;
 	auto filter_set = combiner.GenerateTableScanFilters(info.column_indexes, unused);
+#ifdef ICEBERG_ENABLE_VORTEX
+	// Parquet handles NULL checks through normal row-filter pushdown. When that
+	// path is disabled, copy direct scalar checks for metadata pruning instead.
+	// Keep the original expressions for DuckDB's row filtering.
+	if (!shared_state->row_filter_pushdown) {
+		for (const auto &filter : filters) {
+			if (filter->type != ExpressionType::OPERATOR_IS_NULL &&
+			    filter->type != ExpressionType::OPERATOR_IS_NOT_NULL) {
+				continue;
+			}
+			auto &op = filter->Cast<BoundOperatorExpression>();
+			if (op.children.size() != 1 || op.children[0]->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+				continue;
+			}
+			auto &ref = op.children[0]->Cast<BoundColumnRefExpression>();
+			if (ref.depth != 0 || ref.binding.table_index != info.table_index ||
+			    ref.binding.column_index >= info.column_indexes.size() || ref.return_type.IsNested()) {
+				continue;
+			}
+			auto &column = info.column_indexes[ref.binding.column_index];
+			if (!column.HasPrimaryIndex() || column.IsVirtualColumn() || column.IsPushdownExtract() ||
+			    column.HasChildren()) {
+				continue;
+			}
+			if (filter->type == ExpressionType::OPERATOR_IS_NULL) {
+				filter_set.PushFilter(column, make_uniq<IsNullFilter>());
+			} else {
+				filter_set.PushFilter(column, make_uniq<IsNotNullFilter>());
+			}
+		}
+	}
+#endif
 	if (filter_set.filters.empty()) {
 		return nullptr;
 	}
@@ -796,10 +835,9 @@ bool IcebergMultiFileList::FileMatchesFilter(const IcebergManifestFile &manifest
 				}
 			}
 		}
-		if (data_file.lower_bounds.empty() || data_file.upper_bounds.empty() ||
-		    file_type == IcebergManifestContentType::DELETE) {
-			// There are no bounds statistics for the file, can't filter,
-			// or it is a delete file, which should only be filtered on partitions
+		if (file_type == IcebergManifestContentType::DELETE) {
+			// Delete files should only be filtered on partitions. Data files can
+			// still be pruned using counts when they have no min/max bounds.
 			continue;
 		}
 

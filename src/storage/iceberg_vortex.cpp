@@ -9,7 +9,9 @@
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/execution/execution_context.hpp"
 #include "duckdb/parallel/thread_context.hpp"
+#include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/parser/tableref/table_function_ref.hpp"
+#include <cmath>
 
 #include "common/iceberg_utils.hpp"
 #include "catalog/rest/catalog_entry/table/iceberg_table_information.hpp"
@@ -18,6 +20,7 @@
 #include "planning/metadata_io/manifest/iceberg_manifest_reader.hpp"
 #include "planning/metadata_io/manifest_list/iceberg_manifest_list_reader.hpp"
 #include "planning/iceberg_multi_file_list.hpp"
+#include "core/expression/iceberg_metrics.hpp"
 
 namespace duckdb {
 
@@ -166,9 +169,23 @@ static void VerifyVortexFileAccess(ClientContext &context, const string &path) {
 class IcebergVortexReader : public BaseFileReader {
 public:
 	IcebergVortexReader(ClientContext &context, const OpenFileInfo &file, const MultiFileBindData &iceberg_bind)
-	    : BaseFileReader(file), scan(FindScan(context, "read_vortex", LogicalType::VARCHAR)) {
-		scan_path = VortexLocalPath(context, file.path);
-		VerifyVortexFileAccess(context, scan_path);
+	    : BaseFileReader(file) {
+		duckdb_filesystem = StringUtil::StartsWith(file.path, "s3://");
+		if (duckdb_filesystem) {
+#ifdef ICEBERG_VANE_DISTRIBUTED
+			throw NotImplementedException("S3 Vortex Iceberg reads currently require native DuckDB execution");
+#else
+			if (file.path.find_first_of("*?[") != string::npos) {
+				throw NotImplementedException("Vortex Iceberg data files require literal S3 object paths");
+			}
+			scan_path = file.path;
+			scan = FindScan(context, "_read_vortex_file", LogicalType::VARCHAR);
+#endif
+		} else {
+			scan_path = VortexLocalPath(context, file.path);
+			scan = FindScan(context, "read_vortex", LogicalType::VARCHAR);
+			VerifyVortexFileAccess(context, scan_path);
+		}
 		vector<Value> inputs {Value(scan_path)};
 		named_parameter_map_t parameters;
 		vector<LogicalType> input_types;
@@ -217,7 +234,10 @@ public:
 
 	void PrepareScan(ClientContext &context, GlobalTableFunctionState &, LocalTableFunctionState &) override {
 		// Access settings can change after a prepared query has bound this reader.
-		VerifyVortexFileAccess(context, scan_path);
+		// The DuckDB-backed reader reopens with the current credentials in init_global.
+		if (!duckdb_filesystem) {
+			VerifyVortexFileAccess(context, scan_path);
+		}
 		if (deletion_filter) {
 			throw NotImplementedException("Vortex Iceberg scans do not yet support delete files");
 		}
@@ -254,6 +274,7 @@ private:
 	unique_ptr<GlobalTableFunctionState> global;
 	unique_ptr<LocalTableFunctionState> local;
 	bool claimed = false;
+	bool duckdb_filesystem = false;
 };
 
 // Keep the Parquet bind/options/state contract used by iceberg_scan. Only the
@@ -341,21 +362,83 @@ unique_ptr<FunctionData> IcebergVortex::BindScan(ClientContext &context, TableFu
 	auto &files = bind.file_list->Cast<IcebergMultiFileList>();
 	auto parquet_only = files.HasOnlyParquetDataFiles();
 	input.table_function.filter_pushdown = parquet_only && parquet.filter_pushdown;
+	files.SetRowFilterPushdown(input.table_function.filter_pushdown);
 	input.table_function.pushdown_expression = parquet_only ? parquet.pushdown_expression : nullptr;
 	return result;
 }
 
+struct VortexMetricsColumn {
+	idx_t index;
+	string name;
+	bool bounds;
+};
+
+struct VortexColumnMetrics {
+	idx_t null_count = 0;
+	idx_t nan_count = 0;
+	Value min;
+	Value max;
+
+	template <class T, bool FLOATING = false>
+	void Update(Vector &vector, idx_t count, bool bounds) {
+		UnifiedVectorFormat format;
+		vector.ToUnifiedFormat(count, format);
+		auto values = UnifiedVectorFormat::GetData<T>(format);
+		bool have_bounds = !min.IsNull();
+		T low = have_bounds ? min.GetValue<T>() : T();
+		T high = have_bounds ? max.GetValue<T>() : T();
+		for (idx_t row = 0; row < count; row++) {
+			auto index = format.sel->get_index(row);
+			if (!format.validity.RowIsValid(index)) {
+				null_count++;
+				continue;
+			}
+			auto value = values[index];
+			if (FLOATING && Value::IsNan(value)) {
+				nan_count++;
+				continue;
+			}
+			if (!bounds) {
+				continue;
+			}
+			// Iceberg bounds exclude NaNs and order -0 before +0.
+			if (!have_bounds || value < low || (FLOATING && value == 0 && low == 0 && std::signbit(value))) {
+				low = value;
+			}
+			if (!have_bounds || value > high || (FLOATING && value == 0 && high == 0 && !std::signbit(value))) {
+				high = value;
+			}
+			have_bounds = true;
+		}
+		if (have_bounds) {
+			min = Value::CreateValue<T>(low);
+			max = Value::CreateValue<T>(high);
+		}
+	}
+};
+
 struct VortexCopyBind : public FunctionData {
 	VortexCopyBind(CopyFunction function, unique_ptr<FunctionData> inner, vector<LogicalType> types,
-	               vector<pair<idx_t, string>> required_columns)
+	               vector<pair<idx_t, string>> required_columns, vector<VortexMetricsColumn> metrics_columns)
 	    : function(std::move(function)), inner(std::move(inner)), types(std::move(types)),
-	      required_columns(std::move(required_columns)) {
+	      required_columns(std::move(required_columns)), metrics_columns(std::move(metrics_columns)) {
 	}
 	unique_ptr<FunctionData> Copy() const override {
-		return make_uniq<VortexCopyBind>(function, inner->Copy(), types, required_columns);
+		return make_uniq<VortexCopyBind>(function, inner->Copy(), types, required_columns, metrics_columns);
 	}
 	bool Equals(const FunctionData &other) const override {
 		auto &other_bind = other.Cast<VortexCopyBind>();
+		if (metrics_columns.size() != other_bind.metrics_columns.size()) {
+			return false;
+		}
+		for (idx_t i = 0; i < metrics_columns.size(); i++) {
+			auto &column = metrics_columns[i];
+			auto &other_column = other_bind.metrics_columns[i];
+			if (column.index != other_column.index || column.name != other_column.name ||
+			    column.bounds != other_column.bounds) {
+				return false;
+			}
+		}
 		return types == other_bind.types && required_columns == other_bind.required_columns &&
 		       inner->Equals(*other_bind.inner);
 	}
@@ -363,6 +446,7 @@ struct VortexCopyBind : public FunctionData {
 	unique_ptr<FunctionData> inner;
 	vector<LogicalType> types;
 	vector<pair<idx_t, string>> required_columns;
+	vector<VortexMetricsColumn> metrics_columns;
 };
 
 struct VortexCopyLocal : public LocalFunctionData {
@@ -374,6 +458,8 @@ struct VortexCopyGlobal : public GlobalFunctionData {
 	unique_ptr<GlobalFunctionData> inner;
 	string path;
 	atomic<idx_t> row_count {0};
+	mutex metrics_lock;
+	vector<VortexColumnMetrics> metrics;
 	optional_ptr<CopyFunctionFileStatistics> statistics;
 };
 
@@ -463,7 +549,18 @@ IcebergCopyOptions IcebergVortex::CopyOptions(ClientContext &context, const Iceb
 	vector<string> physical_names;
 	vector<LogicalType> types;
 	vector<pair<idx_t, string>> required_columns;
+	vector<VortexMetricsColumn> metrics_columns;
+	auto default_metrics = GetDefaultMetricsConfig(input.table_metadata);
 	for (const auto &column : input.schema.columns) {
+		auto type = column->type.id();
+		if (type == LogicalTypeId::INTEGER || type == LogicalTypeId::BIGINT || type == LogicalTypeId::FLOAT ||
+		    type == LogicalTypeId::DOUBLE) {
+			auto config = GetColumnMetricsConfig(input.table_metadata, default_metrics, column->name);
+			if (config.mode != IcebergMetricsMode::NONE) {
+				metrics_columns.push_back({types.size(), KeywordHelper::WriteQuoted(column->name, '"'),
+				                           config.mode != IcebergMetricsMode::COUNTS});
+			}
+		}
 		if (column->required) {
 			required_columns.emplace_back(physical_names.size(), column->name);
 		}
@@ -472,12 +569,14 @@ IcebergCopyOptions IcebergVortex::CopyOptions(ClientContext &context, const Iceb
 	}
 	CopyFunctionBindInput bind_input(*info);
 	auto inner_bind = inner.copy_to_bind(context, bind_input, physical_names, types);
-	auto bind = make_uniq<VortexCopyBind>(inner, std::move(inner_bind), std::move(types), std::move(required_columns));
+	auto bind = make_uniq<VortexCopyBind>(inner, std::move(inner_bind), std::move(types), std::move(required_columns),
+	                                      std::move(metrics_columns));
 	CopyFunction function("iceberg_vortex");
 	function.extension = "vortex";
 	function.copy_to_initialize_global = [](ClientContext &context, FunctionData &data, const string &path) {
 		auto &bind = data.Cast<VortexCopyBind>();
 		auto result = make_uniq<VortexCopyGlobal>();
+		result->metrics.resize(bind.metrics_columns.size());
 		result->path = path;
 		result->inner = bind.function.copy_to_initialize_global(context, *bind.inner, path);
 		return unique_ptr<GlobalFunctionData>(std::move(result));
@@ -514,6 +613,28 @@ IcebergCopyOptions IcebergVortex::CopyOptions(ClientContext &context, const Iceb
 		}
 		ValidateTemporalValues(converted);
 		bind.function.copy_to_sink(context, *bind.inner, *state.inner, *local_state.inner, converted);
+		lock_guard<mutex> guard(state.metrics_lock);
+		for (idx_t i = 0; i < bind.metrics_columns.size(); i++) {
+			auto &column = bind.metrics_columns[i];
+			auto &vector = converted.data[column.index];
+			auto &metrics = state.metrics[i];
+			switch (vector.GetType().id()) {
+			case LogicalTypeId::INTEGER:
+				metrics.Update<int32_t>(vector, converted.size(), column.bounds);
+				break;
+			case LogicalTypeId::BIGINT:
+				metrics.Update<int64_t>(vector, converted.size(), column.bounds);
+				break;
+			case LogicalTypeId::FLOAT:
+				metrics.Update<float, true>(vector, converted.size(), column.bounds);
+				break;
+			case LogicalTypeId::DOUBLE:
+				metrics.Update<double, true>(vector, converted.size(), column.bounds);
+				break;
+			default:
+				throw InternalException("Unexpected Vortex metrics type");
+			}
+		}
 		state.row_count += chunk.size();
 	};
 	function.copy_to_combine = [](ExecutionContext &context, FunctionData &data, GlobalFunctionData &global,
@@ -536,6 +657,21 @@ IcebergCopyOptions IcebergVortex::CopyOptions(ClientContext &context, const Iceb
 			state.statistics->row_count = state.row_count;
 			auto file = FileSystem::GetFileSystem(context).OpenFile(state.path, FileFlags::FILE_FLAGS_READ);
 			state.statistics->file_size_bytes = file->GetFileSize();
+			for (idx_t i = 0; i < bind.metrics_columns.size(); i++) {
+				auto &column = bind.metrics_columns[i];
+				auto &metrics = state.metrics[i];
+				auto &stats = state.statistics->column_statistics[column.name];
+				stats["num_values"] = Value::UBIGINT(state.row_count);
+				stats["null_count"] = Value::UBIGINT(metrics.null_count);
+				auto type = bind.types[column.index].id();
+				if (type == LogicalTypeId::FLOAT || type == LogicalTypeId::DOUBLE) {
+					stats["nan_count"] = Value::UBIGINT(metrics.nan_count);
+				}
+				if (!metrics.min.IsNull()) {
+					stats["min"] = metrics.min;
+					stats["max"] = metrics.max;
+				}
+			}
 		}
 	};
 	function.execution_mode = [](bool, bool) {
