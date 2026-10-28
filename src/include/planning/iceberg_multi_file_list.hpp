@@ -125,6 +125,10 @@ public:
 	void SetOptions(const IcebergOptions &options);
 
 	void Bind(vector<LogicalType> &return_types, vector<string> &names);
+#ifdef ICEBERG_ENABLE_VORTEX
+	//! Inspect the bound snapshot and transaction before optimizer pruning.
+	bool HasOnlyParquetDataFiles() const;
+#endif
 	unique_ptr<IcebergMultiFileList> PushdownInternal(ClientContext &context, TableFilterSet &new_filters) const;
 	unique_ptr<DeleteFilter> GetPositionalDeletesForFile(const string &file_path) const;
 	void ProcessDeletes(const vector<MultiFileColumnDefinition> &global_columns,

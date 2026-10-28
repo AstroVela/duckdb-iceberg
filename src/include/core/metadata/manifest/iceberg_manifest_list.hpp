@@ -21,7 +21,8 @@ public:
 	Value ToValue() const {
 		child_list_t<Value> children;
 		children.emplace_back("contains_null", Value::BOOLEAN(contains_null));
-		children.emplace_back("contains_nan", Value::BOOLEAN(contains_nan));
+		children.emplace_back("contains_nan",
+		                      has_contains_nan ? Value::BOOLEAN(contains_nan) : Value(LogicalType::BOOLEAN));
 		D_ASSERT(lower_bound.type().id() == LogicalType::BLOB);
 		D_ASSERT(upper_bound.type().id() == LogicalType::BLOB);
 		children.emplace_back("lower_bound", lower_bound);
@@ -33,6 +34,7 @@ public:
 	bool contains_null = false;
 	//! Optional
 	bool contains_nan = false;
+	bool has_contains_nan = false;
 	//! Optional
 	Value lower_bound;
 	//! Optional

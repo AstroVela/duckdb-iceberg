@@ -46,7 +46,7 @@ bool MatchBoundsTemplated(ClientContext &context, const TableFilter &filter, con
 template <class TRANSFORM>
 static bool MatchBoundsConstant(const Value &constant, ExpressionType comparison_type,
                                 const IcebergPredicateStats &stats, const IcebergTransform &transform) {
-	auto constant_value = TRANSFORM::ApplyTransform(constant, transform);
+	Value constant_value = TRANSFORM::ApplyTransform(constant, transform);
 
 	if (stats.BoundsAreNull()) {
 		// bounds are actually null, expression is not a null comparison expression
@@ -62,6 +62,22 @@ static bool MatchBoundsConstant(const Value &constant, ExpressionType comparison
 	if (!stats.has_upper_bounds || !stats.has_lower_bounds) {
 		// we do not have upper or lower bounds, assume the file matches.
 		return true;
+	}
+
+	// Iceberg bounds exclude NaNs, but DuckDB orders NaN above every other number
+	// and considers NaN = NaN. Keep files whose possible NaNs satisfy the predicate.
+	auto bounds_type = stats.upper_bound.type().id();
+	if ((bounds_type == LogicalTypeId::FLOAT || bounds_type == LogicalTypeId::DOUBLE) &&
+	    (!stats.has_nan_stats || stats.has_nan)) {
+		auto constant_type = constant_value.type().id();
+		bool constant_is_nan = !constant_value.IsNull() &&
+		                       (constant_type == LogicalTypeId::FLOAT || constant_type == LogicalTypeId::DOUBLE) &&
+		                       Value::IsNan(constant_value.GetValue<double>());
+		if (comparison_type == ExpressionType::COMPARE_GREATERTHANOREQUALTO ||
+		    (comparison_type == ExpressionType::COMPARE_GREATERTHAN && !constant_is_nan) ||
+		    (comparison_type == ExpressionType::COMPARE_EQUAL && constant_is_nan)) {
+			return true;
+		}
 	}
 
 	switch (comparison_type) {
