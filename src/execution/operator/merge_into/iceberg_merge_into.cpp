@@ -664,7 +664,7 @@ static unique_ptr<MergeIntoOperator> IcebergPlanMergeIntoAction(IcebergCatalog &
 
 	switch (action.action_type) {
 	case MergeActionType::MERGE_UPDATE: {
-#ifdef ICEBERG_VANE_DISTRIBUTED
+#ifdef ICEBERG_VANE_NATIVE
 		LogicalUpdate update(context, op.table);
 #else
 		LogicalUpdate update(op.table);
@@ -710,7 +710,7 @@ static unique_ptr<MergeIntoOperator> IcebergPlanMergeIntoAction(IcebergCatalog &
 		break;
 	}
 	case MergeActionType::MERGE_DELETE: {
-#ifdef ICEBERG_VANE_DISTRIBUTED
+#ifdef ICEBERG_VANE_NATIVE
 		LogicalDelete delete_op(context, op.table, 0);
 #else
 		LogicalDelete delete_op(op.table, 0);
@@ -733,7 +733,7 @@ static unique_ptr<MergeIntoOperator> IcebergPlanMergeIntoAction(IcebergCatalog &
 		break;
 	}
 	case MergeActionType::MERGE_INSERT: {
-#ifdef ICEBERG_VANE_DISTRIBUTED
+#ifdef ICEBERG_VANE_NATIVE
 		LogicalInsert insert_op(context, op.table, 0);
 #else
 		LogicalInsert insert_op(op.table, 0);

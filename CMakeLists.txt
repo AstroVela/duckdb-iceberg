@@ -20,12 +20,17 @@ if(ICEBERG_ENABLE_EQUALITY_DELETE_WRITES)
 	add_definitions(-DICEBERG_ENABLE_EQUALITY_DELETE_WRITES)
 endif()
 
+option(ICEBERG_VANE_NATIVE
+       "Build against the Vane native engine interfaces" OFF)
 option(ICEBERG_VANE_DISTRIBUTED
        "Build the explicit Vane distributed scan and write interfaces" OFF)
-if(ICEBERG_VANE_DISTRIBUTED)
+if(ICEBERG_VANE_NATIVE OR ICEBERG_VANE_DISTRIBUTED)
 	if(NOT EXISTS "${DUCKDB_SOURCE_PATH}/src/include/duckdb/function/distributed_table_function.hpp")
-		message(FATAL_ERROR "ICEBERG_VANE_DISTRIBUTED requires the Vane DuckDB source tree")
+		message(FATAL_ERROR "Vane Iceberg options require the Vane DuckDB source tree")
 	endif()
+	add_definitions(-DICEBERG_VANE_NATIVE)
+endif()
+if(ICEBERG_VANE_DISTRIBUTED)
 	add_definitions(-DICEBERG_VANE_DISTRIBUTED)
 endif()
 
