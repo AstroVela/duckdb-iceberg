@@ -375,6 +375,14 @@ Vane-specific targets use the exact Vane revision in
 [extension_config_vane.cmake](extension_config_vane.cmake) enables
 `ICEBERG_VANE_DISTRIBUTED` for that build.
 
+Native-only integrations can instead pass `-DICEBERG_VANE_NATIVE=ON` and
+`-DICEBERG_VANE_DISTRIBUTED=OFF` to the Vane CMake configuration. This selects
+Vane's `ClientContext`-taking logical write constructors without enabling the
+distributed scan and write interfaces. No compatibility patch is required.
+The distributed option also enables native compatibility, so existing Vane
+builds keep their behavior. Both options default to OFF for standard DuckDB
+builds, which retain the upstream constructor interfaces.
+
 ```bash
 git clone --branch v1.5-variegata_vane --recurse-submodules \
   https://github.com/AstroVela/duckdb-iceberg.git
